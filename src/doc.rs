@@ -294,6 +294,16 @@ pub struct Node {
     /// Clipping mask: node ini hanya tampil di dalam bentuk (alpha) layer tepat di bawahnya.
     #[serde(default)]
     pub clip: bool,
+    /// Stroke putus-putus: panjang garis dan jarak antar garis (0 = garis utuh; jarak 0 = sama
+    /// dengan panjang garis).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dash: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gap: f32,
+    /// Posisi stroke terhadap tepi bentuk: 0 dalam, 1 tengah, 2 luar. `None` = bawaan jenis
+    /// objeknya (kotak, frame, gambar: dalam; lainnya: tengah).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_align: Option<u8>,
     /// Drop shadow di belakang objek.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<Shadow>,
@@ -329,6 +339,31 @@ impl Shadow {
     pub fn pad(&self) -> f32 {
         self.x.abs().max(self.y.abs()) * 1.5 + self.blur.max(0.0) * 1.5 + 1.0
     }
+}
+
+impl Node {
+    /// Posisi stroke yang berlaku: 0 dalam, 1 tengah, 2 luar. Hanya kotak, frame, gambar, dan
+    /// elips yang bisa memilih; garis dan path selalu di tengah.
+    pub fn stroke_pos(&self) -> u8 {
+        match self.kind {
+            Kind::Rect | Kind::Frame | Kind::Image => self.stroke_align.unwrap_or(0).min(2),
+            Kind::Ellipse => self.stroke_align.unwrap_or(1).min(2),
+            _ => 1,
+        }
+    }
+
+    /// Seberapa jauh garis tengah stroke masuk dari tepi bentuk (negatif = keluar).
+    pub fn stroke_inset(&self) -> f32 {
+        match self.stroke_pos() {
+            0 => self.stroke_w * 0.5,
+            2 => -self.stroke_w * 0.5,
+            _ => 0.0,
+        }
+    }
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 impl AsRef<Node> for Node {
@@ -463,6 +498,9 @@ impl Node {
             locked: false,
             group: 0,
             clip: false,
+            dash: 0.0,
+            gap: 0.0,
+            stroke_align: None,
             shadow: None,
             fill_style: None,
             stroke_style: None,

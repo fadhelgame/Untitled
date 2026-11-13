@@ -103,13 +103,13 @@ Every screenshot here is the real app.
       <br>
       <sub>Gradients, vector paths, styled text and a Multiply blend, in a document with 501 frames and 8,014 layers.</sub>
       <h3>Color, gradients and blending</h3>
-      Solid fills, linear and radial gradients with draggable stops, strokes, opacity, corner radius and a <b>drop shadow</b> (offset, blur and color) that works on any object, including text and cut-out images. <b>Color styles</b> and <b>text styles</b> keep a whole document consistent: change the style once and every object that uses it follows. A built-in color picker with hex and alpha, plus an eyedropper with a pixel loupe that samples any pixel in the window.
+      Solid fills, linear and radial gradients with draggable stops, strokes (solid or dashed; inside, centered or outside), opacity, corner radius and a <b>drop shadow</b> (offset, blur and color) that works on any object, including text and cut-out images. <b>Color styles</b> and <b>text styles</b> keep a whole document consistent: change the style once and every object that uses it follows. A built-in color picker with hex and alpha, plus an eyedropper with a pixel loupe that samples any pixel in the window.
       <br><br>
       <b>7 blend modes:</b> Normal, Darken, Multiply, Lighten, Screen, Plus lighter and Exclusion.
     </td>
     <td width="50%" valign="top">
       <h3>Vector tools</h3>
-      Draw with the <b>Pen</b>: click for corners, drag for curves. Double-click any path to edit its points, add or remove anchors, or continue an open path.
+      The <b>Polygon / star</b> tool makes regular polygons and stars with any number of points. Draw with the <b>Pen</b>: click for corners, drag for curves. Double-click any path to edit its points, add or remove anchors, or continue an open path.
       <br><br>
       The <b>Shape builder</b> splits overlapping shapes into regions. Drag across regions to merge them, Alt-click to remove them. The result is clean bezier curves, not jagged polygons.
       <h3>Select smarter</h3>

@@ -15,6 +15,9 @@ impl App {
         if self.tool == Tool::Wand {
             self.wand_options(ui);
         }
+        if self.tool == Tool::Polygon {
+            self.polygon_options(ui);
+        }
         ui.add_space(6.0);
         if self.sel.len() > 1 {
             self.multi_props(ui, &ctx);
@@ -213,10 +216,37 @@ impl App {
                     style_action = Some(a);
                 }
                 if n.stroke.is_some() {
-                    ui.add_sized(
-                        [half, 28.0],
-                        egui::DragValue::new(&mut n.stroke_w).speed(0.25).range(0.0..=500.0).max_decimals(2).prefix("Weight  "),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [half, 28.0],
+                            egui::DragValue::new(&mut n.stroke_w).speed(0.25).range(0.0..=500.0).max_decimals(2).prefix("Weight  "),
+                        );
+                        // Posisi stroke: hanya untuk bentuk yang punya "dalam" dan "luar" yang jelas.
+                        if matches!(n.kind, Kind::Rect | Kind::Frame | Kind::Image | Kind::Ellipse) {
+                            let mut pos = n.stroke_pos();
+                            egui::ComboBox::from_id_salt("stroke_pos")
+                                .width(half - 8.0)
+                                .selected_text(["Inside", "Center", "Outside"][pos as usize])
+                                .show_ui(ui, |ui| {
+                                    for (i, name) in ["Inside", "Center", "Outside"].iter().enumerate() {
+                                        ui.selectable_value(&mut pos, i as u8, *name);
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Stroke position");
+                            if pos != n.stroke_pos() {
+                                n.stroke_align = Some(pos);
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized([half, 28.0], egui::DragValue::new(&mut n.dash).speed(0.25).range(0.0..=2000.0).max_decimals(1).prefix("Dash  "))
+                            .on_hover_text("Dash length; 0 = solid line");
+                        ui.add_enabled_ui(n.dash > 0.0, |ui| {
+                            ui.add_sized([half, 28.0], egui::DragValue::new(&mut n.gap).speed(0.25).range(0.0..=2000.0).max_decimals(1).prefix("Gap  "))
+                                .on_hover_text("Space between dashes; 0 = same as the dash");
+                        });
+                    });
                 }
             }
             section(ui, "Drop shadow");
@@ -857,7 +887,7 @@ impl App {
                                 (rect, resp)
                             };
                             for (i, (tool, name, key)) in TOOLS.iter().enumerate() {
-                                if matches!(i, 4 | 5 | 10) {
+                                if matches!(i, 4 | 5 | 11) {
                                     separator(ui);
                                 }
                                 let active = self.tool == *tool;

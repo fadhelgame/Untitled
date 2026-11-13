@@ -23,12 +23,36 @@ fn paint(attr: &str, c: Option<[u8; 4]>) -> String {
 
 fn stroke(n: &Node) -> String {
     match n.stroke {
-        Some(_) if n.stroke_w > 0.0 => format!(r#"{} stroke-width="{}""#, paint("stroke", n.stroke), n.stroke_w),
+        Some(_) if n.stroke_w > 0.0 => {
+            let dash = if n.dash > 0.0 {
+                format!(r#" stroke-dasharray="{} {}""#, n.dash, if n.gap > 0.0 { n.gap } else { n.dash })
+            } else {
+                String::new()
+            };
+            format!(r#"{} stroke-width="{}"{dash}"#, paint("stroke", n.stroke), n.stroke_w)
+        }
         _ => String::new(),
     }
 }
 
-/// Atribut fill; gradasi ditulis sebagai <defs> di depan elemen.
+/// Stroke kotak sebagai elemen sendiri, digeser ke dalam/luar sesuai posisi stroke.
+fn stroke_rect(out: &mut String, n: &Node, r: f32) {
+    if n.stroke.is_none() || n.stroke_w <= 0.0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = n.bounds();
+    let i = n.stroke_inset();
+    let (w, h) = ((x1 - x0 - i * 2.0).max(0.0), (y1 - y0 - i * 2.0).max(0.0));
+    let _ = write!(
+        out,
+        r#"<rect x="{}" y="{}" width="{w}" height="{h}" rx="{}" fill="none" {}/>"#,
+        x0 + i,
+        y0 + i,
+        (r - i).max(0.0),
+        stroke(n)
+    );
+}
+
 fn fill(out: &mut String, n: &Node) -> String {
     let (Some(_), Some(g)) = (n.fill, &n.gradient) else { return paint("fill", n.fill) };
     let id = format!("g{}", n.id);
@@ -334,25 +358,27 @@ fn node_inner(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManag
             );
             list_svg(out, &n.children, assets, fonts, ctx);
             out.push_str("</g>");
-            if n.stroke.is_some() && n.stroke_w > 0.0 {
-                let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{w}" height="{h}" fill="none" {}/>"#, stroke(n));
-            }
+            stroke_rect(out, n, 0.0);
         }
         Kind::Rect => {
             let fill = fill(out, n);
-            let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{w}" height="{h}" rx="{r}" {fill} {}/>"#, stroke(n));
+            let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{w}" height="{h}" rx="{r}" {fill}/>"#);
+            stroke_rect(out, n, r);
         }
         Kind::Ellipse => {
             let fill = fill(out, n);
-            let _ = write!(
-                out,
-                r#"<ellipse cx="{}" cy="{}" rx="{}" ry="{}" {fill} {}/>"#,
-                x0 + w * 0.5,
-                y0 + h * 0.5,
-                w * 0.5,
-                h * 0.5,
-                stroke(n)
-            );
+            let (cx, cy) = (x0 + w * 0.5, y0 + h * 0.5);
+            let _ = write!(out, r#"<ellipse cx="{cx}" cy="{cy}" rx="{}" ry="{}" {fill}/>"#, w * 0.5, h * 0.5);
+            if n.stroke.is_some() && n.stroke_w > 0.0 {
+                let i = n.stroke_inset();
+                let _ = write!(
+                    out,
+                    r#"<ellipse cx="{cx}" cy="{cy}" rx="{}" ry="{}" fill="none" {}/>"#,
+                    (w * 0.5 - i).max(0.0),
+                    (h * 0.5 - i).max(0.0),
+                    stroke(n)
+                );
+            }
         }
         Kind::Line => {
             let _ = write!(
@@ -427,9 +453,7 @@ fn node_inner(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManag
                 mime(&asset.bytes),
                 b64::encode(&asset.bytes)
             );
-            if n.stroke.is_some() && n.stroke_w > 0.0 {
-                let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{w}" height="{h}" rx="{r}" fill="none" {}/>"#, stroke(n));
-            }
+            stroke_rect(out, n, r);
         }
         Kind::Text => text_svg(out, n, fonts, ctx),
     }

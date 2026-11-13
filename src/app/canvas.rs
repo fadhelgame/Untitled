@@ -974,6 +974,7 @@ impl App {
                     Tool::Frame => Kind::Frame,
                     Tool::Rect => Kind::Rect,
                     Tool::Ellipse => Kind::Ellipse,
+                    Tool::Polygon => Kind::Path,
                     _ => Kind::Line,
                 };
                 let pre = self.doc.clone();
@@ -989,6 +990,13 @@ impl App {
                         let on_frame = self.doc.frame_at(wp.x, wp.y, 0).is_some();
                         n.stroke = Some(if on_frame { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
                         n.stroke_w = 2.0;
+                    }
+                    Kind::Path => {
+                        // Tool Polygon: path tertutup biasa, jadi titiknya bisa diedit seperti path lain.
+                        n.points = super::polygon::points(&self.poly);
+                        n.closed = true;
+                        n.name = format!("{} {id}", if self.poly.star { "Star" } else { "Polygon" });
+                        n.fill = Some([217, 217, 217, 255]);
                     }
                     _ => n.fill = Some([217, 217, 217, 255]),
                 }

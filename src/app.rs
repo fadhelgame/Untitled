@@ -18,6 +18,7 @@ mod panel;
 mod pen;
 mod photos;
 mod picker;
+mod polygon;
 mod presets;
 pub mod rembg;
 mod remote;
@@ -45,13 +46,14 @@ enum Tool {
     Rect,
     Ellipse,
     Line,
+    Polygon,
     Pen,
     ShapeBuilder,
     Text,
 }
 
 /// Urutan di toolbar bawah: (tool, nama, shortcut).
-const TOOLS: [(Tool, &str, &str); 11] = [
+const TOOLS: [(Tool, &str, &str); 12] = [
     (Tool::Select, "Move", "V"),
     (Tool::Scale, "Scale", "K"),
     (Tool::Wand, "Magic wand", "Y"),
@@ -60,6 +62,7 @@ const TOOLS: [(Tool, &str, &str); 11] = [
     (Tool::Rect, "Rectangle", "R"),
     (Tool::Ellipse, "Ellipse", "O"),
     (Tool::Line, "Line", "L"),
+    (Tool::Polygon, "Polygon / star", "Shift+P"),
     (Tool::Pen, "Pen", "P"),
     (Tool::ShapeBuilder, "Shape builder", "Shift+M"),
     (Tool::Text, "Text", "T"),
@@ -114,6 +117,16 @@ fn draw_icon(p: &egui::Painter, tool: Tool, c: Pos2, color: Color32) {
             p.circle_stroke(c, 7.5, s);
         }
         Tool::Line => line(at(-7.0, 7.0), at(7.0, -7.0)),
+        Tool::Polygon => {
+            // Segi lima.
+            let pts: Vec<Pos2> = (0..5)
+                .map(|i| {
+                    let a = (-90.0_f32 + 72.0 * i as f32).to_radians();
+                    at(8.0 * a.cos(), 8.0 * a.sin() + 0.8)
+                })
+                .collect();
+            p.add(egui::Shape::closed_line(pts, s));
+        }
         Tool::Pen => {
             // Mata pena.
             p.add(egui::Shape::closed_line(vec![at(0.0, -8.5), at(5.5, 1.0), at(2.5, 8.0), at(-2.5, 8.0), at(-5.5, 1.0)], s));
@@ -143,6 +156,8 @@ fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
     n.w *= s;
     n.h *= s;
     n.stroke_w *= s;
+    n.dash *= s;
+    n.gap *= s;
     if let Some(shadow) = &mut n.shadow {
         shadow.x *= s;
         shadow.y *= s;
@@ -322,6 +337,8 @@ pub struct App {
     photos: photos::Photos,
     /// Penggaris dan guide yang sedang ditarik.
     rulers: rulers::Rulers,
+    /// Pengaturan tool Polygon / star.
+    poly: polygon::Options,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -398,6 +415,7 @@ impl App {
             icons: Default::default(),
             photos: Default::default(),
             rulers: Default::default(),
+            poly: Default::default(),
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -1184,6 +1202,7 @@ impl App {
                 Key::O if plain => self.tool = Tool::Ellipse,
                 Key::L if plain => self.tool = Tool::Line,
                 Key::T if plain => self.tool = Tool::Text,
+                Key::P if s && !c && !a => self.tool = Tool::Polygon,
                 Key::P if plain => self.tool = Tool::Pen,
                 Key::M if s && !c && !a => self.tool = Tool::ShapeBuilder,
                 Key::I if plain => self.toggle_eyedropper(),
@@ -1733,6 +1752,36 @@ impl App {
                     }
                     if mode == "2" {
                         self.sel.clear();
+                    }
+                }
+                // `KANVAS_BENCH_STROKE=1`: stroke putus-putus / posisi stroke di isi frame demo,
+                // plus satu bintang dan satu segi enam dari tool Polygon.
+                if std::env::var("KANVAS_BENCH_STROKE").is_ok() {
+                    let demo: Vec<(u64, f32, f32, Vec<u64>)> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").map(|n| (n.id, n.x, n.y, n.children.iter().map(|c| c.id).collect())).collect();
+                    for (frame, fx, fy, ids) in demo {
+                        for (i, id) in ids.into_iter().enumerate() {
+                            if let Some(n) = self.doc.find_mut(id) {
+                                if n.kind != Kind::Text {
+                                    n.stroke = Some([20, 20, 20, 255]);
+                                    n.stroke_w = 6.0;
+                                    n.stroke_align = Some((i % 3) as u8);
+                                    if i % 2 == 0 {
+                                        n.dash = 14.0;
+                                        n.gap = 8.0;
+                                    }
+                                }
+                            }
+                        }
+                        for (star, x) in [(true, 760.0), (false, 960.0)] {
+                            let id = self.doc.alloc_id();
+                            let mut n = Node::new(id, Kind::Path, fx + x, fy + 560.0);
+                            (n.w, n.h, n.closed) = (160.0, 160.0, true);
+                            n.points = polygon::points(&polygon::Options { sides: if star { 5 } else { 6 }, star, inner: 0.45 });
+                            n.fill = Some([255, 196, 0, 255]);
+                            n.stroke = Some([20, 20, 20, 255]);
+                            n.stroke_w = 4.0;
+                            self.doc.insert(n, Some(frame));
+                        }
                     }
                 }
                 if let Ok(q) = std::env::var("KANVAS_BENCH_PHOTOS") {

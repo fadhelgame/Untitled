@@ -823,6 +823,60 @@ pub fn glyph_scale(px: f32, moving: bool, ppp: f32) -> (f32, f32) {
 
 // ---------------------------------------------------------------- node
 
+// ---------------------------------------------------------------- stroke putus-putus
+
+/// Titik-titik keliling kotak bersudut bulat (searah jarum jam dari kiri-atas).
+fn rounded_rect_points(r: Rect, radius: f32) -> Vec<Pos2> {
+    let rad = radius.min(r.width() * 0.5).min(r.height() * 0.5).max(0.0);
+    if rad < 0.5 {
+        return vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+    }
+    let steps = ((rad * 0.5).ceil() as usize).clamp(4, 24);
+    let corners = [
+        (pos2(r.right() - rad, r.top() + rad), -90.0_f32),
+        (pos2(r.right() - rad, r.bottom() - rad), 0.0),
+        (pos2(r.left() + rad, r.bottom() - rad), 90.0),
+        (pos2(r.left() + rad, r.top() + rad), 180.0),
+    ];
+    let mut pts = Vec::with_capacity(4 * (steps + 1));
+    for (c, from) in corners {
+        for i in 0..=steps {
+            let a = (from + 90.0 * i as f32 / steps as f32).to_radians();
+            pts.push(pos2(c.x + rad * a.cos(), c.y + rad * a.sin()));
+        }
+    }
+    pts
+}
+
+fn ellipse_points(c: Pos2, radius: egui::Vec2) -> Vec<Pos2> {
+    let steps = ((radius.x + radius.y).sqrt() * 4.0).clamp(16.0, 256.0) as usize;
+    (0..steps)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / steps as f32;
+            pos2(c.x + radius.x * a.cos(), c.y + radius.y * a.sin())
+        })
+        .collect()
+}
+
+/// Gambar garis putus-putus sepanjang `pts` (ukuran dash dalam satuan dokumen, diskalakan zoom).
+fn add_dashed(sink: &mut Sink, mut pts: Vec<Pos2>, closed: bool, s: Stroke, n: &Node, z: f32) {
+    if closed {
+        if let Some(first) = pts.first().copied() {
+            pts.push(first);
+        }
+    }
+    let dash = n.dash * z;
+    let gap = if n.gap > 0.0 { n.gap } else { n.dash } * z;
+    // Terlalu rapat untuk terlihat sebagai putus-putus: gambar garis utuh saja.
+    if dash + gap < 2.0 {
+        sink.add(Shape::line(pts, s));
+        return;
+    }
+    for shape in Shape::dashed_line(&pts, s, dash, gap) {
+        sink.add(shape);
+    }
+}
+
 // ---------------------------------------------------------------- drop shadow
 
 /// Resolusi tekstur bayangan (piksel per satuan dokumen): tidak perlu lebih halus dari layar,
@@ -1011,7 +1065,20 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 }
             }
             if let Some(s) = stroke {
-                sink.add(Shape::rect_stroke(r, rad, s, StrokeKind::Inside));
+                let inset = n.stroke_inset() * z;
+                if n.dash > 0.0 {
+                    let pts = rounded_rect_points(r.shrink(inset), rad.nw as f32 - inset);
+                    add_dashed(&mut sink, pts, true, s, n, z);
+                } else {
+                    let kind = if inset > 0.0 {
+                        StrokeKind::Inside
+                    } else if inset < 0.0 {
+                        StrokeKind::Outside
+                    } else {
+                        StrokeKind::Middle
+                    };
+                    sink.add(Shape::rect_stroke(r, rad, s, kind));
+                }
             }
         }
         Kind::Ellipse => {
@@ -1029,16 +1096,23 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 }
             }
             if let Some(s) = stroke {
-                let mut e = ellipse(Color32::TRANSPARENT);
-                e.stroke = s;
-                sink.add(e);
+                let radius = (r.size() * 0.5 - egui::Vec2::splat(n.stroke_inset() * z)).max(egui::Vec2::ZERO);
+                if n.dash > 0.0 {
+                    add_dashed(&mut sink, ellipse_points(r.center(), radius), true, s, n, z);
+                } else {
+                    sink.add(egui::epaint::EllipseShape::stroke(r.center(), radius, s));
+                }
             }
         }
         Kind::Line => {
             if let Some(s) = stroke {
                 let a = pc.view.to_screen(pc.o, n.x, n.y);
                 let b = pc.view.to_screen(pc.o, n.x + n.w, n.y + n.h);
-                sink.add(Shape::line_segment([a, b], s));
+                if n.dash > 0.0 {
+                    add_dashed(&mut sink, vec![a, b], false, s, n, z);
+                } else {
+                    sink.add(Shape::line_segment([a, b], s));
+                }
             }
         }
         Kind::Path => {
@@ -1090,9 +1164,16 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 }
             }
             if let Some(s) = stroke {
-                sink.add(if n.closed { Shape::closed_line(pts, s) } else { Shape::line(pts, s) });
-                for h in holes {
-                    sink.add(Shape::closed_line(h, s));
+                if n.dash > 0.0 {
+                    add_dashed(&mut sink, pts, n.closed, s, n, z);
+                    for h in holes {
+                        add_dashed(&mut sink, h, true, s, n, z);
+                    }
+                } else {
+                    sink.add(if n.closed { Shape::closed_line(pts, s) } else { Shape::line(pts, s) });
+                    for h in holes {
+                        sink.add(Shape::closed_line(h, s));
+                    }
                 }
             }
         }
