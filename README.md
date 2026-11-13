@@ -3,13 +3,13 @@
 <p align="center">
   <b>A lightweight, native design editor for Windows, written in Rust.</b><br>
   Infinite canvas, unlimited frames, the whole Google Fonts catalog, vector tools and clean exports,<br>
-  in a single 13 MB file with nothing to install.
+  in a single 35 MB file with nothing to install.
 </p>
 
 <p align="center">
   <img alt="100% Rust" src="https://img.shields.io/badge/100%25-Rust-b7410e?style=flat-square&logo=rust">
   <img alt="Windows 64-bit" src="https://img.shields.io/badge/Windows-64--bit-2f7bf5?style=flat-square">
-  <img alt="Single 13 MB exe" src="https://img.shields.io/badge/single%20exe-13%20MB-2e8b6f?style=flat-square">
+  <img alt="Single 35 MB exe" src="https://img.shields.io/badge/single%20exe-35%20MB-2e8b6f?style=flat-square">
   <img alt="No install" src="https://img.shields.io/badge/install-not%20needed-3a3a3a?style=flat-square">
 </p>
 
@@ -45,7 +45,7 @@
     </td>
     <td width="25%" valign="top">
       <h3>📦 Nothing to install</h3>
-      One 13 MB <code>.exe</code>. Download it, double-click it, start designing. No account and no sign-in.
+      One 35 MB <code>.exe</code>. Download it, double-click it, start designing. No account and no sign-in.
     </td>
     <td width="25%" valign="top">
       <h3>🔤 Every Google Font</h3>
@@ -62,7 +62,7 @@
 
 ## Download
 
-**[⬇ Download Kanvas.exe](https://github.com/fadhelgame/Untitled/raw/master/Kanvas.exe)** · Windows 64-bit · about 13 MB
+**[⬇ Download Kanvas.exe](https://github.com/fadhelgame/Untitled/raw/master/Kanvas.exe)** · Windows 64-bit · about 35 MB
 
 1. Download the file.
 2. Double-click `Kanvas.exe`. There is no installer.
@@ -117,7 +117,7 @@ Every screenshot here is the real app.
       <h3>Images</h3>
       Drop or paste PNG, JPEG, WebP, GIF, BMP and SVG. Round the corners, tint an icon with a color overlay, or use a clipping mask. The <i>Icons</i> button in the toolbar searches 200,000+ open-source icons (Iconify) and drops them in as recolorable SVGs; <i>Photos</i> searches free-to-use stock photos (Openverse) and keeps the author credit in the layer name. <i>Remove background</i> runs on your computer in a couple of seconds; the first use downloads a 170 MB model.
       <h3>Export exactly what you see</h3>
-      Export a frame, a selection or the whole document to <b>PNG, JPG or SVG</b>, from 0.1x up to 16x. Text is exported as outlines, so the file looks the same on every computer.
+      Export a frame, a selection or the whole document to <b>PNG, JPG or SVG</b>, from 0.1x up to 16x, or to a vector <b>PDF</b> with one page per frame, in reading order. Paper-size frames come out at the exact paper size. Text is exported as outlines, so the file looks the same on every computer.
     </td>
   </tr>
 </table>

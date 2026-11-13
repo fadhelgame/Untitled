@@ -392,6 +392,63 @@ pub fn save_raster(svg: &str, w: f32, h: f32, scale: f32, jpg: bool, path: &Path
         .map_err(|e| e.to_string())
 }
 
+/// Simpan beberapa SVG sebagai satu PDF, satu halaman per SVG: (svg, lebar, tinggi).
+/// Isinya tetap vektor (teks sudah berupa outline), dan 1 satuan dokumen = 1 pt, sehingga frame
+/// dari preset kertas (A4 = 595×842) keluar dengan ukuran kertas yang tepat.
+pub fn save_pdf(pages: &[(String, f32, f32)], path: &Path) -> Result<(), String> {
+    use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref};
+    use resvg::usvg;
+    let mut alloc = Ref::new(1);
+    let (catalog_id, tree_id) = (alloc.bump(), alloc.bump());
+    let mut pdf = Pdf::new();
+    let mut kids = Vec::new();
+    let name = Name(b"S");
+    for (svg, w, h) in pages {
+        let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).map_err(|e| e.to_string())?;
+        let (chunk, root) = svg2pdf::to_chunk(&tree, svg2pdf::ConversionOptions::default()).map_err(|e| e.to_string())?;
+        // Nomor objek tiap halaman dibuat ulang supaya tidak bertabrakan di dalam satu file.
+        let mut map = std::collections::HashMap::new();
+        let chunk = chunk.renumber(|old| *map.entry(old).or_insert_with(|| alloc.bump()));
+        let root = *map.get(&root).ok_or("the page couldn't be converted")?;
+        let (page_id, content_id) = (alloc.bump(), alloc.bump());
+        let mut page = pdf.page(page_id);
+        page.media_box(Rect::new(0.0, 0.0, *w, *h));
+        page.parent(tree_id);
+        page.contents(content_id);
+        page.resources().x_objects().pair(name, root);
+        page.finish();
+        // Hasil konversi berukuran 1×1; dibentangkan ke ukuran halaman.
+        let mut content = Content::new();
+        content.transform([*w, 0.0, 0.0, *h, 0.0, 0.0]).x_object(name);
+        pdf.stream(content_id, &content.finish());
+        pdf.extend(&chunk);
+        kids.push(page_id);
+    }
+    pdf.catalog(catalog_id).pages(tree_id);
+    pdf.pages(tree_id).kids(kids.iter().copied()).count(kids.len() as i32);
+    std::fs::write(path, pdf.finish()).map_err(|e| e.to_string())
+}
+
+/// Urutan halaman untuk export PDF: frame level atas yang terlihat, dibaca seperti teks
+/// (baris demi baris dari atas, tiap baris dari kiri ke kanan).
+pub fn pdf_pages(doc: &Doc) -> Vec<u64> {
+    let mut frames: Vec<(u64, (f32, f32, f32, f32))> =
+        doc.nodes.iter().filter(|n| n.kind == Kind::Frame && n.visible).map(|n| (n.id, n.aabb())).collect();
+    frames.sort_by(|a, b| a.1 .1.total_cmp(&b.1 .1));
+    let mut rows: Vec<Vec<(u64, (f32, f32, f32, f32))>> = Vec::new();
+    for frame in frames {
+        match rows.last_mut() {
+            // Masih satu baris kalau tepi atasnya belum melewati tengah frame pertama di baris itu.
+            Some(row) if frame.1 .1 < (row[0].1 .1 + row[0].1 .3) * 0.5 => row.push(frame),
+            _ => rows.push(vec![frame]),
+        }
+    }
+    for row in &mut rows {
+        row.sort_by(|a, b| a.1 .0.total_cmp(&b.1 .0));
+    }
+    rows.into_iter().flatten().map(|f| f.0).collect()
+}
+
 /// Simpan tangkapan layar RGBA (dipakai mode --bench).
 pub fn save_rgba(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
     let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h).ok_or("couldn't create the bitmap")?;

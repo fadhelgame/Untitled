@@ -3,7 +3,7 @@
 use super::picker::paint_row;
 use super::*;
 
-const FORMATS: [&str; 3] = ["PNG", "JPG", "SVG"];
+const FORMATS: [&str; 4] = ["PNG", "JPG", "SVG", "PDF"];
 
 impl App {
     pub(super) fn props(&mut self, ui: &mut egui::Ui) {
@@ -695,7 +695,7 @@ impl App {
             .on_hover_text("Scale: drag, or click and type any value (e.g. 2 or 0.5)");
             egui::ComboBox::from_id_salt(ui.id().with("export_format"))
                 .width(70.0)
-                .selected_text(FORMATS[self.ext.export_fmt.min(2)])
+                .selected_text(FORMATS[self.ext.export_fmt.min(3)])
                 .show_ui(ui, |ui| {
                     for (i, name) in FORMATS.iter().enumerate() {
                         ui.selectable_value(&mut self.ext.export_fmt, i, *name);
@@ -704,6 +704,10 @@ impl App {
         });
         let target = match self.sel.as_slice() {
             [id] => self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default(),
+            _ if self.ext.export_fmt == 3 => match self.pdf_targets().len() {
+                1 => "1 page".to_owned(),
+                n => format!("{n} pages"),
+            },
             _ => "whole document".to_owned(),
         };
         let label = format!("Export {}", target.chars().take(22).collect::<String>());
@@ -717,13 +721,51 @@ impl App {
         self.export_controls(ui, ctx);
     }
 
+    /// Halaman untuk export PDF: objek terpilih, atau semua frame kalau tidak ada yang dipilih.
+    /// `None` di dalam daftar = seluruh dokumen sebagai satu halaman (dokumen tanpa frame).
+    fn pdf_targets(&self) -> Vec<Option<u64>> {
+        if !self.sel.is_empty() {
+            return self.sel.iter().map(|id| Some(*id)).collect();
+        }
+        let frames = export::pdf_pages(&self.doc);
+        if frames.is_empty() {
+            return vec![None];
+        }
+        frames.into_iter().map(Some).collect()
+    }
+
+    fn export_pdf(&mut self, ctx: &egui::Context) {
+        let targets = self.pdf_targets();
+        let pages: Vec<(String, f32, f32)> = targets.iter().filter_map(|t| export::to_svg(&self.doc, *t, &mut self.fonts, ctx)).collect();
+        if pages.is_empty() {
+            self.status = "Nothing to export.".into();
+            return;
+        }
+        let name = match (targets.as_slice(), &self.path) {
+            ([Some(id)], _) => self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default(),
+            (_, Some(path)) => path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            _ => "kanvas".into(),
+        };
+        let safe: String = name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
+        let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{safe}.pdf")).save_file() else {
+            return;
+        };
+        self.status = match export::save_pdf(&pages, &path) {
+            Ok(()) => format!("Exported {} page(s): {}", pages.len(), path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
+    }
+
     fn export_now(&mut self, ctx: &egui::Context) {
+        if self.ext.export_fmt == 3 {
+            return self.export_pdf(ctx);
+        }
         let only = if self.sel.len() == 1 { Some(self.sel[0]) } else { None };
         let Some((svg, w, h)) = export::to_svg(&self.doc, only, &mut self.fonts, ctx) else {
             self.status = "Nothing to export.".into();
             return;
         };
-        let fmt = self.ext.export_fmt.min(2);
+        let fmt = self.ext.export_fmt.min(3);
         let scale = self.ext.export_scale.clamp(0.1, 16.0);
         let ext = FORMATS[fmt].to_lowercase();
         let name = only.and_then(|id| self.doc.find(id)).map(|n| n.name.clone()).unwrap_or_else(|| "kanvas".into());

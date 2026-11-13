@@ -1674,6 +1674,9 @@ impl App {
                         if let Some((svg, w, h)) = export::to_svg(&self.doc, Some(demo), &mut self.fonts, ctx) {
                             let _ = export::save_raster(&svg, w, h, 1.0, false, &b.out.with_file_name("bench-export.png"));
                         }
+                        let ids: Vec<u64> = std::iter::once(demo).chain(export::pdf_pages(&self.doc).into_iter().filter(|id| *id != demo).take(3)).collect();
+                        let pages: Vec<(String, f32, f32)> = ids.iter().filter_map(|id| export::to_svg(&self.doc, Some(*id), &mut self.fonts, ctx)).collect();
+                        let _ = export::save_pdf(&pages, &b.out.with_file_name("bench-export.pdf"));
                     }
                     let mut s = b.samples.clone();
                     s.sort_by(|a, b| a.total_cmp(b));
