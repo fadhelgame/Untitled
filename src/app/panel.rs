@@ -798,6 +798,14 @@ impl App {
                             if resp.on_hover_text("Eyedropper   I").clicked() {
                                 self.toggle_eyedropper();
                             }
+                            // Icons: buka/tutup jendela pencarian icon.
+                            separator(ui);
+                            let active = self.icons.open;
+                            let (rect, resp) = button(ui, active);
+                            super::icons::toolbar_icon(ui.painter(), rect.center(), if active { Color32::WHITE } else { Color32::from_gray(225) });
+                            if resp.on_hover_text("Icons").clicked() {
+                                self.toggle_icons();
+                            }
                             // Export: popup di atas toolbar dengan skala dan format.
                             separator(ui);
                             let popup_id = ui.make_persistent_id("export_popup");
@@ -858,6 +866,7 @@ impl eframe::App for App {
         self.fonts.poll(ctx);
         self.ext.poll(ctx);
         self.rembg_poll();
+        self.icons.poll(ctx);
         self.remote_poll(ctx);
         self.frame_ms = frame.info().cpu_usage.unwrap_or(0.0) * 1000.0;
         self.close_flow(ctx);
@@ -902,6 +911,7 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(CANVAS_BG))
             .show(ctx, |ui| self.canvas(ui));
         self.toolbar(ctx);
+        self.icons_window(ctx);
         self.eyedropper(ctx);
 
         let name = self.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled".into(), |n| n.to_string_lossy());

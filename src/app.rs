@@ -13,6 +13,7 @@ pub(crate) mod blend;
 mod builder;
 mod canvas;
 mod home;
+mod icons;
 mod panel;
 mod pen;
 mod picker;
@@ -307,6 +308,8 @@ pub struct App {
     remote: Option<remote::Remote>,
     /// Pengaturan magic wand.
     wand: wand::Wand,
+    /// Jendela pencarian icon (Iconify).
+    icons: icons::Icons,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -380,6 +383,7 @@ impl App {
             files: home::Files::new(&cc.egui_ctx),
             rembg: None,
             remote: None,
+            icons: Default::default(),
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -1596,11 +1600,17 @@ impl App {
                 self.fit_all();
                 // Pilih satu teks supaya panel font (dengan preview) ikut terlihat di tangkapan layar.
                 self.bench_demo();
+                // `KANVAS_BENCH_ICONS=<kata>`: buka jendela icon dan cari, supaya ikut di tangkapan layar.
+                if let Ok(q) = std::env::var("KANVAS_BENCH_ICONS") {
+                    self.icons.open = true;
+                    self.icons.query = q;
+                    self.icons.search(ctx);
+                }
                 let target = self.doc.nodes.get(30).map(|n| n.bounds());
                 let _ = target;
             }
             _ => {
-                let ready = !self.fonts.any_loading() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
+                let ready = !self.fonts.any_loading() && !self.icons.busy() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
@@ -1620,6 +1630,11 @@ impl App {
                                 b.inject.push((f + 4 + s, egui::Event::PointerMoved(from + (to - from) * (s as f32 / 4.0))));
                             }
                             b.inject.push((f + 10, button(to, false)));
+                        }
+                    }
+                    if b.frame == b.mark + 100 {
+                        if let Some(i) = self.first_ready_icon() {
+                            self.add_icon(i);
                         }
                     }
                     if b.frame == b.mark + 115 {
