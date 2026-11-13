@@ -1697,10 +1697,8 @@ impl App {
                             n.shadow = Some(crate::doc::Shadow { x: 6.0, y: 10.0, blur: 14.0, color: [0, 0, 0, 120] });
                         }
                     }
-                    // Gulir panel properti ke bawah supaya bagian Drop shadow ikut di tangkapan layar.
-                    let at = pos2(ctx.screen_rect().right() - 150.0, 500.0);
-                    let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
-                    b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
+                    // Buka tab Effects supaya bagian Drop shadow ikut di tangkapan layar.
+                    self.ext.props_tab = 1;
                 }
                 // `KANVAS_BENCH_BLUR=1`: layer blur di frame demo — satu kotak, satu group (elips +
                 // bintang, buram sebagai satu gambar), teks, alas clipping mask, dan objek ber-blend.
@@ -1723,9 +1721,7 @@ impl App {
                                 n.blur = blur;
                             }
                         }
-                        let at = pos2(ctx.screen_rect().right() - 150.0, 500.0);
-                        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
-                        b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
+                        self.ext.props_tab = 1;
                     }
                 }
                 // `KANVAS_BENCH_LOCK=1`: kunci isi frame demo dan buka frame-nya di panel layer.

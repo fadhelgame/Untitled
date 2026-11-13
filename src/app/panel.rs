@@ -95,10 +95,35 @@ impl App {
         let mut style_action: Option<super::styles::StyleAction> = None;
         let has_parent = self.doc.parent_of(id).is_some();
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        prop_tabs(ui, &mut self.ext.props_tab, n.shadow.is_some() || n.blur > 0.0);
+        let tab = self.ext.props_tab;
+        egui::ScrollArea::vertical().id_salt(("props", tab)).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.label(theme::title(n.kind.label()));
             ui.add(egui::TextEdit::singleline(&mut n.name).desired_width(f32::INFINITY));
+            if tab == 1 {
+                let half = (ui.available_width() - 8.0) / 2.0;
+                section(ui, "Drop shadow");
+                let mut shadow_color = n.shadow.map(|s| s.color);
+                paint_row(ui, &mut self.ext.picker, (id, 2), &mut shadow_color, None, crate::doc::Shadow::default().color);
+                n.shadow = match (shadow_color, n.shadow) {
+                    (Some(color), Some(s)) => Some(crate::doc::Shadow { color, ..s }),
+                    (Some(color), None) => Some(crate::doc::Shadow { color, ..Default::default() }),
+                    (None, _) => None,
+                };
+                if let Some(s) = &mut n.shadow {
+                    ui.horizontal(|ui| {
+                        let third = (ui.available_width() - 16.0) / 3.0;
+                        ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.x).speed(0.25).max_decimals(1).prefix("X  "));
+                        ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.y).speed(0.25).max_decimals(1).prefix("Y  "));
+                        ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.blur).speed(0.25).range(0.0..=500.0).max_decimals(1).prefix("Blur  "));
+                    });
+                }
+                section(ui, "Layer blur");
+                blur_field(ui, half, &mut n.blur).on_hover_text("Blurs the whole layer, with its shadow. On a frame, the contents are blurred too. 0 = off");
+                ui.add_space(12.0);
+                return;
+            }
 
             section(ui, "Position");
             sub(ui, "Alignment");
@@ -249,24 +274,6 @@ impl App {
                     });
                 }
             }
-            section(ui, "Drop shadow");
-            let mut shadow_color = n.shadow.map(|s| s.color);
-            paint_row(ui, &mut self.ext.picker, (id, 2), &mut shadow_color, None, crate::doc::Shadow::default().color);
-            n.shadow = match (shadow_color, n.shadow) {
-                (Some(color), Some(s)) => Some(crate::doc::Shadow { color, ..s }),
-                (Some(color), None) => Some(crate::doc::Shadow { color, ..Default::default() }),
-                (None, _) => None,
-            };
-            if let Some(s) = &mut n.shadow {
-                ui.horizontal(|ui| {
-                    let third = (ui.available_width() - 16.0) / 3.0;
-                    ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.x).speed(0.25).max_decimals(1).prefix("X  "));
-                    ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.y).speed(0.25).max_decimals(1).prefix("Y  "));
-                    ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.blur).speed(0.25).range(0.0..=500.0).max_decimals(1).prefix("Blur  "));
-                });
-            }
-            section(ui, "Layer blur");
-            blur_field(ui, half, &mut n.blur).on_hover_text("Blurs the whole layer, with its shadow. On a frame, the contents are blurred too. 0 = off");
             self.export_section(ui, &ctx);
             ui.add_space(12.0);
         });
@@ -371,7 +378,9 @@ impl App {
         let mut align: Option<u8> = None;
         const MIXED: &str = "Mixed — showing the first layer; a change applies to all.";
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        prop_tabs(ui, &mut self.ext.props_tab, n.blur > 0.0);
+        let tab = self.ext.props_tab;
+        egui::ScrollArea::vertical().id_salt(("props", tab)).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.label(theme::title(&title));
             if let Some(g) = group {
@@ -384,6 +393,20 @@ impl App {
                 }
             }
             ui.weak(format!("{} layers selected", ids.len()));
+            if tab == 1 {
+                let half = (ui.available_width() - 8.0) / 2.0;
+                section(ui, "Layer blur");
+                if mixed_blur {
+                    ui.weak(MIXED);
+                }
+                blur_field(ui, half, &mut n.blur).on_hover_text(if group.is_some() {
+                    "Blurs the whole group as one layer. 0 = off"
+                } else {
+                    "Blurs each selected layer. Group them first to blur them together as one. 0 = off"
+                });
+                ui.add_space(12.0);
+                return;
+            }
             section(ui, "Position");
             sub(ui, "Alignment");
             if let Some(mode) = align_buttons(ui) {
@@ -446,15 +469,6 @@ impl App {
                     );
                 }
             }
-            section(ui, "Layer blur");
-            if mixed_blur {
-                ui.weak(MIXED);
-            }
-            blur_field(ui, half, &mut n.blur).on_hover_text(if group.is_some() {
-                "Blurs the whole group as one layer. 0 = off"
-            } else {
-                "Blurs each selected layer. Group them first to blur them together as one. 0 = off"
-            });
             self.export_section(ui, ctx);
             ui.add_space(12.0);
         });
@@ -961,6 +975,32 @@ impl App {
                         });
                     });
             });
+    }
+}
+
+/// Tab di atas panel properti: Design dan Effects. `has_effects` memberi titik penanda di tab
+/// Effects supaya efek yang aktif tetap kelihatan dari tab Design.
+fn prop_tabs(ui: &mut egui::Ui, tab: &mut u8, has_effects: bool) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(9), ui.visuals().extreme_bg_color);
+    let cell = (rect.width() - 4.0) / 2.0;
+    for (i, name) in ["Design", "Effects"].into_iter().enumerate() {
+        let r = Rect::from_min_size(pos2(rect.left() + 2.0 + i as f32 * cell, rect.top() + 2.0), vec2(cell, 28.0));
+        let resp = ui.interact(r, ui.id().with(("prop_tab", i)), Sense::click());
+        let active = *tab == i as u8;
+        if active {
+            ui.painter().rect_filled(r, CornerRadius::same(7), Color32::from_rgb(62, 62, 67));
+        } else if resp.hovered() {
+            ui.painter().rect_filled(r, CornerRadius::same(7), Color32::from_rgb(44, 44, 48));
+        }
+        let color = if active { Color32::from_gray(240) } else { Color32::from_gray(160) };
+        let text = ui.painter().text(r.center(), Align2::CENTER_CENTER, name, FontId::new(13.0, theme::strong()), color);
+        if i == 1 && has_effects {
+            ui.painter().circle_filled(pos2(text.right() + 7.0, r.center().y), 2.5, ACCENT);
+        }
+        if resp.clicked() {
+            *tab = i as u8;
+        }
     }
 }
 
