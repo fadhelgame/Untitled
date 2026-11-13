@@ -67,7 +67,10 @@ impl App {
             self.view.pan += inp.scroll;
         }
         if let Some(p) = inp.pos {
-            self.pointer(p, &inp, hovered, space);
+            // Penggaris dan guide didahulukan; sisanya interaksi canvas biasa.
+            if !self.ruler_pointer(p, &inp, hovered) {
+                self.pointer(p, &inp, hovered, space);
+            }
             if resp.double_clicked() {
                 if self.tool == Tool::Pen {
                     // egui menghitung klik ganda dari waktu saja; dua titik yang diklik cepat di tempat
@@ -236,6 +239,7 @@ impl App {
             }
             _ => {}
         }
+        self.paint_ruler_guides(&painter, inp.pos);
         self.paint_guides(&painter);
         self.paint_grad(&painter);
         if self.tool == Tool::Pen {
@@ -292,6 +296,7 @@ impl App {
         self.paint_rotate_cursor(&painter, inp.pos, hovered);
 
         self.text_editor(&ctx, &painter, hovered);
+        self.paint_rulers(&ctx, &painter, inp.pos, hovered);
     }
 
     fn outline(&self, painter: &egui::Painter, n: &Node, width: f32) {

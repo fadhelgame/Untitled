@@ -113,7 +113,7 @@ Every screenshot here is the real app.
       <br><br>
       The <b>Shape builder</b> splits overlapping shapes into regions. Drag across regions to merge them, Alt-click to remove them. The result is clean bezier curves, not jagged polygons.
       <h3>Select smarter</h3>
-      The <b>Magic wand</b> selects every object that shares a property with the one you click, with a tolerance for near-matching colors. Objects snap to edges and centers of their neighbors with guide lines as you move them.
+      The <b>Magic wand</b> selects every object that shares a property with the one you click, with a tolerance for near-matching colors. Objects snap to edges and centers of their neighbors with guide lines as you move them. Turn on <b>rulers</b> with <code>Shift+R</code> and drag <b>guides</b> out of them; objects snap to guides too.
       <h3>Images</h3>
       Drop or paste PNG, JPEG, WebP, GIF, BMP and SVG. Round the corners, tint an icon with a color overlay, or use a clipping mask. The <i>Icons</i> button in the toolbar searches 200,000+ open-source icons (Iconify) and drops them in as recolorable SVGs; <i>Photos</i> searches free-to-use stock photos (Openverse) and keeps the author credit in the layer name. <i>Remove background</i> runs on your computer in a couple of seconds; the first use downloads a 170 MB model.
       <h3>Export exactly what you see</h3>

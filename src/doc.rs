@@ -726,6 +726,13 @@ impl Node {
     }
 }
 
+/// Garis bantu (guide) di canvas: garis vertikal di x = `at`, atau horizontal di y = `at`.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct RulerGuide {
+    pub vertical: bool,
+    pub at: f32,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Doc {
     pub nodes: Vec<Arc<Node>>,
@@ -736,6 +743,9 @@ pub struct Doc {
     /// Nama group per id group (ditampilkan di panel layer).
     #[serde(default)]
     pub group_names: BTreeMap<u64, String>,
+    /// Garis bantu yang ditarik dari penggaris.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guides: Vec<RulerGuide>,
 }
 
 impl Doc {

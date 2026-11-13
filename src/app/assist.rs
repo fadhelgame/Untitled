@@ -48,6 +48,16 @@ impl App {
                 }
             }
         }
+        // Guide dari penggaris juga jadi kandidat tempel.
+        if self.rulers.show {
+            for g in &self.doc.guides {
+                if g.vertical {
+                    xs.push((g.at, orig.1, orig.3));
+                } else {
+                    ys.push((g.at, orig.0, orig.2));
+                }
+            }
+        }
         self.ext.snap = Some(Snap { orig, xs, ys });
     }
 

@@ -21,6 +21,7 @@ mod picker;
 mod presets;
 pub mod rembg;
 mod remote;
+mod rulers;
 pub(crate) mod render;
 mod theme;
 mod vtext;
@@ -318,6 +319,8 @@ pub struct App {
     icons: icons::Icons,
     /// Jendela pencarian foto stok (Openverse).
     photos: photos::Photos,
+    /// Penggaris dan guide yang sedang ditarik.
+    rulers: rulers::Rulers,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -393,6 +396,7 @@ impl App {
             remote: None,
             icons: Default::default(),
             photos: Default::default(),
+            rulers: Default::default(),
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -1173,6 +1177,8 @@ impl App {
                 Key::Y if plain => self.tool = Tool::Wand,
                 Key::H if plain => self.tool = Tool::Hand,
                 Key::F if plain => self.tool = Tool::Frame,
+                // Shift+R penggaris dan guide
+                Key::R if s && !c && !a => self.toggle_rulers(),
                 Key::R if plain => self.tool = Tool::Rect,
                 Key::O if plain => self.tool = Tool::Ellipse,
                 Key::L if plain => self.tool = Tool::Line,
@@ -1332,6 +1338,10 @@ impl App {
                 if ui.add(egui::Button::new("Zoom to fit").shortcut_text("Shift+1")).clicked() {
                     ui.close_menu();
                     self.fit_all();
+                }
+                if ui.add(egui::Button::new(if self.rulers.show { "Hide rulers and guides" } else { "Show rulers and guides" }).shortcut_text("Shift+R")).clicked() {
+                    ui.close_menu();
+                    self.toggle_rulers();
                 }
                 ui.separator();
                 if ui.button("Stress test: add 500 frames").clicked() {
@@ -1683,6 +1693,23 @@ impl App {
                         }
                     }
                 }
+                // `KANVAS_BENCH_RULERS=1`: tampilkan penggaris dengan dua guide di frame demo.
+                if std::env::var("KANVAS_BENCH_RULERS").is_ok() {
+                    self.rulers.show = true;
+                    if let Some((x, y)) = self.doc.nodes.iter().find(|n| n.name == "Feature demo").map(|n| (n.x, n.y)) {
+                        self.doc.guides.push(crate::doc::RulerGuide { vertical: true, at: x + 40.0 });
+                        self.doc.guides.push(crate::doc::RulerGuide { vertical: false, at: y + 280.0 });
+                        // Uji tarik: guide horizontal baru dari penggaris atas, lalu geser guide vertikal.
+                        let r = self.canvas_rect;
+                        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                        let mv = egui::Event::PointerMoved;
+                        let (p0, p1) = (pos2(r.center().x, r.top() + 8.0), pos2(r.center().x, r.top() + 60.0));
+                        b_inject(&mut b.inject, &[(200, mv(p0)), (202, button(p0, true)), (204, mv(p0 + (p1 - p0) * 0.5)), (206, mv(p1)), (208, button(p1, false))]);
+                        let gx = self.view.to_screen(r.min, x + 40.0, 0.0).x;
+                        let (c, d) = (pos2(gx, r.top() + 120.0), pos2(gx + 200.0, r.top() + 120.0));
+                        b_inject(&mut b.inject, &[(220, mv(c)), (222, button(c, true)), (224, mv(c + (d - c) * 0.5)), (226, mv(d)), (228, button(d, false)), (230, mv(r.center()))]);
+                    }
+                }
                 if let Ok(q) = std::env::var("KANVAS_BENCH_PHOTOS") {
                     self.photos.open = true;
                     self.photos.query = q;
@@ -1800,6 +1827,11 @@ impl App {
         }
         self.bench = Some(b);
     }
+}
+
+/// Mode `--bench`: jadwalkan event pointer buatan.
+fn b_inject(queue: &mut Vec<(u32, egui::Event)>, events: &[(u32, egui::Event)]) {
+    queue.extend(events.iter().cloned());
 }
 
 /// Gembok kecil untuk panel layer: tertutup (terkunci) atau terbuka.
