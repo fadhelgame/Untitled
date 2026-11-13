@@ -297,6 +297,13 @@ pub struct Node {
     /// Drop shadow di belakang objek.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<Shadow>,
+    /// Color style yang dipakai fill / stroke, dan text style (id ke `Doc::colors` / `Doc::type_styles`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_style: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_style: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_style: Option<u64>,
     #[serde(default)]
     pub children: Vec<Node>,
 }
@@ -457,6 +464,9 @@ impl Node {
             group: 0,
             clip: false,
             shadow: None,
+            fill_style: None,
+            stroke_style: None,
+            type_style: None,
             children: Vec::new(),
         }
     }
@@ -726,6 +736,67 @@ impl Node {
     }
 }
 
+/// Color style: satu warna bernama. Objek yang memakainya menyimpan id-nya di `fill_style` /
+/// `stroke_style`; warnanya disalin ke objek setiap kali style berubah.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct ColorStyle {
+    pub id: u64,
+    pub name: String,
+    pub color: [u8; 4],
+}
+
+/// Text style: font, ketebalan, ukuran, dan jarak. Warna teks tidak termasuk (itu color style).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct TypeStyle {
+    pub id: u64,
+    pub name: String,
+    pub font: String,
+    pub weight: u16,
+    pub italic: bool,
+    pub size: f32,
+    pub line_height: f32,
+    pub letter_spacing: f32,
+}
+
+impl TypeStyle {
+    /// Gaya teks node ini (tanpa id dan nama).
+    pub fn of(n: &Node) -> Self {
+        TypeStyle {
+            id: 0,
+            name: String::new(),
+            font: n.font.clone(),
+            weight: n.weight,
+            italic: n.italic,
+            size: n.font_size,
+            line_height: n.line_height,
+            letter_spacing: n.letter_spacing,
+        }
+    }
+
+    pub fn matches(&self, n: &Node) -> bool {
+        self.font == n.font
+            && self.weight == n.weight
+            && self.italic == n.italic
+            && self.size == n.font_size
+            && self.line_height == n.line_height
+            && self.letter_spacing == n.letter_spacing
+    }
+
+    pub fn apply(&self, n: &mut Node) {
+        n.font = self.font.clone();
+        n.weight = self.weight;
+        n.italic = self.italic;
+        n.font_size = self.size;
+        n.line_height = self.line_height;
+        n.letter_spacing = self.letter_spacing;
+    }
+
+    /// Ringkasan satu baris, mis. "Montserrat 24 · Bold".
+    pub fn summary(&self) -> String {
+        format!("{} {} · {}{}", self.font, self.size, crate::fonts::weight_name(self.weight), if self.italic { " Italic" } else { "" })
+    }
+}
+
 /// Garis bantu (guide) di canvas: garis vertikal di x = `at`, atau horizontal di y = `at`.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct RulerGuide {
@@ -746,9 +817,101 @@ pub struct Doc {
     /// Garis bantu yang ditarik dari penggaris.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guides: Vec<RulerGuide>,
+    /// Color styles: warna bernama yang dipakai bersama.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub colors: Vec<ColorStyle>,
+    /// Text styles: gaya teks bernama yang dipakai bersama.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_styles: Vec<TypeStyle>,
 }
 
 impl Doc {
+    pub fn color_style(&self, id: u64) -> Option<&ColorStyle> {
+        self.colors.iter().find(|s| s.id == id)
+    }
+
+    pub fn type_style(&self, id: u64) -> Option<&TypeStyle> {
+        self.type_styles.iter().find(|s| s.id == id)
+    }
+
+    pub fn add_color_style(&mut self, color: [u8; 4]) -> u64 {
+        let id = self.alloc_id();
+        let name = format!("Color {}", self.colors.len() + 1);
+        self.colors.push(ColorStyle { id, name, color });
+        id
+    }
+
+    pub fn add_type_style(&mut self, from: &Node) -> u64 {
+        let id = self.alloc_id();
+        let name = format!("{} {}", from.font, from.font_size);
+        self.type_styles.push(TypeStyle { id, name, ..TypeStyle::of(from) });
+        id
+    }
+
+    /// Ubah node yang memenuhi `uses` (level atas dan anak frame). Frame yang tidak tersentuh
+    /// tidak disalin, jadi snapshot undo tetap berbagi memori.
+    fn update_nodes(&mut self, uses: impl Fn(&Node) -> bool, mut apply: impl FnMut(&mut Node)) {
+        for top in &mut self.nodes {
+            if uses(top) || top.children.iter().any(&uses) {
+                let top = Arc::make_mut(top);
+                if uses(top) {
+                    apply(top);
+                }
+                for c in top.children.iter_mut().filter(|c| uses(c)) {
+                    apply(c);
+                }
+            }
+        }
+    }
+
+    /// Salin warna style ke semua objek yang memakainya.
+    pub fn sync_color_style(&mut self, id: u64) {
+        let Some(color) = self.color_style(id).map(|s| s.color) else { return };
+        self.update_nodes(
+            |n| n.fill_style == Some(id) || n.stroke_style == Some(id),
+            |n| {
+                if n.fill_style == Some(id) {
+                    n.fill = Some(color);
+                    n.gradient = None;
+                }
+                if n.stroke_style == Some(id) {
+                    n.stroke = Some(color);
+                    if n.stroke_w <= 0.0 {
+                        n.stroke_w = 1.0;
+                    }
+                }
+            },
+        );
+    }
+
+    /// Salin gaya teks style ke semua teks yang memakainya.
+    pub fn sync_type_style(&mut self, id: u64) {
+        let Some(style) = self.type_style(id).cloned() else { return };
+        self.update_nodes(|n| n.type_style == Some(id), |n| style.apply(n));
+    }
+
+    pub fn color_style_uses(&self, id: u64) -> usize {
+        let uses = |n: &Node| (n.fill_style == Some(id)) as usize + (n.stroke_style == Some(id)) as usize;
+        self.nodes.iter().map(|n| uses(n) + n.children.iter().map(uses).sum::<usize>()).sum()
+    }
+
+    /// Setelah style dihapus: lepaskan objek yang masih menunjuk ke style itu (tampilannya tetap).
+    pub fn drop_missing_styles(&mut self) {
+        let colors: Vec<u64> = self.colors.iter().map(|s| s.id).collect();
+        let types: Vec<u64> = self.type_styles.iter().map(|s| s.id).collect();
+        let gone = |list: &[u64], id: Option<u64>| id.is_some_and(|id| !list.contains(&id));
+        let (c2, t2) = (colors.clone(), types.clone());
+        self.update_nodes(
+            move |n| gone(&colors, n.fill_style) || gone(&colors, n.stroke_style) || gone(&types, n.type_style),
+            move |n| {
+                let keep = |list: &[u64], id: Option<u64>| id.filter(|id| list.contains(id));
+                n.fill_style = keep(&c2, n.fill_style);
+                n.stroke_style = keep(&c2, n.stroke_style);
+                n.type_style = keep(&t2, n.type_style);
+            },
+        );
+    }
+
     pub fn alloc_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id

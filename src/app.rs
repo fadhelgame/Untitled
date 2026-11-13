@@ -22,6 +22,7 @@ mod presets;
 pub mod rembg;
 mod remote;
 mod rulers;
+mod styles;
 pub(crate) mod render;
 mod theme;
 mod vtext;
@@ -1708,6 +1709,30 @@ impl App {
                         let gx = self.view.to_screen(r.min, x + 40.0, 0.0).x;
                         let (c, d) = (pos2(gx, r.top() + 120.0), pos2(gx + 200.0, r.top() + 120.0));
                         b_inject(&mut b.inject, &[(220, mv(c)), (222, button(c, true)), (224, mv(c + (d - c) * 0.5)), (226, mv(d)), (228, button(d, false)), (230, mv(r.center()))]);
+                    }
+                }
+                // `KANVAS_BENCH_STYLES=1`: color style dari elips terpilih, dipakai dua objek lain,
+                // lalu warnanya diubah; text style dari judul. `=2`: tanpa seleksi (daftar style tampil).
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_STYLES") {
+                    use styles::StyleAction;
+                    if let Some(id) = self.sel.first().copied() {
+                        self.style_action(id, StyleAction::CreateColor { stroke: false });
+                    }
+                    if let Some(style) = self.doc.colors.first().map(|s| s.id) {
+                        let by_name = |doc: &Doc, name: &str| doc.nodes.iter().flat_map(|n| n.children.iter()).find(|c| c.name == name).map(|c| c.id);
+                        for name in ["Rotated", "Linear gradient"] {
+                            if let Some(id) = by_name(&self.doc, name) {
+                                self.style_action(id, StyleAction::LinkColor { stroke: false, style });
+                            }
+                        }
+                        self.doc.colors[0].color = [20, 160, 90, 255];
+                        self.doc.sync_color_style(style);
+                        if let Some(id) = by_name(&self.doc, "Paragraph") {
+                            self.style_action(id, StyleAction::CreateType);
+                        }
+                    }
+                    if mode == "2" {
+                        self.sel.clear();
                     }
                 }
                 if let Ok(q) = std::env::var("KANVAS_BENCH_PHOTOS") {

@@ -24,6 +24,7 @@ impl App {
             ui.label(theme::title("Design"));
             if self.sel.is_empty() {
                 ui.weak("Nothing selected.");
+                self.styles_manager(ui);
                 ui.add_space(8.0);
                 for line in [
                     "V  move         K  scale",
@@ -88,6 +89,7 @@ impl App {
         let before = n.clone();
         let mut align: Option<u8> = None;
         let mut remove_bg = false;
+        let mut style_action: Option<super::styles::StyleAction> = None;
         let has_parent = self.doc.parent_of(id).is_some();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -164,6 +166,11 @@ impl App {
 
             if n.kind == Kind::Text {
                 self.typography(ui, &ctx, &mut n, editing, range, None);
+                if range.is_none() {
+                    if let Some(a) = super::styles::type_style_row(&self.doc, ui, &mut n) {
+                        style_action = Some(a);
+                    }
+                }
             }
 
             if !matches!(n.kind, Kind::Line | Kind::Image) {
@@ -171,6 +178,11 @@ impl App {
                 // Teks hanya mendukung warna solid.
                 let gradient = if n.kind == Kind::Text { None } else { Some(&mut n.gradient) };
                 paint_row(ui, &mut self.ext.picker, (id, 0), &mut n.fill, gradient, [217, 217, 217, 255]);
+                if range.is_none() {
+                    if let Some(a) = super::styles::color_style_row(&self.doc, ui, &mut n, false) {
+                        style_action = Some(a);
+                    }
+                }
             }
             if n.kind == Kind::Image {
                 // Color overlay: mewarnai ulang gambar, transparansinya tetap.
@@ -197,6 +209,9 @@ impl App {
             if n.kind != Kind::Text {
                 section(ui, "Stroke");
                 paint_row(ui, &mut self.ext.picker, (id, 1), &mut n.stroke, None, [0, 0, 0, 255]);
+                if let Some(a) = super::styles::color_style_row(&self.doc, ui, &mut n, true) {
+                    style_action = Some(a);
+                }
                 if n.stroke.is_some() {
                     ui.add_sized(
                         [half, 28.0],
@@ -230,6 +245,10 @@ impl App {
         }
         if remove_bg {
             self.rembg_start(id, &ctx);
+            return;
+        }
+        if let Some(action) = style_action {
+            self.style_action(id, action);
             return;
         }
         if n == before {
