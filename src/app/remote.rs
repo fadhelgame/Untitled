@@ -467,7 +467,7 @@ impl App {
 
     fn remote_run(&mut self, cmd: &str, args: &Value) -> Result<Outcome, String> {
         // Perintah yang mengubah dokumen: akhiri dulu mode edit teks / titik path.
-        if matches!(cmd, "create_nodes" | "update_nodes" | "delete_nodes" | "arrange" | "history" | "file") {
+        if matches!(cmd, "create_nodes" | "update_nodes" | "delete_nodes" | "arrange" | "history" | "file" | "pages") {
             self.finish_text_edit();
             self.ext.path_edit = None;
         }
@@ -479,6 +479,7 @@ impl App {
             "arrange" => self.remote_arrange(args).map(Outcome::Now),
             "select_nodes" => self.remote_select(args).map(Outcome::Now),
             "history" => self.remote_history(args).map(Outcome::Now),
+            "pages" => self.remote_pages(args).map(Outcome::Now),
             "file" => self.remote_file(args).map(Outcome::Now),
             "list_fonts" => self.remote_fonts(args).map(Outcome::Now),
             "screenshot" => {
@@ -631,6 +632,10 @@ impl App {
             "unsaved_changes": self.dirty,
             "selection": self.sel,
         });
+        if self.doc.page_count() > 1 {
+            out["pages"] = self.pages_json();
+            out["note_pages"] = json!("`nodes` are the layers of the current page only; use the pages tool to switch.");
+        }
         if !self.doc.group_names.is_empty() {
             out["groups"] = self.doc.group_names.iter().map(|(g, name)| (g.to_string(), json!(name))).collect::<Map<_, _>>().into();
         }
@@ -1076,6 +1081,53 @@ impl App {
             }
         }
         Ok(json!({ "selection": self.sel }))
+    }
+
+    fn pages_json(&self) -> Value {
+        (0..self.doc.page_count()).map(|i| json!({ "index": i, "name": self.doc.page_name(i), "current": i == self.doc.page })).collect()
+    }
+
+    fn remote_pages(&mut self, args: &Value) -> Result<Value, String> {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+        let count = self.doc.page_count();
+        let index = || -> Result<usize, String> {
+            match args.get("index").and_then(Value::as_u64) {
+                Some(i) if (i as usize) < count => Ok(i as usize),
+                Some(i) => Err(format!("page {i} doesn't exist; the document has {count} page(s), indexed from 0")),
+                None => Ok(self.doc.page),
+            }
+        };
+        let name = args.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        match action {
+            "list" => {}
+            "switch" => {
+                let i = index()?;
+                self.go_page(i);
+            }
+            "add" => {
+                self.add_page();
+                if let Some(name) = name {
+                    self.doc.rename_page(self.doc.page, name);
+                }
+            }
+            "rename" => {
+                let i = index()?;
+                self.rename_page(i, name.ok_or("`name` is required to rename a page")?);
+            }
+            "duplicate" => {
+                let i = index()?;
+                self.duplicate_page(i);
+            }
+            "delete" => {
+                let i = index()?;
+                if count < 2 {
+                    return Err("the last page can't be deleted".into());
+                }
+                self.delete_page(i);
+            }
+            other => return Err(format!("unknown action \"{other}\"; use list, switch, add, rename, duplicate or delete")),
+        }
+        Ok(json!({ "pages": self.pages_json() }))
     }
 
     fn remote_history(&mut self, args: &Value) -> Result<Value, String> {

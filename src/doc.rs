@@ -376,6 +376,10 @@ impl Node {
     }
 }
 
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
 fn is_zero(v: &f32) -> bool {
     *v == 0.0
 }
@@ -944,9 +948,29 @@ pub struct RulerGuide {
     pub at: f32,
 }
 
+/// Satu halaman dokumen: punya layer dan guide sendiri; style, gambar dan nama group dipakai bersama.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Page {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub nodes: Vec<Arc<Node>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guides: Vec<RulerGuide>,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Doc {
+    /// Layer halaman aktif.
     pub nodes: Vec<Arc<Node>>,
+    /// Halaman dokumen. Isi halaman aktif (`pages[page]`) ada di `nodes` / `guides` di atas, dan
+    /// slotnya di sini kosong, jadi kode lain cukup bekerja dengan `nodes`. Daftar kosong =
+    /// dokumen satu halaman (file lama); versi lama yang membuka file baru melihat halaman aktif.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<Page>,
+    /// Indeks halaman aktif di `pages`.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub page: usize,
     #[serde(default)]
     pub next_id: u64,
     #[serde(default)]
@@ -991,7 +1015,7 @@ impl Doc {
     /// Ubah node yang memenuhi `uses` (level atas dan anak frame). Frame yang tidak tersentuh
     /// tidak disalin, jadi snapshot undo tetap berbagi memori.
     fn update_nodes(&mut self, uses: impl Fn(&Node) -> bool, mut apply: impl FnMut(&mut Node)) {
-        for top in &mut self.nodes {
+        for top in self.nodes.iter_mut().chain(self.pages.iter_mut().flat_map(|p| p.nodes.iter_mut())) {
             if uses(top) || top.children.iter().any(&uses) {
                 let top = Arc::make_mut(top);
                 if uses(top) {
@@ -1032,7 +1056,7 @@ impl Doc {
 
     pub fn color_style_uses(&self, id: u64) -> usize {
         let uses = |n: &Node| (n.fill_style == Some(id)) as usize + (n.stroke_style == Some(id)) as usize;
-        self.nodes.iter().map(|n| uses(n) + n.children.iter().map(uses).sum::<usize>()).sum()
+        self.all_tops().map(|n| uses(n) + n.children.iter().map(uses).sum::<usize>()).sum()
     }
 
     /// Setelah style dihapus: lepaskan objek yang masih menunjuk ke style itu (tampilannya tetap).
@@ -1050,6 +1074,139 @@ impl Doc {
                 n.type_style = keep(&t2, n.type_style);
             },
         );
+    }
+
+    // ---------------------------------------------------------------- pages
+
+    /// Node level atas di semua halaman (halaman aktif dulu).
+    pub fn all_tops(&self) -> impl Iterator<Item = &Node> {
+        self.nodes.iter().chain(self.pages.iter().flat_map(|p| p.nodes.iter())).map(|n| &**n)
+    }
+
+    /// Id node terbesar di semua halaman (untuk memastikan id baru tidak bentrok).
+    pub fn max_node_id(&self) -> u64 {
+        self.all_tops().flat_map(|n| std::iter::once(n.id).chain(n.children.iter().map(|c| c.id))).max().unwrap_or(0)
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len().max(1)
+    }
+
+    /// Id halaman aktif (0 untuk dokumen satu halaman yang belum punya daftar halaman).
+    pub fn page_id(&self) -> u64 {
+        self.pages.get(self.page).map_or(0, |p| p.id)
+    }
+
+    pub fn page_name(&self, i: usize) -> &str {
+        self.pages.get(i).map_or("Page 1", |p| p.name.as_str())
+    }
+
+    /// Dokumen lama / baru belum punya daftar halaman: buat "Page 1" untuk isi yang ada.
+    pub fn ensure_pages(&mut self) {
+        if self.pages.is_empty() {
+            let id = self.alloc_id();
+            self.pages.push(Page { id, name: "Page 1".into(), ..Default::default() });
+        }
+        self.page = self.page.min(self.pages.len() - 1);
+    }
+
+    /// Setelah file dibuka: rapikan indeks halaman aktif.
+    pub fn fix_pages(&mut self) {
+        if !self.pages.is_empty() {
+            self.page = self.page.min(self.pages.len() - 1);
+        }
+    }
+
+    fn next_page_name(&self) -> String {
+        let last = self.pages.iter().filter_map(|p| p.name.strip_prefix("Page ")?.parse::<u32>().ok()).max().unwrap_or(0);
+        format!("Page {}", (last + 1).max(self.pages.len() as u32 + 1))
+    }
+
+    /// Pindah ke halaman `i`. Hasil: apakah halaman aktif berganti.
+    pub fn switch_page(&mut self, i: usize) -> bool {
+        self.ensure_pages();
+        if i == self.page || i >= self.pages.len() {
+            return false;
+        }
+        let cur = &mut self.pages[self.page];
+        cur.nodes = std::mem::take(&mut self.nodes);
+        cur.guides = std::mem::take(&mut self.guides);
+        self.page = i;
+        let new = &mut self.pages[i];
+        self.nodes = std::mem::take(&mut new.nodes);
+        self.guides = std::mem::take(&mut new.guides);
+        true
+    }
+
+    /// Tambah halaman kosong di akhir dan pindah ke sana. Hasil: indeksnya.
+    pub fn add_page(&mut self) -> usize {
+        self.ensure_pages();
+        let (id, name) = (self.alloc_id(), self.next_page_name());
+        self.pages.push(Page { id, name, ..Default::default() });
+        let i = self.pages.len() - 1;
+        self.switch_page(i);
+        i
+    }
+
+    /// Salin halaman `i` (dengan id node dan group baru) tepat setelahnya, lalu pindah ke salinan.
+    pub fn duplicate_page(&mut self, i: usize) -> Option<usize> {
+        self.ensure_pages();
+        if i >= self.pages.len() {
+            return None;
+        }
+        let (src, guides) = if i == self.page { (&self.nodes, &self.guides) } else { (&self.pages[i].nodes, &self.pages[i].guides) };
+        let (mut nodes, guides): (Vec<Node>, Vec<RulerGuide>) = (src.iter().map(|n| (**n).clone()).collect(), guides.clone());
+        self.regroup(&mut nodes);
+        for n in &mut nodes {
+            self.reassign_ids(n);
+        }
+        let page = Page { id: self.alloc_id(), name: format!("{} copy", self.pages[i].name), nodes: nodes.into_iter().map(Arc::new).collect(), guides };
+        self.pages.insert(i + 1, page);
+        if self.page > i {
+            self.page += 1;
+        }
+        self.switch_page(i + 1);
+        Some(i + 1)
+    }
+
+    /// Hapus halaman `i` beserta isinya; halaman terakhir tidak bisa dihapus.
+    pub fn delete_page(&mut self, i: usize) -> bool {
+        if i >= self.pages.len() || self.pages.len() < 2 {
+            return false;
+        }
+        if i == self.page {
+            self.switch_page(if i == 0 { 1 } else { i - 1 });
+        }
+        self.pages.remove(i);
+        if self.page > i {
+            self.page -= 1;
+        }
+        let used: Vec<u64> = self.all_tops().flat_map(|n| std::iter::once(n.group).chain(n.children.iter().map(|c| c.group))).collect();
+        self.group_names.retain(|g, _| used.contains(g));
+        true
+    }
+
+    pub fn rename_page(&mut self, i: usize, name: &str) -> bool {
+        self.ensure_pages();
+        match self.pages.get_mut(i) {
+            Some(p) if !name.trim().is_empty() && p.name != name.trim() => {
+                p.name = name.trim().to_owned();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Pindahkan halaman `from` ke posisi `to` dalam daftar; halaman aktif tetap sama.
+    pub fn move_page(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.pages.len() || to >= self.pages.len() {
+            return false;
+        }
+        let active = self.page_id();
+        let p = self.pages.remove(from);
+        self.pages.insert(to, p);
+        self.page = self.pages.iter().position(|p| p.id == active).unwrap_or(0);
+        true
     }
 
     pub fn alloc_id(&mut self) -> u64 {
@@ -1456,6 +1613,52 @@ mod tests {
         // Beberapa layer sekaligus: urutan relatifnya tetap.
         doc.reorder(&[5, 1], false);
         assert_eq!(order(&doc), [1, 5, 4, 3, 2, 6]);
+    }
+
+    #[test]
+    fn pages_keep_their_own_layers() {
+        let mut doc = Doc::default();
+        let a = doc.alloc_id();
+        doc.insert(Node::new(a, Kind::Rect, 0.0, 0.0), None);
+        doc.guides.push(RulerGuide { vertical: true, at: 10.0 });
+        assert_eq!((doc.page_count(), doc.page_name(0)), (1, "Page 1"));
+        // Halaman baru kosong; isi halaman pertama tersimpan dan kembali saat dibuka lagi.
+        assert_eq!(doc.add_page(), 1);
+        assert!(doc.nodes.is_empty() && doc.guides.is_empty());
+        assert_eq!(doc.page_name(1), "Page 2");
+        let b = doc.alloc_id();
+        doc.insert(Node::new(b, Kind::Ellipse, 0.0, 0.0), None);
+        assert!(doc.find(a).is_none());
+        assert_eq!(doc.max_node_id(), b);
+        // Simpan dan buka lagi: halaman aktif dan isi halaman lain tetap.
+        let mut back: Doc = serde_json::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!((back.page, back.nodes[0].id, back.pages[0].nodes[0].id), (1, b, a));
+        assert!(back.switch_page(0));
+        assert_eq!((back.nodes[0].id, back.guides.len()), (a, 1));
+        // Style berlaku lintas halaman.
+        let style = doc.add_color_style([1, 2, 3, 255]);
+        doc.switch_page(0);
+        doc.find_mut(a).unwrap().fill_style = Some(style);
+        doc.switch_page(1);
+        assert_eq!(doc.color_style_uses(style), 1);
+        doc.colors[0].color = [9, 9, 9, 255];
+        doc.sync_color_style(style);
+        doc.switch_page(0);
+        assert_eq!(doc.find(a).unwrap().fill, Some([9, 9, 9, 255]));
+        // Duplikat: id baru, pindah ke salinan; hapus: kembali ke tetangganya.
+        assert_eq!(doc.duplicate_page(0), Some(1));
+        assert_eq!((doc.page, doc.page_count(), doc.page_name(1)), (1, 3, "Page 1 copy"));
+        assert!(doc.nodes.len() == 1 && doc.nodes[0].id != a);
+        assert!(doc.move_page(1, 2));
+        assert_eq!((doc.page, doc.page_name(2)), (2, "Page 1 copy"));
+        assert!(doc.delete_page(2));
+        assert_eq!((doc.page, doc.nodes[0].id), (1, b));
+        assert!(doc.delete_page(0));
+        assert!(!doc.delete_page(0));
+        assert_eq!((doc.page, doc.page_count(), doc.nodes[0].id), (0, 1, b));
+        // File lama tanpa daftar halaman tetap terbuka sebagai satu halaman.
+        let old: Doc = serde_json::from_str(r#"{"nodes":[]}"#).unwrap();
+        assert_eq!((old.page_count(), old.page_id()), (1, 0));
     }
 
     #[test]

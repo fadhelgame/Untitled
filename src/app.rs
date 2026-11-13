@@ -14,6 +14,7 @@ mod builder;
 mod canvas;
 mod home;
 mod icons;
+mod pages;
 mod panel;
 mod pen;
 mod photos;
@@ -342,6 +343,8 @@ pub struct App {
     rulers: rulers::Rulers,
     /// Pengaturan tool Polygon / star.
     poly: polygon::Options,
+    /// Daftar halaman: tampilan tiap halaman dan nama yang sedang diedit.
+    pages: pages::Pages,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -420,6 +423,7 @@ impl App {
             photos: Default::default(),
             rulers: Default::default(),
             poly: Default::default(),
+            pages: Default::default(),
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -468,14 +472,18 @@ impl App {
 
     fn do_undo(&mut self) {
         if let Some(d) = self.undo.pop() {
+            let page = self.doc.page_id();
             self.redo.push(std::mem::replace(&mut self.doc, d));
+            self.page_changed(page);
             self.after_history();
         }
     }
 
     fn do_redo(&mut self) {
         if let Some(d) = self.redo.pop() {
+            let page = self.doc.page_id();
             self.undo.push(std::mem::replace(&mut self.doc, d));
+            self.page_changed(page);
             self.after_history();
         }
     }
@@ -933,6 +941,7 @@ impl App {
         self.drag = Drag::None;
         self.dirty = false;
         self.fit_pending = true;
+        self.pages.reset();
     }
 
     fn new_doc(&mut self) {
@@ -961,8 +970,8 @@ impl App {
         match result {
             Ok(mut doc) => {
                 // Pastikan id baru tidak bentrok dengan id di file.
-                let max_id = doc.nodes.iter().flat_map(|n| std::iter::once(n.id).chain(n.children.iter().map(|c| c.id))).max();
-                doc.next_id = doc.next_id.max(max_id.unwrap_or(0));
+                doc.next_id = doc.next_id.max(doc.max_node_id());
+                doc.fix_pages();
                 self.doc = doc;
                 self.status = format!("Opened: {}", path.display());
                 self.opened(&path);
@@ -1271,6 +1280,8 @@ impl App {
                 Key::OpenBracket if c => self.step_order(false),
                 Key::CloseBracket if !a => self.reorder(true),
                 Key::OpenBracket if !a => self.reorder(false),
+                Key::PageDown if plain => self.step_page(true),
+                Key::PageUp if plain => self.step_page(false),
                 _ => {}
             }
         }
@@ -1392,7 +1403,10 @@ impl App {
     }
 
     fn layers(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(2.0);
+        self.pages_ui(ui);
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
         ui.label(theme::title("Layers").size(15.0));
         ui.add_space(2.0);
         ui.separator();
@@ -1870,6 +1884,18 @@ impl App {
                             b.inject.push((218, button(to, false)));
                         }
                     }
+                }
+                // `KANVAS_BENCH_PAGES=1`: tiga halaman (yang kedua diberi nama dan satu kotak), lalu
+                // kembali ke halaman pertama. `=2`: berhenti di halaman kedua.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_PAGES") {
+                    self.add_page();
+                    self.rename_page(1, "Kalender meja");
+                    let id = self.doc.alloc_id();
+                    let mut n = Node::new(id, Kind::Rect, 100.0, 100.0);
+                    (n.w, n.h, n.fill) = (400.0, 300.0, Some([13, 153, 255, 255]));
+                    self.doc.insert(n, None);
+                    self.add_page();
+                    self.go_page(if mode == "2" { 1 } else { 0 });
                 }
                 // `KANVAS_BENCH_RULERS=1`: tampilkan penggaris dengan dua guide di frame demo.
                 if std::env::var("KANVAS_BENCH_RULERS").is_ok() {

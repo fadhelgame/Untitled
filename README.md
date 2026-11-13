@@ -162,7 +162,7 @@ Every screenshot here is the real app.
     </td>
     <td width="33%" valign="top">
       <h4>🗃️ Layers</h4>
-      A layer tree per frame, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
+      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree per frame, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
     </td>
     <td width="33%" valign="top">
       <h4>💾 Files</h4>
@@ -213,7 +213,7 @@ On macOS, use `Cmd` wherever this table says `Ctrl`. While resizing, hold `Shift
 
 Kanvas ships with `kanvas-mcp`, a small [Model Context Protocol](https://modelcontextprotocol.io) server. It connects an AI assistant such as Claude to the document that is open in the app, over a local, token-protected connection that never leaves your computer.
 
-The assistant gets 11 tools: `get_document`, `create_nodes`, `update_nodes`, `delete_nodes`, `arrange`, `select_nodes`, `screenshot`, `export`, `file`, `history` and `list_fonts`. Every change appears on your canvas immediately and is one undo step.
+The assistant gets 12 tools: `get_document`, `create_nodes`, `update_nodes`, `delete_nodes`, `arrange`, `select_nodes`, `screenshot`, `export`, `pages`, `file`, `history` and `list_fonts`. Every change appears on your canvas immediately and is one undo step.
 
 Get `kanvas-mcp` first:
 
