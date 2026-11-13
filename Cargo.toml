@@ -1,6 +1,6 @@
 [package]
 name = "kanvas"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Editor desain native yang ringan: canvas infinite, frame tanpa batas, Google Fonts"
 # `src/bin/kanvas-mcp.rs` = server MCP; `cargo run` tetap menjalankan aplikasinya.
