@@ -1274,6 +1274,9 @@ impl App {
     /// File yang dijatuhkan ke jendela: gambar jadi node, `.kanvas` dibuka.
     pub(super) fn dropped_files(&mut self, ctx: &egui::Context) {
         let (files, pos) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.latest_pos()));
+        if self.library_take_drop(ctx, &files, pos) {
+            return;
+        }
         let mut offset = 0.0;
         for file in files {
             let name = file

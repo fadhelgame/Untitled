@@ -480,6 +480,7 @@ impl App {
             "select_nodes" => self.remote_select(args).map(Outcome::Now),
             "history" => self.remote_history(args).map(Outcome::Now),
             "pages" => self.remote_pages(args).map(Outcome::Now),
+            "library" => self.remote_library(args).map(Outcome::Now),
             "file" => self.remote_file(args).map(Outcome::Now),
             "list_fonts" => self.remote_fonts(args).map(Outcome::Now),
             "screenshot" => {
@@ -1081,6 +1082,23 @@ impl App {
             }
         }
         Ok(json!({ "selection": self.sel }))
+    }
+
+    fn remote_library(&mut self, args: &Value) -> Result<Value, String> {
+        match args.get("action").and_then(Value::as_str).unwrap_or("list") {
+            "list" => {}
+            "add" => {
+                let path = PathBuf::from(string("path", args.get("path").unwrap_or(&Value::Null))?);
+                if !path.is_absolute() {
+                    return Err("`path` must be an absolute file path".into());
+                }
+                let name = self.library.add_file(&path)?;
+                self.status = format!("Remote: added \"{name}\" to the library.");
+            }
+            other => return Err(format!("unknown action \"{other}\"; use list or add")),
+        }
+        let items: Vec<Value> = self.library.list().into_iter().map(|(name, path)| json!({ "name": name, "path": path })).collect();
+        Ok(json!({ "items": items }))
     }
 
     fn pages_json(&self) -> Value {

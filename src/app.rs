@@ -14,6 +14,7 @@ mod builder;
 mod canvas;
 mod home;
 mod icons;
+mod library;
 mod pages;
 mod panel;
 mod pen;
@@ -345,6 +346,8 @@ pub struct App {
     poly: polygon::Options,
     /// Daftar halaman: tampilan tiap halaman dan nama yang sedang diedit.
     pages: pages::Pages,
+    /// Jendela Library: gambar milik pengguna yang tersedia di semua dokumen.
+    library: library::Library,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -382,6 +385,8 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, bench: Option<PathBuf>, open: Option<PathBuf>) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         theme::apply(&cc.egui_ctx);
+        // Mode `--bench` memakai folder library sendiri supaya library pengguna tidak tersentuh.
+        let library_dir = bench.as_ref().map_or_else(|| home::data_dir().join("library"), |out| out.with_file_name("bench-library"));
         let mut app = App {
             doc: Doc::default(),
             view: View { pan: vec2(80.0, 80.0), zoom: 1.0 },
@@ -424,6 +429,7 @@ impl App {
             rulers: Default::default(),
             poly: Default::default(),
             pages: Default::default(),
+            library: library::Library::new(library_dir),
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -1897,6 +1903,23 @@ impl App {
                     self.add_page();
                     self.go_page(if mode == "2" { 1 } else { 0 });
                 }
+                // `KANVAS_BENCH_LIBRARY=<file;file;…>`: buka Library, tambahkan file-file itu, dan
+                // (dengan `KANVAS_BENCH_LIBRARY_DROP=x,y`) tarik item pertama ke titik layar itu.
+                if let Ok(list) = std::env::var("KANVAS_BENCH_LIBRARY") {
+                    self.library.open = true;
+                    let paths: Vec<PathBuf> = list.split(';').filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+                    self.library_add_files(ctx, &paths);
+                    let v: Vec<f32> = std::env::var("KANVAS_BENCH_LIBRARY_DROP").unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                    if let [x, y] = v[..] {
+                        let (from, to) = (self.canvas_rect.left_top() + vec2(80.0, 190.0), pos2(x, y));
+                        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                        b.inject.extend([(230, egui::Event::PointerMoved(from)), (232, button(from, true))]);
+                        for s in 1..=6u32 {
+                            b.inject.push((232 + s * 2, egui::Event::PointerMoved(from + (to - from) * (s as f32 / 6.0))));
+                        }
+                        b.inject.push((248, button(to, false)));
+                    }
+                }
                 // `KANVAS_BENCH_RULERS=1`: tampilkan penggaris dengan dua guide di frame demo.
                 if std::env::var("KANVAS_BENCH_RULERS").is_ok() {
                     self.rulers.show = true;
@@ -1977,7 +2000,7 @@ impl App {
                 let _ = target;
             }
             _ => {
-                let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
+                let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));

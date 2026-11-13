@@ -932,6 +932,13 @@ impl App {
                             if resp.on_hover_text("Photos").clicked() {
                                 self.toggle_photos();
                             }
+                            // Library: buka/tutup jendela gambar milik pengguna.
+                            let active = self.library.open;
+                            let (rect, resp) = button(ui, active);
+                            super::library::toolbar_icon(ui.painter(), rect.center(), if active { Color32::WHITE } else { Color32::from_gray(225) });
+                            if resp.on_hover_text("Library: your own logos and images").clicked() {
+                                self.toggle_library();
+                            }
                             // Export: popup di atas toolbar dengan skala dan format.
                             separator(ui);
                             let popup_id = ui.make_persistent_id("export_popup");
@@ -1053,6 +1060,7 @@ impl eframe::App for App {
         self.rembg_poll();
         self.icons.poll(ctx);
         self.photos_poll(ctx);
+        self.library.poll(ctx);
         self.remote_poll(ctx);
         self.frame_ms = frame.info().cpu_usage.unwrap_or(0.0) * 1000.0;
         self.close_flow(ctx);
@@ -1099,6 +1107,7 @@ impl eframe::App for App {
         self.toolbar(ctx);
         self.icons_window(ctx);
         self.photos_window(ctx);
+        self.library_window(ctx);
         self.eyedropper(ctx);
 
         let name = self.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled".into(), |n| n.to_string_lossy());

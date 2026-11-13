@@ -111,6 +111,18 @@
     }
   },
   {
+    "name": "library",
+    "description": "The user's personal image library: logos, photos and graphics they reuse across designs (the Library window in the app). list: every item with its name and absolute `path` — pass that path as `image_path` to create_nodes to place it. Check here first when the user mentions their logo or \"my\" images. add: copy an image file (PNG, JPEG, WebP, GIF, BMP or SVG) into the library so it is available in every document. Returns the item list.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": { "type": "string", "enum": ["list", "add"] },
+        "path": { "type": "string", "description": "Absolute path of the image file to add (action add)." }
+      },
+      "required": ["action"]
+    }
+  },
+  {
     "name": "file",
     "description": "Document file operations. info: path and counts. new: start an empty document. open: open a .kanvas file. save: save (pass `path` for a document that has no file yet, or to save a copy elsewhere). Documents that already have a file are auto-saved by the app. new/open refuse to drop a never-saved document with changes unless discard is true — ask the user before discarding.",
     "inputSchema": {

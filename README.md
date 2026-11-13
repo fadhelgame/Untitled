@@ -143,7 +143,7 @@ Every screenshot here is the real app.
       <h3>Select smarter</h3>
       The <b>Magic wand</b> selects every object that shares a property with the one you click, with a tolerance for near-matching colors. Objects snap to edges and centers of their neighbors with guide lines as you move them. Turn on <b>rulers</b> with <code>Shift+R</code> and drag <b>guides</b> out of them; objects snap to guides too.
       <h3>Images</h3>
-      Drop or paste PNG, JPEG, WebP, GIF, BMP and SVG. Round the corners, tint an icon with a color overlay, or use a clipping mask. The <i>Icons</i> button in the toolbar searches 200,000+ open-source icons (Iconify) and drops them in as recolorable SVGs; <i>Photos</i> searches free-to-use stock photos (Openverse) and keeps the author credit in the layer name. <i>Remove background</i> runs on your computer in a couple of seconds; the first use downloads a 170 MB model.
+      Drop or paste PNG, JPEG, WebP, GIF, BMP and SVG. Round the corners, tint an icon with a color overlay, or use a clipping mask. The <i>Icons</i> button in the toolbar searches 200,000+ open-source icons (Iconify) and drops them in as recolorable SVGs; <i>Photos</i> searches free-to-use stock photos (Openverse) and keeps the author credit in the layer name. The <b>Library</b> keeps your own logos, photos and graphics one click away in every document: add files once (or drop them onto the Library window, or save an image straight from the canvas), then drag them onto any design instead of digging through folders. <i>Remove background</i> runs on your computer in a couple of seconds; the first use downloads a 170 MB model.
       <h3>Export exactly what you see</h3>
       Export a frame, a selection or the whole document to <b>PNG, JPG or SVG</b>, from 0.1x up to 16x, or to a vector <b>PDF</b> with one page per frame, in reading order. Paper-size frames come out at the exact paper size. Text is exported as outlines, so the file looks the same on every computer.
     </td>
@@ -213,7 +213,7 @@ On macOS, use `Cmd` wherever this table says `Ctrl`. While resizing, hold `Shift
 
 Kanvas ships with `kanvas-mcp`, a small [Model Context Protocol](https://modelcontextprotocol.io) server. It connects an AI assistant such as Claude to the document that is open in the app, over a local, token-protected connection that never leaves your computer.
 
-The assistant gets 12 tools: `get_document`, `create_nodes`, `update_nodes`, `delete_nodes`, `arrange`, `select_nodes`, `screenshot`, `export`, `pages`, `file`, `history` and `list_fonts`. Every change appears on your canvas immediately and is one undo step.
+The assistant gets 13 tools: `get_document`, `create_nodes`, `update_nodes`, `delete_nodes`, `arrange`, `select_nodes`, `screenshot`, `export`, `pages`, `library`, `file`, `history` and `list_fonts`. Every change appears on your canvas immediately and is one undo step.
 
 Get `kanvas-mcp` first:
 
