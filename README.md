@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/fadhelgame/Untitled/raw/master/Kanvas.exe"><img alt="Download Kanvas for Windows" src="https://img.shields.io/badge/Download%20Kanvas.exe-0d99ff?style=for-the-badge&logo=windows&logoColor=white" height="40"></a>
+  <a href="https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas.exe"><img alt="Download Kanvas for Windows" src="https://img.shields.io/badge/Download%20Kanvas.exe-0d99ff?style=for-the-badge&logo=windows&logoColor=white" height="40"></a>
 </p>
 
 <br>
@@ -62,7 +62,7 @@
 
 ## Download
 
-**[⬇ Download Kanvas.exe](https://github.com/fadhelgame/Untitled/raw/master/Kanvas.exe)** · Windows 64-bit · about 35 MB
+**[⬇ Download Kanvas.exe](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas.exe)** · Windows 64-bit · about 35 MB
 
 1. Download the file.
 2. Double-click `Kanvas.exe`. There is no installer.
