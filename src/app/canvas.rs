@@ -43,6 +43,8 @@ impl App {
         }
         if self.tool != Tool::Pen {
             self.ext.pen_cont = None;
+            self.ext.pen_undo.clear();
+            self.ext.pen_redo.clear();
         }
         if self.tool != Tool::ShapeBuilder {
             self.ext.builder = None;

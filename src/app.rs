@@ -409,6 +409,23 @@ impl App {
         self.files.last_change = std::time::Instant::now();
     }
 
+    /// Undo dari pengguna (Ctrl+Z / menu): saat menggambar dengan pen, mundur satu titik dulu.
+    fn undo_cmd(&mut self) {
+        if self.pen_can_undo() {
+            self.pen_undo();
+        } else {
+            self.do_undo();
+        }
+    }
+
+    fn redo_cmd(&mut self) {
+        if self.pen_can_redo() {
+            self.pen_redo();
+        } else {
+            self.do_redo();
+        }
+    }
+
     fn do_undo(&mut self) {
         if let Some(d) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.doc, d));
@@ -1052,9 +1069,9 @@ impl App {
             self.group_selection();
         }
         if redo {
-            self.do_redo();
+            self.redo_cmd();
         } else if undo {
-            self.do_undo();
+            self.undo_cmd();
         }
         if dup {
             let nodes = self.selected_nodes();
@@ -1220,13 +1237,15 @@ impl App {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                let can_undo = self.pen_can_undo() || !self.undo.is_empty();
+                if ui.add_enabled(can_undo, egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
                     ui.close_menu();
-                    self.do_undo();
+                    self.undo_cmd();
                 }
-                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
+                let can_redo = self.pen_can_redo() || !self.redo.is_empty();
+                if ui.add_enabled(can_redo, egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
                     ui.close_menu();
-                    self.do_redo();
+                    self.redo_cmd();
                 }
                 ui.separator();
                 if ui.add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {

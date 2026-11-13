@@ -282,7 +282,13 @@ impl App {
     pub(super) fn pen_press(&mut self, p: Pos2, wp: Pos2, mods: Modifiers) {
         self.ext.pen_keep_in = false;
         self.ext.pen_clicks = [self.ext.pen_clicks[1], p];
-        match self.pen_hover(p, mods.alt) {
+        let hover = self.pen_hover(p, mods.alt);
+        // Aksi baru membatalkan redo; menambah titik/sudut dicatat supaya bisa di-undo per langkah.
+        self.ext.pen_redo.clear();
+        if matches!(hover, PenHover::New | PenHover::Corner) {
+            self.ext.pen_undo.push(self.ext.pen.clone().unwrap_or_default());
+        }
+        match hover {
             PenHover::Close => self.finish_pen(true),
             PenHover::Corner => {
                 if let Some(last) = self.ext.pen.as_mut().and_then(|v| v.last_mut()) {
@@ -377,7 +383,9 @@ impl App {
     /// Backspace saat menggambar: buang titik terakhir.
     pub(super) fn pen_backspace(&mut self) {
         self.ext.pen_drag = false;
+        self.ext.pen_redo.clear();
         if let Some(pts) = &mut self.ext.pen {
+            self.ext.pen_undo.push(pts.clone());
             pts.pop();
             if pts.is_empty() {
                 self.ext.pen = None;
@@ -386,9 +394,46 @@ impl App {
         }
     }
 
+    /// Ada langkah pen yang bisa di-undo / di-redo (menggambar belum selesai).
+    pub(super) fn pen_can_undo(&self) -> bool {
+        self.tool == Tool::Pen && self.ext.pen.is_some()
+    }
+
+    pub(super) fn pen_can_redo(&self) -> bool {
+        self.tool == Tool::Pen && !self.ext.pen_redo.is_empty()
+    }
+
+    /// Undo saat menggambar: kembali ke keadaan sebelum titik terakhir. Tanpa riwayat
+    /// (baru mulai melanjutkan path) = batal menggambar.
+    pub(super) fn pen_undo(&mut self) {
+        self.ext.pen_drag = false;
+        let Some(cur) = self.ext.pen.take() else { return };
+        match self.ext.pen_undo.pop() {
+            Some(prev) => {
+                self.ext.pen_redo.push(cur);
+                if !prev.is_empty() {
+                    self.ext.pen = Some(prev);
+                }
+            }
+            None => self.ext.pen_redo.clear(),
+        }
+        if self.ext.pen.is_none() && self.ext.pen_redo.is_empty() {
+            self.ext.pen_cont = None;
+        }
+    }
+
+    pub(super) fn pen_redo(&mut self) {
+        self.ext.pen_drag = false;
+        let Some(next) = self.ext.pen_redo.pop() else { return };
+        self.ext.pen_undo.push(self.ext.pen.take().unwrap_or_default());
+        self.ext.pen = Some(next);
+    }
+
     /// Ubah titik-titik pen jadi node path (atau tulis balik ke path yang dilanjutkan).
     pub(super) fn finish_pen(&mut self, close: bool) {
         self.ext.pen_drag = false;
+        self.ext.pen_undo.clear();
+        self.ext.pen_redo.clear();
         let cont = self.ext.pen_cont.take();
         let Some(mut pts) = self.ext.pen.take() else { return };
         pts.dedup_by(|b, a| (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5);

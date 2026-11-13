@@ -102,6 +102,9 @@ pub struct Ext {
     pub pen_keep_in: bool,
     /// Posisi layar dua klik pen terakhir (untuk mengenali klik ganda sungguhan).
     pub pen_clicks: [Pos2; 2],
+    /// Riwayat titik selama menggambar dengan pen (undo/redo per titik, sebelum path jadi objek).
+    pub pen_undo: Vec<Vec<PenPt>>,
+    pub pen_redo: Vec<Vec<PenPt>>,
     pub path_edit: Option<PathEdit>,
     /// Sesi Shape Builder yang sedang aktif.
     pub builder: Option<super::builder::Session>,
@@ -160,6 +163,8 @@ impl Default for Ext {
             pen_cont: None,
             pen_keep_in: false,
             pen_clicks: [pos2(-1e6, -1e6), pos2(1e6, 1e6)],
+            pen_undo: Vec::new(),
+            pen_redo: Vec::new(),
             path_edit: None,
             builder: None,
             rev: 0,
