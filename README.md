@@ -162,7 +162,7 @@ Every screenshot here is the real app.
     </td>
     <td width="33%" valign="top">
       <h4>🗃️ Layers</h4>
-      A layer tree per frame, groups, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
+      A layer tree per frame, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
     </td>
     <td width="33%" valign="top">
       <h4>💾 Files</h4>

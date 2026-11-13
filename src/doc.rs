@@ -456,6 +456,79 @@ fn clip_siblings<T: AsRef<Node>>(v: &mut Vec<T>, ids: &[u64], node: impl Fn(&mut
     true
 }
 
+/// Potong `range` jadi rangkaian berurutan; `joins(i)`: item `i` menyambung rangkaian item `i - 1`.
+fn runs(range: std::ops::Range<usize>, joins: impl Fn(usize) -> bool) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for i in range {
+        match out.last_mut() {
+            Some(r) if joins(i) => r.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out
+}
+
+/// Urutan baru setelah item terpilih digeser: paling depan/belakang, atau (`step`) satu tingkat.
+/// Urutan relatif sesama yang terpilih, dan sesama yang tidak terpilih, tetap.
+fn shifted(sel: &[bool], up: bool, step: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..sel.len()).collect();
+    if !step {
+        order.sort_by_key(|i| sel[*i] == up);
+    } else if up {
+        for i in (0..sel.len().saturating_sub(1)).rev() {
+            if sel[order[i]] && !sel[order[i + 1]] {
+                order.swap(i, i + 1);
+            }
+        }
+    } else {
+        for i in 1..sel.len() {
+            if sel[order[i]] && !sel[order[i - 1]] {
+                order.swap(i, i - 1);
+            }
+        }
+    }
+    order
+}
+
+/// Ubah urutan tumpukan node `ids` dalam satu daftar saudara. Group (beserta layer yang di-clip
+/// ke alasnya) bergerak sebagai satu kesatuan: isinya tidak berubah urutan, dan layer lain
+/// melompati seluruh group, tidak menyelip ke dalamnya. Kalau hanya sebagian anggota group yang
+/// dipilih, anggota itu bergeser di dalam group-nya saja.
+fn restack<T: AsRef<Node>>(list: &mut Vec<T>, ids: &[u64], up: bool, step: bool) {
+    // (terpilih, group, clip)
+    let meta: Vec<(bool, u64, bool)> = list.iter().map(|t| t.as_ref()).map(|n| (ids.contains(&n.id), n.group, n.clip)).collect();
+    if !meta.iter().any(|m| m.0) {
+        return;
+    }
+    let units = runs(0..meta.len(), |i| meta[i].2 || (meta[i].1 != 0 && meta[i].1 == meta[i - 1].1));
+    // Satu kesatuan ikut pindah utuh kalau alasnya (seluruh anggota group, atau node tunggal) terpilih.
+    let whole: Vec<bool> = units
+        .iter()
+        .map(|u| {
+            let g = meta[u.start].1;
+            u.clone().filter(|i| *i == u.start || (g != 0 && meta[*i].1 == g)).all(|i| meta[i].0)
+        })
+        .collect();
+    let mut order: Vec<usize> = Vec::with_capacity(meta.len());
+    for ui in shifted(&whole, up, step) {
+        let u = units[ui].clone();
+        if whole[ui] {
+            order.extend(u);
+            continue;
+        }
+        // Sebagian saja yang terpilih: geser di antara sesama anggota group (atau sesama layer ter-clip).
+        for r in runs(u, |i| meta[i].1 == meta[i - 1].1 && (meta[i].1 != 0 || (meta[i].2 && meta[i - 1].2))) {
+            let sel: Vec<bool> = r.clone().map(|i| meta[i].0).collect();
+            order.extend(shifted(&sel, up, step).into_iter().map(|j| r.start + j));
+        }
+    }
+    if order.iter().enumerate().all(|(i, j)| i == *j) {
+        return;
+    }
+    let mut slots: Vec<Option<T>> = std::mem::take(list).into_iter().map(Some).collect();
+    *list = order.into_iter().filter_map(|i| slots[i].take()).collect();
+}
+
 /// Kumpulkan elemen yang cocok supaya berurutan, di posisi elemen cocok yang paling depan.
 fn gather<T>(v: &mut Vec<T>, is: impl Fn(&T) -> bool) {
     let Some(last) = v.iter().rposition(&is) else { return };
@@ -1051,51 +1124,108 @@ impl Doc {
         self.nodes.push(Arc::new(node));
     }
 
-    pub fn reorder(&mut self, id: u64, to_front: bool) {
-        match self.locate(id) {
-            Some((ti, None)) => {
-                let n = self.nodes.remove(ti);
-                if to_front {
-                    self.nodes.push(n);
-                } else {
-                    self.nodes.insert(0, n);
-                }
-            }
-            Some((ti, Some(ci))) => {
-                let top = Arc::make_mut(&mut self.nodes[ti]);
-                let n = top.children.remove(ci);
-                if to_front {
-                    top.children.push(n);
-                } else {
-                    top.children.insert(0, n);
-                }
-            }
-            None => {}
-        }
+    /// Bawa node-node ini ke paling depan / paling belakang di antara saudaranya (lihat `restack`).
+    pub fn reorder(&mut self, ids: &[u64], to_front: bool) {
+        self.restack(ids, to_front, false);
     }
 
     /// Naik/turun satu tingkat dalam urutan tumpukan.
-    pub fn reorder_step(&mut self, id: u64, up: bool) {
-        fn swap_idx(i: usize, len: usize, up: bool) -> Option<usize> {
-            if up {
-                (i + 1 < len).then_some(i + 1)
-            } else {
-                i.checked_sub(1)
+    pub fn reorder_step(&mut self, ids: &[u64], up: bool) {
+        self.restack(ids, up, true);
+    }
+
+    fn restack(&mut self, ids: &[u64], up: bool, step: bool) {
+        restack(&mut self.nodes, ids, up, step);
+        for top in &mut self.nodes {
+            // Frame yang ikut terpilih pindah beserta isinya; urutan isinya tidak diubah.
+            if !ids.contains(&top.id) && top.children.iter().any(|c| ids.contains(&c.id)) {
+                restack(&mut Arc::make_mut(top).children, ids, up, step);
             }
         }
-        match self.locate(id) {
-            Some((ti, None)) => {
-                if let Some(j) = swap_idx(ti, self.nodes.len(), up) {
-                    self.nodes.swap(ti, j);
-                }
+    }
+
+    /// Pindahkan node-node `ids` (tarik-lepas di panel layer) ke `parent` (frame, atau level atas
+    /// bila `None`). `anchor` = (id saudara, di atasnya?): disisipkan tepat di atas/bawah saudara
+    /// itu dalam urutan tumpukan; `None` = paling depan. Semua yang dipindah ikut `group` tujuan;
+    /// kalau tujuannya bukan group, group yang terbawa utuh tetap jadi group. Urutan relatif yang
+    /// dipindah tetap. Hasil `false`: tidak sah (frame ke dalam frame) atau tidak ada yang berubah.
+    pub fn move_nodes(&mut self, ids: &[u64], parent: Option<u64>, anchor: Option<(u64, bool)>, group: u64) -> bool {
+        let layout = |d: &Doc| -> Vec<(u64, u64, u64, bool)> {
+            d.nodes.iter().flat_map(|n| std::iter::once((n.id, 0, n.group, n.clip)).chain(n.children.iter().map(|c| (c.id, n.id, c.group, c.clip)))).collect()
+        };
+        let before = layout(self);
+        if let Some(p) = parent {
+            let ok = !ids.contains(&p) && self.nodes.iter().any(|n| n.id == p && n.kind == Kind::Frame);
+            if !ok || self.nodes.iter().any(|n| n.kind == Kind::Frame && ids.contains(&n.id)) {
+                return false;
             }
-            Some((ti, Some(ci))) => {
-                if let Some(j) = swap_idx(ci, self.nodes[ti].children.len(), up) {
-                    Arc::make_mut(&mut self.nodes[ti]).children.swap(ci, j);
-                }
-            }
-            None => {}
         }
+        // Posisi sisip dihitung di daftar tujuan tanpa node yang dipindah.
+        let siblings: Vec<u64> = match parent {
+            Some(p) => self.find(p).map(|f| f.children.iter().map(|c| c.id).collect()).unwrap_or_default(),
+            None => self.nodes.iter().map(|n| n.id).collect(),
+        };
+        let stay = |list: &[u64]| list.iter().filter(|id| !ids.contains(id)).count();
+        let at = match anchor {
+            Some((a, above)) => {
+                let Some(i) = siblings.iter().position(|id| *id == a) else { return false };
+                stay(&siblings[..i]) + (above && !ids.contains(&a)) as usize
+            }
+            None => stay(&siblings),
+        };
+        // Group yang semua anggotanya ikut pindah tetap utuh (kalau tujuannya bukan group lain).
+        let mut whole: Vec<u64> = before.iter().filter(|r| r.2 != 0 && ids.contains(&r.0)).map(|r| r.2).collect();
+        whole.dedup();
+        whole.retain(|g| before.iter().filter(|r| r.2 == *g).all(|r| ids.contains(&r.0)));
+
+        let mut moved: Vec<Node> = Vec::new();
+        for top in std::mem::take(&mut self.nodes) {
+            if ids.contains(&top.id) {
+                moved.push(Arc::unwrap_or_clone(top));
+                continue;
+            }
+            let mut top = top;
+            if top.children.iter().any(|c| ids.contains(&c.id)) {
+                let t = Arc::make_mut(&mut top);
+                for c in std::mem::take(&mut t.children) {
+                    if ids.contains(&c.id) {
+                        moved.push(c);
+                    } else {
+                        t.children.push(c);
+                    }
+                }
+            }
+            self.nodes.push(top);
+        }
+        if moved.is_empty() {
+            return false;
+        }
+        for n in &mut moved {
+            n.group = if group != 0 || !whole.contains(&n.group) { group } else { n.group };
+        }
+        // Disisipkan di tengah rangkaian clipping mask: ikut di-clip. Di luar itu yang paling
+        // bawah lepas dari clip (yang lain tetap, supaya alas + isinya pindah sebagai satu kesatuan).
+        let above_clip = |next: Option<&Node>| at > 0 && next.is_some_and(|n| n.clip);
+        let inside = match parent {
+            Some(p) => above_clip(self.find(p).and_then(|f| f.children.get(at))),
+            None => above_clip(self.nodes.get(at).map(|n| &**n)),
+        };
+        if inside {
+            moved.iter_mut().filter(|n| n.kind != Kind::Frame).for_each(|n| n.clip = true);
+        } else {
+            moved[0].clip = false;
+        }
+        match parent.and_then(|p| self.nodes.iter_mut().find(|n| n.id == p)) {
+            Some(f) => {
+                Arc::make_mut(f).children.splice(at..at, moved);
+            }
+            None => {
+                self.nodes.splice(at..at, moved.into_iter().map(Arc::new));
+            }
+        }
+        let after = layout(self);
+        self.group_names.retain(|g, _| after.iter().any(|r| r.2 == *g));
+        before != after
     }
 
     /// Beri id baru untuk node (dan anak-anaknya), dipakai saat tempel/duplikat.
@@ -1291,6 +1421,44 @@ mod tests {
     }
 
     #[test]
+    fn groups_restack_as_one_unit() {
+        let mut doc = Doc::default();
+        for _ in 0..6 {
+            let id = doc.alloc_id();
+            doc.insert(Node::new(id, Kind::Rect, 0.0, 0.0), None);
+        }
+        let order = |d: &Doc| d.nodes.iter().map(|n| n.id).collect::<Vec<u64>>();
+        doc.group(&[2, 3, 4]);
+        assert_eq!(order(&doc), [1, 2, 3, 4, 5, 6]);
+        // Urutan seleksi tidak berpengaruh: isi group tetap 2, 3, 4.
+        doc.reorder(&[4, 2, 3], false);
+        assert_eq!(order(&doc), [2, 3, 4, 1, 5, 6]);
+        doc.reorder(&[3, 4, 2], true);
+        assert_eq!(order(&doc), [1, 5, 6, 2, 3, 4]);
+        doc.reorder_step(&[2, 3, 4], false);
+        assert_eq!(order(&doc), [1, 5, 2, 3, 4, 6]);
+        // Layer lain melompati seluruh group, tidak menyelip ke dalamnya.
+        doc.reorder_step(&[5], true);
+        assert_eq!(order(&doc), [1, 2, 3, 4, 5, 6]);
+        doc.reorder_step(&[5], false);
+        assert_eq!(order(&doc), [1, 5, 2, 3, 4, 6]);
+        // Sebagian anggota saja: bergeser di dalam group-nya.
+        doc.reorder(&[4], false);
+        assert_eq!(order(&doc), [1, 5, 4, 2, 3, 6]);
+        doc.reorder_step(&[4], true);
+        assert_eq!(order(&doc), [1, 5, 2, 4, 3, 6]);
+        doc.reorder(&[2], true);
+        assert_eq!(order(&doc), [1, 5, 4, 3, 2, 6]);
+        // Layer yang di-clip ke group ikut pindah bersama alasnya.
+        assert!(doc.make_clip(&[6]));
+        doc.reorder(&[4, 3, 2], false);
+        assert_eq!(order(&doc), [4, 3, 2, 6, 1, 5]);
+        // Beberapa layer sekaligus: urutan relatifnya tetap.
+        doc.reorder(&[5, 1], false);
+        assert_eq!(order(&doc), [1, 5, 4, 3, 2, 6]);
+    }
+
+    #[test]
     fn style_only_the_selected_range() {
         let mut n = text_node("Dokumentasi Kajian");
         n.style_range(12, 18, |s| s.font = "Lora".into());
@@ -1354,6 +1522,45 @@ mod tests {
 
         doc.ungroup(&[g]);
         assert!(doc.group_members(&[g]).is_empty());
+    }
+
+    #[test]
+    fn layers_move_between_groups_and_frames() {
+        let mut doc = Doc::default();
+        let frame = doc.alloc_id();
+        doc.insert(Node::new(frame, Kind::Frame, 0.0, 0.0), None);
+        let ids: Vec<u64> = (0..5)
+            .map(|_| {
+                let id = doc.alloc_id();
+                doc.insert(Node::new(id, Kind::Rect, 0.0, 0.0), None);
+                id
+            })
+            .collect();
+        let order = |d: &Doc| -> Vec<u64> { d.nodes.iter().map(|n| n.id).collect() };
+        let g = doc.group(&[ids[0], ids[1]]);
+        // Ke dalam group, tepat di atas anggota paling depan.
+        assert!(doc.move_nodes(&[ids[4]], None, Some((ids[1], true)), g));
+        assert_eq!(order(&doc), vec![frame, ids[0], ids[1], ids[4], ids[2], ids[3]]);
+        assert_eq!(doc.group_members(&[g]), vec![ids[0], ids[1], ids[4]]);
+        // Keluar dari group: di bawah ids[3], tanpa group.
+        assert!(doc.move_nodes(&[ids[0]], None, Some((ids[3], false)), 0));
+        assert_eq!(order(&doc), vec![frame, ids[1], ids[4], ids[2], ids[0], ids[3]]);
+        assert_eq!(doc.find(ids[0]).unwrap().group, 0);
+        // Ke dalam frame; frame sendiri tidak bisa masuk frame.
+        assert!(doc.move_nodes(&[ids[2], ids[3]], Some(frame), None, 0));
+        assert_eq!(doc.nodes[0].children.iter().map(|c| c.id).collect::<Vec<_>>(), vec![ids[2], ids[3]]);
+        assert!(!doc.move_nodes(&[frame], Some(frame), None, 0));
+        // Seluruh group dipindah: tetap satu group.
+        assert!(doc.move_nodes(&[ids[1], ids[4]], Some(frame), Some((ids[2], false)), 0));
+        assert_eq!(doc.nodes[0].children.iter().map(|c| c.id).collect::<Vec<_>>(), vec![ids[1], ids[4], ids[2], ids[3]]);
+        assert_eq!(doc.group_members(&[g]), vec![ids[1], ids[4]]);
+        // Dilepas di tempat semula: tidak ada yang berubah.
+        assert!(!doc.move_nodes(&[ids[2]], Some(frame), Some((ids[2], true)), 0));
+        // Group yang ditinggal semua anggotanya ikut hilang namanya.
+        let h = doc.group(&[ids[2], ids[3]]);
+        assert!(doc.move_nodes(&[ids[1], ids[4]], Some(frame), Some((ids[3], true)), h));
+        assert_eq!(doc.group_members(&[h]), vec![ids[2], ids[3], ids[1], ids[4]]);
+        assert_eq!(doc.group_names.keys().copied().collect::<Vec<_>>(), vec![h]);
     }
 
     #[test]

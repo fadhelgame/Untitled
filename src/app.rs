@@ -311,6 +311,8 @@ pub struct App {
     expanded: HashSet<u64>,
     /// Group yang namanya sedang diedit di panel layer: (id group, teks, fokus sudah diminta).
     group_rename: Option<(u64, String, bool)>,
+    /// Layer yang sedang ditarik di panel layer (untuk dipindah urutan / induk / group-nya).
+    layer_drag: Option<Vec<u64>>,
     status: String,
     last_prop: (u64, f64),
     canvas_rect: Rect,
@@ -396,6 +398,7 @@ impl App {
             font_search: String::new(),
             expanded: HashSet::new(),
             group_rename: None,
+            layer_drag: None,
             status: "Ready. Press F to create a frame.".to_owned(),
             last_prop: (0, 0.0),
             canvas_rect: Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0)),
@@ -590,9 +593,7 @@ impl App {
             return;
         }
         let pre = self.doc.clone();
-        for id in self.sel.clone() {
-            self.doc.reorder_step(id, up);
-        }
+        self.doc.reorder_step(&self.sel, up);
         self.push_undo(pre);
     }
 
@@ -877,9 +878,7 @@ impl App {
             return;
         }
         let pre = self.doc.clone();
-        for id in self.sel.clone() {
-            self.doc.reorder(id, to_front);
-        }
+        self.doc.reorder(&self.sel, to_front);
         self.push_undo(pre);
     }
 
@@ -1404,15 +1403,16 @@ impl App {
         enum Row {
             /// (indeks level atas, indeks anak, kedalaman indentasi)
             Node(usize, Option<usize>, u8),
-            /// (id group, kedalaman indentasi)
-            Group(u64, u8),
+            /// (id group, kedalaman indentasi, anggota paling depan, frame induk)
+            Group(u64, u8, u64, Option<u64>),
         }
         // Menyisipkan baris group di awal tiap rangkaian; hasilnya: apakah anggotanya ditampilkan.
-        fn header(rows: &mut Vec<Row>, last: &mut u64, g: u64, depth: u8, expanded: &HashSet<u64>) -> bool {
+        fn header(rows: &mut Vec<Row>, last: &mut u64, n: &Node, parent: Option<u64>, depth: u8, expanded: &HashSet<u64>) -> bool {
+            let g = n.group;
             if g != *last {
                 *last = g;
                 if g != 0 {
-                    rows.push(Row::Group(g, depth));
+                    rows.push(Row::Group(g, depth, n.id, parent));
                 }
             }
             g == 0 || expanded.contains(&g)
@@ -1420,7 +1420,7 @@ impl App {
         let mut rows: Vec<Row> = Vec::with_capacity(self.doc.nodes.len());
         let mut last = 0u64;
         for (ti, n) in self.doc.nodes.iter().enumerate().rev() {
-            if !header(&mut rows, &mut last, n.group, 0, &self.expanded) {
+            if !header(&mut rows, &mut last, n, None, 0, &self.expanded) {
                 continue;
             }
             let depth = (n.group != 0) as u8;
@@ -1429,7 +1429,7 @@ impl App {
                 let mut last = 0u64;
                 for ci in (0..n.children.len()).rev() {
                     let g = n.children[ci].group;
-                    if header(&mut rows, &mut last, g, depth + 1, &self.expanded) {
+                    if header(&mut rows, &mut last, &n.children[ci], Some(n.id), depth + 1, &self.expanded) {
                         rows.push(Row::Node(ti, Some(ci), depth + 1 + (g != 0) as u8));
                     }
                 }
@@ -1468,13 +1468,29 @@ impl App {
         };
         let mut rename = self.group_rename.take();
         let mut renamed: Option<(u64, String)> = None;
+        // Tarik-lepas layer: tujuan lepas dihitung dari baris di bawah pointer.
+        struct Drop {
+            parent: Option<u64>,
+            anchor: Option<(u64, bool)>,
+            group: u64,
+            /// Frame / group yang dibuka setelah dilepas, supaya hasilnya terlihat.
+            open: Option<u64>,
+        }
+        let drag_pos = if self.layer_drag.is_some() { ui.input(|i| i.pointer.latest_pos()) } else { None };
+        let drag_frame = self.layer_drag.as_ref().is_some_and(|ids| ids.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.kind == Kind::Frame)));
+        let mut drag_start: Option<(Vec<u64>, bool)> = None; // (id yang ditarik, sudah terpilih)
+        let mut target: Option<Drop> = None;
+        let mut mark: Option<(Rect, bool)> = None; // (garis sisip / baris tujuan, masuk ke dalam?)
         ui.spacing_mut().item_spacing.y = 0.0;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
+            let at_end = range.end == rows.len();
+            let mut last_bottom = ui.cursor().top();
             for i in range {
+                last_bottom = ui.cursor().top() + row_h;
                 let (ti, ci, depth) = match rows[i] {
                     Row::Node(ti, ci, depth) => (ti, ci, depth),
-                    Row::Group(g, depth) => {
-                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                    Row::Group(g, depth, front, parent) => {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                         let members = self.doc.group_members(&[g]);
                         let selected = !members.is_empty() && members.iter().all(|id| self.sel.contains(id));
                         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
@@ -1486,6 +1502,15 @@ impl App {
                         let x = rect.left() + 10.0 + 26.0 * depth as f32;
                         let weak = ui.visuals().weak_text_color();
                         let open = self.expanded.contains(&g);
+                        if resp.drag_started() {
+                            drag_start = Some((members.clone(), selected));
+                        }
+                        if let Some(p) = drag_pos.filter(|p| rect.contains(*p) && !(drag_frame && parent.is_some())) {
+                            // Tepi atas baris group: di atas group (di luarnya). Selebihnya: masuk ke group.
+                            let above = p.y < rect.top() + row_h * 0.3;
+                            target = Some(Drop { parent, anchor: Some((front, true)), group: if above { 0 } else { g }, open: (!above).then_some(g) });
+                            mark = Some(if above { (Rect::from_min_max(pos2(x, rect.top()), rect.right_top()), false) } else { (rect, true) });
+                        }
                         painter.text(pos2(x + 5.0, rect.center().y), Align2::CENTER_CENTER, if open { "⏷" } else { "⏵" }, FontId::proportional(12.5), weak);
                         // Ikon group: kotak bergaris putus-putus.
                         let icon = Rect::from_center_size(pos2(x + 23.0, rect.center().y), vec2(11.0, 11.0));
@@ -1533,7 +1558,7 @@ impl App {
                     Some(ci) => &top.children[ci],
                     None => top,
                 };
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 let selected = self.sel.contains(&n.id);
                 let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
                 if selected {
@@ -1544,6 +1569,27 @@ impl App {
                 let indent = 10.0 + 26.0 * depth as f32;
                 let mut x = rect.left() + indent;
                 let is_frame = n.kind == Kind::Frame && ci.is_none();
+                if resp.drag_started() {
+                    drag_start = Some((if selected { self.sel.clone() } else { vec![n.id] }, selected));
+                }
+                let parent = ci.map(|_| top.id);
+                if let Some(p) = drag_pos.filter(|p| rect.contains(*p)) {
+                    let t = (p.y - rect.top()) / row_h;
+                    if is_frame && !drag_frame && t > 0.25 && (t < 0.75 || self.expanded.contains(&n.id)) {
+                        // Bagian tengah baris frame: masuk ke frame, paling depan.
+                        target = Some(Drop { parent: Some(n.id), anchor: None, group: 0, open: Some(n.id) });
+                        mark = Some((rect, true));
+                    } else if !(drag_frame && parent.is_some()) {
+                        let above = t < 0.5;
+                        // Di bawah anggota terakhir sebuah group: pointer di kiri indentasinya = keluar dari group.
+                        let more = matches!(rows.get(i + 1), Some(&Row::Node(t2, c2, _)) if c2.is_some() == ci.is_some() && (ci.is_none() || t2 == ti)
+                            && c2.map_or(&*self.doc.nodes[t2], |c| &self.doc.nodes[t2].children[c]).group == n.group);
+                        let out = n.group != 0 && !above && !more && p.x < rect.left() + indent;
+                        target = Some(Drop { parent, anchor: Some((n.id, above)), group: if out { 0 } else { n.group }, open: None });
+                        let (lx, ly) = (rect.left() + indent - if out { 26.0 } else { 0.0 }, if above { rect.top() } else { rect.bottom() });
+                        mark = Some((Rect::from_min_max(pos2(lx, ly), pos2(rect.right(), ly)), false));
+                    }
+                }
                 if n.clip {
                     // Panah siku: layer ini di-clip ke layer di bawahnya.
                     let (c, s) = (pos2(x + 4.0, rect.center().y), Stroke::new(1.3_f32, ACCENT));
@@ -1599,7 +1645,68 @@ impl App {
                     }
                 }
             }
+            if let Some(p) = drag_pos {
+                let clip = ui.clip_rect();
+                // Dilepas di area kosong di bawah daftar: jadi layer paling bawah.
+                if target.is_none() && at_end && p.y >= last_bottom && clip.contains(p) {
+                    if let Some(first) = self.doc.nodes.first() {
+                        target = Some(Drop { parent: None, anchor: Some((first.id, false)), group: 0, open: None });
+                        mark = Some((Rect::from_min_max(pos2(clip.left() + 10.0, last_bottom), pos2(clip.right(), last_bottom)), false));
+                    }
+                }
+                if let Some((r, into)) = mark {
+                    if into {
+                        ui.painter().rect_stroke(r.shrink2(vec2(0.0, 1.0)), CornerRadius::same(8), Stroke::new(1.5_f32, ACCENT), StrokeKind::Inside);
+                    } else {
+                        ui.painter().hline(r.x_range(), r.top(), Stroke::new(2.0_f32, ACCENT));
+                        ui.painter().circle_filled(r.left_top(), 3.0, ACCENT);
+                    }
+                }
+                // Dekat tepi atas/bawah daftar: gulir otomatis.
+                if clip.x_range().contains(p.x) {
+                    let dy = if p.y < clip.top() + 24.0 { 10.0 } else if p.y > clip.bottom() - 24.0 { -10.0 } else { 0.0 };
+                    if dy != 0.0 {
+                        ui.scroll_with_delta(vec2(0.0, dy));
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
         });
+        if let Some((ids, selected)) = drag_start {
+            if !selected {
+                self.sel = ids.clone();
+            }
+            self.layer_drag = Some(ids);
+        }
+        if let Some(ids) = self.layer_drag.take() {
+            let (down, esc) = ui.input(|i| (i.pointer.primary_down(), i.key_pressed(egui::Key::Escape)));
+            if down && !esc {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                // Label kecil yang mengikuti pointer: nama layer, atau jumlahnya.
+                if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+                    let text = match ids[..] {
+                        [id] => self.doc.find(id).map_or(String::new(), |n| n.name.clone()),
+                        _ => format!("{} layers", ids.len()),
+                    };
+                    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("layer_drag")));
+                    let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), Color32::WHITE);
+                    let r = Rect::from_min_size(p + vec2(14.0, 8.0), galley.size() + vec2(16.0, 8.0));
+                    painter.rect_filled(r, CornerRadius::same(6), ACCENT);
+                    painter.galley(r.min + vec2(8.0, 4.0), galley, Color32::WHITE);
+                }
+                self.layer_drag = Some(ids);
+            } else if let Some(d) = target.filter(|_| !esc) {
+                let pre = self.doc.clone();
+                if self.doc.move_nodes(&ids, d.parent, d.anchor, d.group) {
+                    if let Some(open) = d.open {
+                        self.expanded.insert(open);
+                    }
+                    self.status = if ids.len() == 1 { "Layer moved.".into() } else { format!("{} layers moved.", ids.len()) };
+                    self.sel = ids;
+                    self.push_undo(pre);
+                }
+            }
+        }
         if let Some(id) = lock_toggle {
             let pre = self.doc.clone();
             if let Some(n) = self.doc.find_mut(id) {
@@ -1737,6 +1844,30 @@ impl App {
                             if let Some(n) = self.doc.find_mut(id) {
                                 n.locked = true;
                             }
+                        }
+                    }
+                }
+                // `KANVAS_BENCH_LAYERDRAG=x1,y1,x2,y2[,hold]`: buka frame demo di panel layer, group dua
+                // isinya, lalu tarik dari (x1,y1) ke (x2,y2). Dengan `hold` tombol tidak dilepas,
+                // supaya penanda tujuan ikut di tangkapan layar.
+                if let Ok(spec) = std::env::var("KANVAS_BENCH_LAYERDRAG") {
+                    if let Some((frame, kids)) = self.doc.nodes.iter().find(|n| n.name == "Feature demo").map(|n| (n.id, n.children.iter().map(|c| c.id).collect::<Vec<_>>())) {
+                        self.expanded.insert(frame);
+                        if kids.len() >= 3 {
+                            let g = self.doc.group(&kids[kids.len() - 3..kids.len() - 1]);
+                            self.expanded.insert(g);
+                        }
+                    }
+                    let v: Vec<f32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                    if let [x1, y1, x2, y2] = v[..] {
+                        let (from, to) = (pos2(x1, y1), pos2(x2, y2));
+                        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                        b.inject.extend([(200, egui::Event::PointerMoved(from)), (202, button(from, true))]);
+                        for s in 1..=6u32 {
+                            b.inject.push((202 + s * 2, egui::Event::PointerMoved(from + (to - from) * (s as f32 / 6.0))));
+                        }
+                        if !spec.contains("hold") {
+                            b.inject.push((218, button(to, false)));
                         }
                     }
                 }
