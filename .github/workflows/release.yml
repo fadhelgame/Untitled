@@ -28,7 +28,7 @@ jobs:
             asset: Kanvas.exe
           # Apple Silicon only: ONNX Runtime (remove background) has no prebuilt Intel macOS library.
           - name: macOS
-            os: macos-14
+            os: macos-latest
             asset: Kanvas-macos-arm64.zip
           - name: Linux
             os: ubuntu-24.04
@@ -60,6 +60,8 @@ jobs:
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
+          # The runner must be Apple Silicon; fail loudly if "macos-latest" ever stops being one.
+          test "$(uname -m)" = arm64
           version=$(cargo pkgid | sed 's/.*[#@]//')
           app=dist/Kanvas.app
           mkdir -p "$app/Contents/MacOS"
