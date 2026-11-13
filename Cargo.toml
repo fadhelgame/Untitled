@@ -19,7 +19,7 @@ ttf-parser = "0.25"
 lyon_tessellation = "1.0.23"
 i_overlay = "9.1.0"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-31"] }
-svg2pdf = { version = "0.13", default-features = false, features = ["image"] }
+svg2pdf = { version = "0.13", default-features = false, features = ["image", "filters"] }
 pdf-writer = "0.12"
 
 [profile.dev]

@@ -4,11 +4,13 @@
 
 use crate::app::blend;
 use crate::app::render::{is_svg, layout_text, text_left};
-use crate::doc::{b64, Doc, Kind, Node};
+use crate::doc::{b64, Asset, Doc, Kind, Node, Shadow};
 use crate::fonts::FontManager;
 use eframe::egui;
 use std::fmt::Write;
 use std::path::Path;
+
+type Assets = std::collections::BTreeMap<u64, std::sync::Arc<Asset>>;
 
 fn paint(attr: &str, c: Option<[u8; 4]>) -> String {
     match c {
@@ -151,13 +153,13 @@ fn text_svg(out: &mut String, n: &Node, fonts: &mut FontManager, ctx: &egui::Con
 
 /// Daftar saudara (urutan tumpukan). Clipping mask: alas ditulis sekali dalam grup ber-id, lalu
 /// dipakai ulang sebagai mask alpha untuk layer yang di-clip kepadanya.
-fn list_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], doc: &Doc, fonts: &mut FontManager, ctx: &egui::Context) {
+fn list_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) {
     let mut i = 0;
     while i < nodes.len() {
         let (j, k) = crate::doc::clip_run(nodes, i);
         if k == j {
             for n in &nodes[i..j] {
-                node_svg(out, n.as_ref(), doc, fonts, ctx);
+                node_svg(out, n.as_ref(), assets, fonts, ctx);
             }
         } else {
             let id = nodes[i].as_ref().id;
@@ -165,7 +167,7 @@ fn list_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], doc: &Doc, fonts: &mu
             let mut area: Option<(f32, f32, f32, f32)> = None;
             for n in &nodes[i..j] {
                 let n = n.as_ref();
-                node_svg(out, n, doc, fonts, ctx);
+                node_svg(out, n, assets, fonts, ctx);
                 // Stroke dan glyph bisa keluar sedikit dari kotak pembatas.
                 let (b, pad) = (n.aabb(), n.stroke_w.max(0.0) + if n.kind == Kind::Text { n.max_size() } else { 0.0 });
                 let b = (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad);
@@ -179,7 +181,7 @@ fn list_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], doc: &Doc, fonts: &mu
                 y1 - y0
             );
             for n in &nodes[j..k] {
-                node_svg(out, n.as_ref(), doc, fonts, ctx);
+                node_svg(out, n.as_ref(), assets, fonts, ctx);
             }
             out.push_str("</g>");
         }
@@ -187,8 +189,78 @@ fn list_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], doc: &Doc, fonts: &mu
     }
 }
 
-fn node_svg(out: &mut String, n: &Node, doc: &Doc, fonts: &mut FontManager, ctx: &egui::Context) {
+/// Cara drop shadow ikut digambar.
+#[derive(Clone, Copy, PartialEq)]
+enum Fx {
+    /// Objek beserta bayangannya (export).
+    Full,
+    /// Hanya bayangannya (tekstur bayangan di canvas).
+    ShadowOnly,
+}
+
+fn node_svg(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) {
+    node_fx(out, n, assets, fonts, ctx, Fx::Full);
+}
+
+/// Jarak aman di sekeliling objek supaya bayangannya tidak terpotong.
+fn shadow_pad(n: &Node, s: &Shadow) -> f32 {
+    s.pad() + n.stroke_w.max(0.0) + if n.kind == Kind::Text { n.max_size() } else { 0.0 }
+}
+
+/// Tulis `<filter>` drop shadow untuk node (keluarannya hanya bayangan, tanpa objeknya);
+/// hasilnya atribut `filter` untuk elemen yang dibayangi.
+/// Filter dipasang di dalam grup rotasi, jadi arah bayangan ikut berputar bersama objek.
+fn shadow_filter(out: &mut String, n: &Node, s: &Shadow) -> String {
+    let (x0, y0, x1, y1) = n.bounds();
+    let pad = shadow_pad(n, s);
+    let [r, g, b, a] = s.color;
+    let _ = write!(
+        out,
+        r#"<filter id="sh{}" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}" color-interpolation-filters="sRGB">"#,
+        n.id,
+        x0 - pad,
+        y0 - pad,
+        x1 - x0 + pad * 2.0,
+        y1 - y0 + pad * 2.0
+    );
+    // Blur 0 = bayangan tajam: tanpa feGaussianBlur.
+    let source = if s.blur >= 0.01 {
+        let _ = write!(out, r#"<feGaussianBlur in="SourceAlpha" stdDeviation="{}"/>"#, s.blur * 0.5);
+        String::new()
+    } else {
+        r#" in="SourceAlpha""#.to_owned()
+    };
+    let _ = write!(
+        out,
+        r##"<feOffset{source} dx="{}" dy="{}" result="b"/><feFlood flood-color="#{r:02x}{g:02x}{b:02x}" flood-opacity="{:.3}"/><feComposite in2="b" operator="in"/>"##,
+        s.x,
+        s.y,
+        a as f32 / 255.0
+    );
+    out.push_str("</filter>");
+    format!(r#" filter="url(#sh{})""#, n.id)
+}
+
+/// Untuk tekstur bayangan: objek yang bentuknya pasti kotak penuh cukup diwakili satu `<rect>`
+/// (tanpa menanam gambar atau isi frame). Hasil: sudut bulatnya.
+fn solid_box(n: &Node, assets: &Assets) -> Option<f32> {
+    let (x0, y0, x1, y1) = n.bounds();
+    match n.kind {
+        Kind::Frame if n.fill.is_some_and(|c| c[3] == 255) => Some(0.0),
+        // JPEG tidak punya transparansi.
+        Kind::Image if n.image.and_then(|id| assets.get(&id)).is_some_and(|a| mime(&a.bytes) == "image/jpeg") => {
+            Some(n.radius.min((x1 - x0) * 0.5).min((y1 - y0) * 0.5).max(0.0))
+        }
+        _ => None,
+    }
+}
+
+fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context, fx: Fx) {
     if !n.visible {
+        return;
+    }
+    let shadow = n.shadow.filter(|s| s.color[3] > 0);
+    if fx == Fx::ShadowOnly && shadow.is_none() {
         return;
     }
     // Opacity, rotasi, dan blend mode dibungkus dalam satu grup.
@@ -200,19 +272,55 @@ fn node_svg(out: &mut String, n: &Node, doc: &Doc, fonts: &mut FontManager, ctx:
         let (cx, cy) = n.center();
         let _ = write!(attrs, r#" transform="rotate({} {cx} {cy})""#, n.rotation);
     }
-    if n.blend != 0 {
+    if n.blend != 0 && fx == Fx::Full {
         let _ = write!(attrs, r#" style="mix-blend-mode:{}""#, blend::CSS[(n.blend as usize).min(blend::CSS.len() - 1)]);
     }
-    if attrs.is_empty() {
-        node_inner(out, n, doc, fonts, ctx);
-    } else {
+    let filter = shadow.map(|s| shadow_filter(out, n, &s));
+    if !attrs.is_empty() {
         let _ = write!(out, "<g{attrs}>");
-        node_inner(out, n, doc, fonts, ctx);
+    }
+    match (&filter, fx) {
+        (None, _) => node_inner(out, n, assets, fonts, ctx),
+        (Some(filter), Fx::ShadowOnly) => {
+            let _ = write!(out, "<g{filter}>");
+            match solid_box(n, assets) {
+                Some(r) => {
+                    let (x0, y0, x1, y1) = n.bounds();
+                    let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{}" height="{}" rx="{r}"/>"#, x1 - x0, y1 - y0);
+                }
+                None => node_inner(out, n, assets, fonts, ctx),
+            }
+            out.push_str("</g>");
+        }
+        // Objek ditulis sekali lalu dipakai dua kali: salinan berfilter untuk bayangan, dan objek
+        // aslinya di atasnya tanpa filter. Dengan begitu hanya bayangan yang menjadi bitmap di PDF;
+        // objeknya sendiri tetap vektor.
+        (Some(filter), Fx::Full) => {
+            let _ = write!(out, r#"<defs><g id="n{}">"#, n.id);
+            node_inner(out, n, assets, fonts, ctx);
+            let _ = write!(out, r##"</g></defs><use href="#n{id}"{filter}/><use href="#n{id}"/>"##, id = n.id);
+        }
+    }
+    if !attrs.is_empty() {
         out.push_str("</g>");
     }
 }
 
-fn node_inner(out: &mut String, n: &Node, doc: &Doc, fonts: &mut FontManager, ctx: &egui::Context) {
+/// SVG yang hanya berisi bayangan satu node, untuk tekstur bayangan di canvas.
+/// Hasil: (svg, area dunia yang dicakup).
+pub fn shadow_svg(n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32))> {
+    let s = n.shadow.filter(|s| s.color[3] > 0 && n.visible)?;
+    let pad = shadow_pad(n, &s);
+    let b = n.aabb();
+    let region = (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad);
+    let (w, h) = (region.2 - region.0, region.3 - region.1);
+    let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{} {} {w} {h}">"#, region.0, region.1);
+    node_fx(&mut out, n, assets, fonts, ctx, Fx::ShadowOnly);
+    out.push_str("</svg>");
+    Some((out, region))
+}
+
+fn node_inner(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) {
     let (x0, y0, x1, y1) = n.bounds();
     let (w, h) = (x1 - x0, y1 - y0);
     let r = n.radius.min(w * 0.5).min(h * 0.5).max(0.0);
@@ -224,7 +332,7 @@ fn node_inner(out: &mut String, n: &Node, doc: &Doc, fonts: &mut FontManager, ct
                 r#"<clipPath id="c{id}"><rect x="{x0}" y="{y0}" width="{w}" height="{h}"/></clipPath><rect x="{x0}" y="{y0}" width="{w}" height="{h}" {fill}/><g clip-path="url(#c{id})">"#,
                 id = n.id
             );
-            list_svg(out, &n.children, doc, fonts, ctx);
+            list_svg(out, &n.children, assets, fonts, ctx);
             out.push_str("</g>");
             if n.stroke.is_some() && n.stroke_w > 0.0 {
                 let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{w}" height="{h}" fill="none" {}/>"#, stroke(n));
@@ -289,7 +397,7 @@ fn node_inner(out: &mut String, n: &Node, doc: &Doc, fonts: &mut FontManager, ct
             );
         }
         Kind::Image => {
-            let Some(asset) = n.image.and_then(|id| doc.assets.get(&id)) else { return };
+            let Some(asset) = n.image.and_then(|id| assets.get(&id)) else { return };
             let clip = if r > 0.0 {
                 let _ = write!(
                     out,
@@ -329,11 +437,14 @@ fn node_inner(out: &mut String, n: &Node, doc: &Doc, fonts: &mut FontManager, ct
 
 /// SVG untuk satu node (mis. frame terpilih) atau seluruh dokumen. Hasil: (svg, lebar, tinggi).
 pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, f32, f32)> {
+    let assets = &doc.assets;
     let target = only.and_then(|id| doc.find(id));
     let (x0, y0, x1, y1) = match target {
         Some(n) => {
             // Stroke garis/path melebar keluar dari kotak pembatas.
             let pad = if matches!(n.kind, Kind::Line | Kind::Path) && n.stroke.is_some() { n.stroke_w * 0.5 } else { 0.0 };
+            // Bayangan ikut masuk hasil export, kecuali untuk frame (ukuran halaman harus tetap).
+            let pad = pad + n.shadow.filter(|s| s.color[3] > 0 && n.kind != Kind::Frame).map_or(0.0, |s| s.pad());
             let b = n.aabb();
             (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad)
         }
@@ -344,8 +455,8 @@ pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui:
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{x0} {y0} {w} {h}">"#
     );
     match target {
-        Some(n) => node_svg(&mut out, n, doc, fonts, ctx),
-        None => list_svg(&mut out, &doc.nodes, doc, fonts, ctx),
+        Some(n) => node_svg(&mut out, n, assets, fonts, ctx),
+        None => list_svg(&mut out, &doc.nodes, assets, fonts, ctx),
     }
     out.push_str("</svg>");
     Some((out, w, h))
@@ -405,7 +516,9 @@ pub fn save_pdf(pages: &[(String, f32, f32)], path: &Path) -> Result<(), String>
     let name = Name(b"S");
     for (svg, w, h) in pages {
         let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).map_err(|e| e.to_string())?;
-        let (chunk, root) = svg2pdf::to_chunk(&tree, svg2pdf::ConversionOptions::default()).map_err(|e| e.to_string())?;
+        // Bagian yang memakai filter (bayangan, color overlay) menjadi bitmap; 3× cukup tajam untuk cetak.
+        let options = svg2pdf::ConversionOptions { raster_scale: 3.0, ..Default::default() };
+        let (chunk, root) = svg2pdf::to_chunk(&tree, options).map_err(|e| e.to_string())?;
         // Nomor objek tiap halaman dibuat ulang supaya tidak bertabrakan di dalam satu file.
         let mut map = std::collections::HashMap::new();
         let chunk = chunk.renumber(|old| *map.entry(old).or_insert_with(|| alloc.bump()));

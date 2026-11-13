@@ -141,6 +141,11 @@ fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
     n.w *= s;
     n.h *= s;
     n.stroke_w *= s;
+    if let Some(shadow) = &mut n.shadow {
+        shadow.x *= s;
+        shadow.y *= s;
+        shadow.blur *= s;
+    }
     n.radius *= s;
     n.font_size = (n.font_size * s).max(1.0);
     for span in &mut n.spans {
@@ -1609,6 +1614,19 @@ impl App {
                     self.icons.open = true;
                     self.icons.query = q;
                     self.icons.search(ctx);
+                }
+                // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
+                if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
+                    let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
+                    for id in ids {
+                        if let Some(n) = self.doc.find_mut(id) {
+                            n.shadow = Some(crate::doc::Shadow { x: 6.0, y: 10.0, blur: 14.0, color: [0, 0, 0, 120] });
+                        }
+                    }
+                    // Gulir panel properti ke bawah supaya bagian Drop shadow ikut di tangkapan layar.
+                    let at = pos2(ctx.screen_rect().right() - 150.0, 500.0);
+                    let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
+                    b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
                 }
                 if let Ok(q) = std::env::var("KANVAS_BENCH_PHOTOS") {
                     self.photos.open = true;

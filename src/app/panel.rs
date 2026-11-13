@@ -203,6 +203,22 @@ impl App {
                     );
                 }
             }
+            section(ui, "Drop shadow");
+            let mut shadow_color = n.shadow.map(|s| s.color);
+            paint_row(ui, &mut self.ext.picker, (id, 2), &mut shadow_color, None, crate::doc::Shadow::default().color);
+            n.shadow = match (shadow_color, n.shadow) {
+                (Some(color), Some(s)) => Some(crate::doc::Shadow { color, ..s }),
+                (Some(color), None) => Some(crate::doc::Shadow { color, ..Default::default() }),
+                (None, _) => None,
+            };
+            if let Some(s) = &mut n.shadow {
+                ui.horizontal(|ui| {
+                    let third = (ui.available_width() - 16.0) / 3.0;
+                    ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.x).speed(0.25).max_decimals(1).prefix("X  "));
+                    ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.y).speed(0.25).max_decimals(1).prefix("Y  "));
+                    ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.blur).speed(0.25).range(0.0..=500.0).max_decimals(1).prefix("Blur  "));
+                });
+            }
             self.export_section(ui, &ctx);
             ui.add_space(12.0);
         });

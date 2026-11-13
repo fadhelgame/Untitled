@@ -83,6 +83,21 @@ struct Detail {
     frame: u64,
 }
 
+/// Tekstur bayangan satu node. `node` = keadaan node saat dirender (untuk tahu kapan harus
+/// dirender ulang), `scale` = piksel tekstur per satuan dokumen, `region` = area dunia yang dicakup.
+struct ShadowTex {
+    node: Node,
+    scale: f32,
+    region: (f32, f32, f32, f32),
+    /// Jumlah font yang bisa dipakai saat dirender: font yang baru selesai diunduh mengubah
+    /// tata letak teks, jadi bayangannya harus dirender ulang.
+    fonts: usize,
+    tex: TextureHandle,
+    frame: u64,
+}
+
+type ShadowDone = (Node, usize, f32, (f32, f32, f32, f32), Result<ColorImage, String>);
+
 struct DetailReq {
     node: u64,
     key: TexKey,
@@ -140,6 +155,12 @@ pub struct Ext {
     detail_failed: HashSet<u64>,
     det_tx: mpsc::Sender<(DetailReq, Result<ColorImage, String>)>,
     det_rx: mpsc::Receiver<(DetailReq, Result<ColorImage, String>)>,
+    /// Tekstur drop shadow per node, yang sedang dirender, dan yang gagal dirender.
+    shadows: HashMap<u64, ShadowTex>,
+    shadow_busy: HashSet<u64>,
+    shadow_failed: HashSet<u64>,
+    sh_tx: mpsc::Sender<ShadowDone>,
+    sh_rx: mpsc::Receiver<ShadowDone>,
     pub export_scale: f32,
     pub export_fmt: usize,
     pub v_plain: bool,
@@ -150,6 +171,7 @@ impl Default for Ext {
     fn default() -> Self {
         let (img_tx, img_rx) = mpsc::channel();
         let (det_tx, det_rx) = mpsc::channel();
+        let (sh_tx, sh_rx) = mpsc::channel();
         Ext {
             svg: HashMap::new(),
             details: HashMap::new(),
@@ -157,6 +179,11 @@ impl Default for Ext {
             detail_failed: HashSet::new(),
             det_tx,
             det_rx,
+            shadows: HashMap::new(),
+            shadow_busy: HashSet::new(),
+            shadow_failed: HashSet::new(),
+            sh_tx,
+            sh_rx,
             frame: 0,
             pen: None,
             pen_drag: false,
@@ -231,8 +258,21 @@ impl Ext {
                 }
             }
         }
+        while let Ok((node, fonts, scale, region, result)) = self.sh_rx.try_recv() {
+            self.shadow_busy.remove(&node.id);
+            match result {
+                Ok(image) => {
+                    let tex = ctx.load_texture(format!("shadow-{}", node.id), image, egui::TextureOptions::LINEAR);
+                    self.shadows.insert(node.id, ShadowTex { node, scale, region, fonts, tex, frame: self.frame });
+                }
+                Err(_) => {
+                    self.shadow_failed.insert(node.id);
+                }
+            }
+        }
         let frame = self.frame;
         self.details.retain(|_, d| d.frame + 300 > frame);
+        self.shadows.retain(|_, s| s.frame + 300 > frame);
         if self.tex.len() > 6 {
             self.tex.retain(|_, e| e.1 + 1200 > frame);
         }
@@ -783,6 +823,62 @@ pub fn glyph_scale(px: f32, moving: bool, ppp: f32) -> (f32, f32) {
 
 // ---------------------------------------------------------------- node
 
+// ---------------------------------------------------------------- drop shadow
+
+/// Resolusi tekstur bayangan (piksel per satuan dokumen): tidak perlu lebih halus dari layar,
+/// dan bayangan yang buram cukup dengan resolusi rendah.
+fn shadow_scale(blur: f32, screen: f32, side: f32) -> f32 {
+    screen.min(8.0 / blur.max(0.5)).min(2048.0 / side.max(1.0)).max(1e-3)
+}
+
+fn render_shadow(svg: &str, region: (f32, f32, f32, f32), scale: f32) -> Result<ColorImage, String> {
+    use resvg::tiny_skia::{Pixmap, Transform};
+    let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).map_err(|e| e.to_string())?;
+    let (w, h) = (((region.2 - region.0) * scale).ceil().max(1.0) as u32, ((region.3 - region.1) * scale).ceil().max(1.0) as u32);
+    let mut pixmap = Pixmap::new(w, h).ok_or("couldn't create the bitmap")?;
+    resvg::render(&tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    Ok(ColorImage::from_rgba_premultiplied([w as usize, h as usize], pixmap.data()))
+}
+
+/// Gambar drop shadow node (di bawah node itu sendiri). Bayangan dirasterkan di thread lain dari
+/// SVG yang sama dengan jalur export, lalu disimpan sebagai tekstur; selama versi baru belum jadi,
+/// tekstur lama tetap dipakai (digeser mengikuti node, jadi menggeser objek tetap mulus).
+fn shadow_layer(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32) {
+    let Some(shadow) = n.shadow.filter(|s| s.color[3] > 0) else { return };
+    if pc.capture.is_some() {
+        return;
+    }
+    let frame = pc.ext.frame;
+    let screen = pc.view.zoom * pc.ctx.pixels_per_point();
+    let fonts = pc.fonts.usable_count();
+    let fresh = pc.ext.shadows.get_mut(&n.id).is_some_and(|c| {
+        c.frame = frame;
+        let want = shadow_scale(shadow.blur, screen, (c.region.2 - c.region.0).max(c.region.3 - c.region.1));
+        c.node == *n && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
+    });
+    if !fresh && !pc.ext.shadow_busy.contains(&n.id) && !pc.ext.shadow_failed.contains(&n.id) {
+        if let Some((svg, region)) = crate::export::shadow_svg(n, pc.assets, pc.fonts, pc.ctx) {
+            let scale = shadow_scale(shadow.blur, screen, (region.2 - region.0).max(region.3 - region.1));
+            pc.ext.shadow_busy.insert(n.id);
+            let (tx, ctx, node) = (pc.ext.sh_tx.clone(), pc.ctx.clone(), n.clone());
+            std::thread::spawn(move || {
+                let image = render_shadow(&svg, region, scale);
+                let _ = tx.send((node, fonts, scale, region, image));
+                ctx.request_repaint();
+            });
+        }
+    }
+    if let Some(c) = pc.ext.shadows.get(&n.id) {
+        let (dx, dy) = (n.x - c.node.x, n.y - c.node.y);
+        let r = Rect::from_min_max(
+            pc.view.to_screen(pc.o, c.region.0 + dx, c.region.1 + dy),
+            pc.view.to_screen(pc.o, c.region.2 + dx, c.region.3 + dy),
+        );
+        let tint = Color32::WHITE.gamma_multiply(alpha);
+        painter.add(egui::epaint::RectShape::filled(r, CornerRadius::ZERO, tint).with_texture(c.tex.id(), UV_FULL));
+    }
+}
+
 /// Penampung bentuk. Node biasa langsung masuk painter; node yang dirotasi atau memakai
 /// blend mode dikumpulkan dulu supaya bisa di-tessellate, diputar, dan digambar khusus.
 struct Sink<'p> {
@@ -858,13 +954,16 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
         return;
     }
     // Opacity diturunkan ke anak (pendekatan; bukan group opacity sungguhan).
+    let parent_alpha = alpha;
     let alpha = alpha * n.opacity.clamp(0.0, 1.0);
     let (x0, y0, x1, y1) = n.bounds();
     let cull = if n.rotation != 0.0 { n.aabb() } else { (x0, y0, x1, y1) };
-    let pad = n.stroke_w.max(1.0) + if n.kind == Kind::Text { n.max_size() } else { 0.0 };
+    let pad = n.stroke_w.max(1.0) + if n.kind == Kind::Text { n.max_size() } else { 0.0 } + n.shadow.map_or(0.0, |s| s.pad());
     if cull.2 + pad < pc.vis.0 || cull.0 - pad > pc.vis.2 || cull.3 + pad < pc.vis.1 || cull.1 - pad > pc.vis.3 {
         return;
     }
+    // Opacity node sudah termasuk di tekstur bayangan; yang dikalikan di sini hanya milik induknya.
+    shadow_layer(pc, painter, n, parent_alpha);
     let z = pc.view.zoom;
     let r = Rect::from_min_max(pc.view.to_screen(pc.o, x0, y0), pc.view.to_screen(pc.o, x1, y1));
     let pivot = r.center();

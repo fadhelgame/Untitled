@@ -306,6 +306,9 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     if n.radius != 0.0 {
         put("radius", r2(n.radius));
     }
+    if let Some(s) = n.shadow {
+        put("shadow", json!({ "x": r2(s.x), "y": r2(s.y), "blur": r2(s.blur), "color": hex(s.color) }));
+    }
     if n.rotation != 0.0 {
         put("rotation", r2(n.rotation));
     }
@@ -725,6 +728,19 @@ impl App {
                 }
                 "stroke_width" => n.stroke_w = num(k, v)?.max(0.0),
                 "radius" => n.radius = num(k, v)?.max(0.0),
+                "shadow" => {
+                    n.shadow = if v.is_null() {
+                        None
+                    } else {
+                        let d = crate::doc::Shadow::default();
+                        let f = |key: &str, default: f32| v.get(key).and_then(|x| x.as_f64()).map_or(default, |x| x as f32);
+                        let color = match v.get("color") {
+                            Some(c) => color(c)?,
+                            None => d.color,
+                        };
+                        Some(crate::doc::Shadow { x: f("x", d.x), y: f("y", d.y), blur: f("blur", d.blur).max(0.0), color })
+                    };
+                }
                 "rotation" => n.rotation = num(k, v)?,
                 "opacity" => n.opacity = num(k, v)?.clamp(0.0, 1.0),
                 "visible" => n.visible = flag(k, v)?,

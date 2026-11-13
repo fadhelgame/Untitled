@@ -436,6 +436,12 @@ impl FontManager {
         self.state.iter().any(|(k, s)| k.contains(':') && matches!(s, State::Loading))
     }
 
+    /// Jumlah font yang sudah bisa dipakai untuk layout di frame ini (font yang baru selesai
+    /// dimuat baru berlaku satu frame kemudian). Berubah = tata letak teks bisa berubah.
+    pub fn usable_count(&self) -> usize {
+        self.state.values().filter(|s| matches!(s, State::Ready { frame } if self.frame > *frame)).count()
+    }
+
     pub fn loaded_count(&self) -> usize {
         self.state.iter().filter(|(k, s)| k.contains(':') && matches!(s, State::Ready { .. })).count()
     }

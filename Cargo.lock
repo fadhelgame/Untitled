@@ -2979,6 +2979,8 @@ dependencies = [
  "miniz_oxide 0.8.9",
  "once_cell",
  "pdf-writer",
+ "resvg",
+ "tiny-skia",
  "usvg",
 ]
 

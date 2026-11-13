@@ -103,7 +103,7 @@ Every screenshot here is the real app.
       <br>
       <sub>Gradients, vector paths, styled text and a Multiply blend, in a document with 501 frames and 8,014 layers.</sub>
       <h3>Color, gradients and blending</h3>
-      Solid fills, linear and radial gradients with draggable stops, strokes, opacity and corner radius. A built-in color picker with hex and alpha, plus an eyedropper with a pixel loupe that samples any pixel in the window.
+      Solid fills, linear and radial gradients with draggable stops, strokes, opacity, corner radius and a <b>drop shadow</b> (offset, blur and color) that works on any object, including text and cut-out images. A built-in color picker with hex and alpha, plus an eyedropper with a pixel loupe that samples any pixel in the window.
       <br><br>
       <b>7 blend modes:</b> Normal, Darken, Multiply, Lighten, Screen, Plus lighter and Exclusion.
     </td>

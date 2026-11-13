@@ -290,8 +290,34 @@ pub struct Node {
     /// Clipping mask: node ini hanya tampil di dalam bentuk (alpha) layer tepat di bawahnya.
     #[serde(default)]
     pub clip: bool,
+    /// Drop shadow di belakang objek.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<Shadow>,
     #[serde(default)]
     pub children: Vec<Node>,
+}
+
+/// Drop shadow: bayangan di belakang objek. Offset dan blur dalam satuan dokumen;
+/// blur mengikuti kebiasaan CSS/Figma (simpangan baku = setengah nilai blur).
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Shadow {
+    pub x: f32,
+    pub y: f32,
+    pub blur: f32,
+    pub color: [u8; 4],
+}
+
+impl Default for Shadow {
+    fn default() -> Self {
+        Shadow { x: 0.0, y: 4.0, blur: 12.0, color: [0, 0, 0, 64] }
+    }
+}
+
+impl Shadow {
+    /// Seberapa jauh bayangan bisa melebar keluar dari objeknya, ke arah mana pun.
+    pub fn pad(&self) -> f32 {
+        self.x.abs().max(self.y.abs()) * 1.5 + self.blur.max(0.0) * 1.5 + 1.0
+    }
 }
 
 impl AsRef<Node> for Node {
@@ -425,6 +451,7 @@ impl Node {
             visible: true,
             group: 0,
             clip: false,
+            shadow: None,
             children: Vec::new(),
         }
     }
