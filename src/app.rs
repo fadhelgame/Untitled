@@ -1697,8 +1697,10 @@ impl App {
                             n.shadow = Some(crate::doc::Shadow { x: 6.0, y: 10.0, blur: 14.0, color: [0, 0, 0, 120] });
                         }
                     }
-                    // Buka tab Effects supaya bagian Drop shadow ikut di tangkapan layar.
-                    self.ext.props_tab = 1;
+                    // Gulir panel properti ke bawah supaya bagian Drop shadow ikut di tangkapan layar.
+                    let at = pos2(ctx.screen_rect().right() - 150.0, 500.0);
+                    let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
+                    b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
                 }
                 // `KANVAS_BENCH_BLUR=1`: layer blur di frame demo — satu kotak, satu group (elips +
                 // bintang, buram sebagai satu gambar), teks, alas clipping mask, dan objek ber-blend.
@@ -1721,7 +1723,9 @@ impl App {
                                 n.blur = blur;
                             }
                         }
-                        self.ext.props_tab = 1;
+                        let at = pos2(ctx.screen_rect().right() - 150.0, 500.0);
+                        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
+                        b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
                     }
                 }
                 // `KANVAS_BENCH_LOCK=1`: kunci isi frame demo dan buka frame-nya di panel layer.
@@ -1976,9 +1980,9 @@ fn field(ui: &mut egui::Ui, width: f32, label: &str, v: &mut f32) {
     );
 }
 
-/// Kolom nilai layer blur (0 = mati).
+/// Kolom nilai layer blur. Tidak bisa sampai 0: blur dilepas lewat tombol − di bagian Effects.
 fn blur_field(ui: &mut egui::Ui, width: f32, v: &mut f32) -> egui::Response {
-    ui.add_sized([width, 28.0], egui::DragValue::new(v).speed(0.25).range(0.0..=500.0).max_decimals(1).prefix("Blur  "))
+    ui.add_sized([width, 28.0], egui::DragValue::new(v).speed(0.25).range(0.1..=500.0).max_decimals(1).prefix("Blur  "))
 }
 
 fn icon_button(ui: &mut egui::Ui, selected: bool, tip: &str, draw: impl FnOnce(&egui::Painter, Pos2, Color32)) -> bool {

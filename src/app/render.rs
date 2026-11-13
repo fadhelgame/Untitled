@@ -182,8 +182,6 @@ pub struct Ext {
     bl_rx: mpsc::Receiver<BlurDone>,
     pub export_scale: f32,
     pub export_fmt: usize,
-    /// Tab panel properti yang terbuka: 0 = Design, 1 = Effects.
-    pub props_tab: u8,
     pub v_plain: bool,
     pub paste_seen: bool,
 }
@@ -241,7 +239,6 @@ impl Default for Ext {
             glyphs: vtext::Cache::default(),
             export_scale: 1.0,
             export_fmt: 0,
-            props_tab: 0,
             v_plain: false,
             paste_seen: false,
         }
