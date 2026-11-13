@@ -1,0 +1,29 @@
+[package]
+name = "kanvas"
+version = "0.1.0"
+edition = "2021"
+description = "Editor desain native yang ringan: canvas infinite, frame tanpa batas, Google Fonts"
+# `src/bin/kanvas-mcp.rs` = server MCP; `cargo run` tetap menjalankan aplikasinya.
+default-run = "kanvas"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+ureq = "2"
+rfd = "0.15"
+resvg = "0.45"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+arboard = "3"
+ttf-parser = "0.25"
+lyon_tessellation = "1.0.23"
+i_overlay = "9.1.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

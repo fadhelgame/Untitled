@@ -1,0 +1,1789 @@
+use crate::doc::{Doc, Kind, Node};
+use crate::export;
+use crate::fonts::{weight_name, CatalogState, FontManager};
+use eframe::egui::{
+    self, pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Key, Modifiers, PointerButton, Pos2, Rect,
+    Sense, Stroke, StrokeKind, Vec2,
+};
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+mod assist;
+pub(crate) mod blend;
+mod builder;
+mod canvas;
+mod home;
+mod panel;
+mod pen;
+mod picker;
+mod presets;
+mod rembg;
+mod remote;
+pub(crate) mod render;
+mod theme;
+mod vtext;
+mod wand;
+
+const ACCENT: Color32 = Color32::from_rgb(13, 153, 255);
+const CANVAS_BG: Color32 = Color32::from_rgb(24, 24, 26);
+const MIN_ZOOM: f32 = 0.01;
+const MAX_ZOOM: f32 = 64.0;
+const UNDO_LIMIT: usize = 200;
+const CLIP_TAG: &str = "kanvas_clip";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Select,
+    Scale,
+    Wand,
+    Hand,
+    Frame,
+    Rect,
+    Ellipse,
+    Line,
+    Pen,
+    ShapeBuilder,
+    Text,
+}
+
+/// Urutan di toolbar bawah: (tool, nama, shortcut).
+const TOOLS: [(Tool, &str, &str); 11] = [
+    (Tool::Select, "Move", "V"),
+    (Tool::Scale, "Scale", "K"),
+    (Tool::Wand, "Magic wand", "Y"),
+    (Tool::Hand, "Hand", "H / hold Space"),
+    (Tool::Frame, "Frame", "F"),
+    (Tool::Rect, "Rectangle", "R"),
+    (Tool::Ellipse, "Ellipse", "O"),
+    (Tool::Line, "Line", "L"),
+    (Tool::Pen, "Pen", "P"),
+    (Tool::ShapeBuilder, "Shape builder", "Shift+M"),
+    (Tool::Text, "Text", "T"),
+];
+
+/// Posisi 8 pegangan sebagai pecahan kotak pembatas (searah jarum jam dari kiri-atas).
+const HANDLE_F: [(f32, f32); 8] =
+    [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0), (0.0, 1.0), (0.0, 0.5)];
+
+fn draw_icon(p: &egui::Painter, tool: Tool, c: Pos2, color: Color32) {
+    let s = Stroke::new(1.6_f32, color);
+    let at = |x: f32, y: f32| pos2(c.x + x, c.y + y);
+    let line = |a: Pos2, b: Pos2| {
+        p.line_segment([a, b], s);
+    };
+    match tool {
+        Tool::Select => {
+            p.add(egui::Shape::closed_line(vec![at(-5.5, -8.0), at(6.5, 0.5), at(0.5, 1.8), at(-2.5, 7.5)], s));
+        }
+        Tool::Scale => {
+            p.rect_stroke(Rect::from_min_max(at(-8.0, -1.0), at(1.0, 8.0)), CornerRadius::same(1), s, StrokeKind::Middle);
+            line(at(2.0, -2.0), at(8.0, -8.0));
+            line(at(3.0, -8.0), at(8.0, -8.0));
+            line(at(8.0, -8.0), at(8.0, -3.0));
+        }
+        Tool::Wand => {
+            // Tongkat miring dengan kilau di ujungnya.
+            line(at(-7.5, 8.0), at(1.0, -0.5));
+            for (dx, dy) in [(0.0, -3.6), (0.0, 3.6), (-3.6, 0.0), (3.6, 0.0)] {
+                line(at(4.0 + dx * 0.45, -3.5 + dy * 0.45), at(4.0 + dx, -3.5 + dy));
+            }
+            p.circle_filled(at(-4.5, -6.0), 1.0, color);
+            p.circle_filled(at(7.0, 4.5), 1.0, color);
+        }
+        Tool::Hand => {
+            // Telapak + empat jari, digambar sederhana.
+            p.rect_stroke(Rect::from_min_max(at(-5.5, -1.0), at(6.0, 8.0)), CornerRadius::same(4), s, StrokeKind::Middle);
+            for (x, top) in [(-3.6, -6.0), (-0.7, -8.0), (2.2, -7.0), (5.0, -4.5)] {
+                line(at(x, top), at(x, -1.0));
+            }
+        }
+        Tool::Frame => {
+            for d in [-4.0, 4.0] {
+                line(at(d, -8.0), at(d, 8.0));
+                line(at(-8.0, d), at(8.0, d));
+            }
+        }
+        Tool::Rect => {
+            p.rect_stroke(Rect::from_center_size(c, vec2(15.0, 15.0)), CornerRadius::same(2), s, StrokeKind::Middle);
+        }
+        Tool::Ellipse => {
+            p.circle_stroke(c, 7.5, s);
+        }
+        Tool::Line => line(at(-7.0, 7.0), at(7.0, -7.0)),
+        Tool::Pen => {
+            // Mata pena.
+            p.add(egui::Shape::closed_line(vec![at(0.0, -8.5), at(5.5, 1.0), at(2.5, 8.0), at(-2.5, 8.0), at(-5.5, 1.0)], s));
+            line(at(0.0, -8.5), at(0.0, 0.5));
+            p.circle_filled(at(0.0, 1.8), 1.6, color);
+        }
+        Tool::ShapeBuilder => {
+            // Dua bentuk bertumpuk yang sedang disatukan, dengan tanda plus.
+            p.circle_stroke(at(-2.8, 2.2), 5.4, s);
+            p.rect_stroke(Rect::from_min_max(at(-1.5, -7.5), at(7.5, 1.5)), CornerRadius::same(1), s, StrokeKind::Middle);
+            p.circle_filled(at(1.0, -1.0), 1.7, color);
+        }
+        Tool::Text => {
+            line(at(-6.5, -7.0), at(6.5, -7.0));
+            line(at(0.0, -7.0), at(0.0, 7.5));
+            line(at(-6.5, -7.0), at(-6.5, -4.5));
+            line(at(6.5, -7.0), at(6.5, -4.5));
+            line(at(-2.5, 7.5), at(2.5, 7.5));
+        }
+    }
+}
+
+/// Skala proporsional terhadap titik jangkar, termasuk stroke, radius, ukuran font, dan anak.
+fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
+    n.x = ax + (n.x - ax) * s;
+    n.y = ay + (n.y - ay) * s;
+    n.w *= s;
+    n.h *= s;
+    n.stroke_w *= s;
+    n.radius *= s;
+    n.font_size = (n.font_size * s).max(1.0);
+    for span in &mut n.spans {
+        span.style.size = (span.style.size * s).max(1.0);
+    }
+    for c in &mut n.children {
+        scale_node(c, s, ax, ay);
+    }
+}
+
+/// Regangkan node mengikuti kotak seleksi: kotak asal berpojok (x0, y0) dipetakan ke pojok
+/// (nx, ny) dengan skala (sx, sy). Stroke, radius, dan ukuran font tidak berubah (itu tugas Scale tool).
+fn stretch_node(n: &mut Node, (x0, y0): (f32, f32), (nx, ny): (f32, f32), (sx, sy): (f32, f32)) {
+    let map = |x: f32, y: f32| (nx + (x - x0) * sx, ny + (y - y0) * sy);
+    if n.kind == Kind::Line && n.rotation == 0.0 {
+        (n.x, n.y) = map(n.x, n.y);
+        n.w *= sx;
+        n.h *= sy;
+    } else {
+        let (cx, cy) = n.center();
+        let (cx, cy) = map(cx, cy);
+        // Node berputar: sumbu lokalnya ikut teregang sesuai arahnya.
+        let (sin, cos) = n.rotation.to_radians().sin_cos();
+        let (kw, kh) = ((sx * cos).hypot(sy * sin), (sx * sin).hypot(sy * cos));
+        match n.kind {
+            // Tinggi teks mengikuti isinya; teks lebar-otomatis hanya berpindah tempat.
+            Kind::Text if n.wrap => n.w = (n.w * kw).max(1.0),
+            Kind::Text => {}
+            Kind::Line => {
+                n.w *= kw;
+                n.h *= kh;
+            }
+            _ => {
+                n.w = (n.w * kw).max(1.0);
+                n.h = (n.h * kh).max(1.0);
+            }
+        }
+        n.x = cx - n.w * 0.5;
+        n.y = cy - n.h * 0.5;
+    }
+    for c in &mut n.children {
+        stretch_node(c, (x0, y0), (nx, ny), (sx, sy));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stretch_keeps_layout_inside_the_selection_box() {
+        // Kotak seleksi (0,0)-(200,100) ditarik jadi (10,20)-(410,70): sx = 2, sy = 0.5.
+        let mut a = Node::new(1, Kind::Rect, 0.0, 0.0);
+        (a.w, a.h) = (50.0, 100.0);
+        let mut b = Node::new(2, Kind::Image, 150.0, 60.0);
+        (b.w, b.h) = (50.0, 40.0);
+        let mut label = Node::new(3, Kind::Text, 80.0, 40.0);
+        (label.w, label.h) = (40.0, 20.0);
+        for n in [&mut a, &mut b, &mut label] {
+            stretch_node(n, (0.0, 0.0), (10.0, 20.0), (2.0, 0.5));
+        }
+        assert_eq!((a.x, a.y, a.w, a.h), (10.0, 20.0, 100.0, 50.0));
+        assert_eq!((b.x, b.y, b.w, b.h), (310.0, 50.0, 100.0, 20.0));
+        // Teks lebar-otomatis: ukuran tetap, pusatnya ikut berpindah.
+        assert_eq!((label.w, label.h), (40.0, 20.0));
+        assert_eq!(label.center(), (210.0, 45.0));
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct View {
+    pan: Vec2,
+    zoom: f32,
+}
+
+impl View {
+    fn to_screen(&self, o: Pos2, x: f32, y: f32) -> Pos2 {
+        pos2(o.x + self.pan.x + x * self.zoom, o.y + self.pan.y + y * self.zoom)
+    }
+    fn to_world(&self, o: Pos2, p: Pos2) -> Pos2 {
+        pos2((p.x - o.x - self.pan.x) / self.zoom, (p.y - o.y - self.pan.y) / self.zoom)
+    }
+}
+
+enum Drag {
+    None,
+    Pan,
+    /// `dup`: Alt sedang ditahan, yang digeser adalah salinan; isinya seleksi asli (untuk dibatalkan
+    /// kalau Alt dilepas sebelum mouse dilepas).
+    Move { start: Pos2, applied: Vec2, moved: bool, dup: Option<Vec<u64>> },
+    Resize { id: u64, handle: u8, orig: (f32, f32, f32, f32), start: Pos2 },
+    Scale { id: u64, handle: u8, orig: Node },
+    /// Resize/scale beberapa objek sekaligus lewat kotak seleksi. `bounds` = kotak asal,
+    /// `orig` = node asli; `scale` = Scale tool (proporsional, termasuk stroke dan font).
+    MultiResize { handle: u8, bounds: (f32, f32, f32, f32), start: Pos2, orig: Vec<Node>, scale: bool },
+    TextBox { start: Pos2, cur: Pos2 },
+    Rotate { id: u64, center: Pos2, start: f32, orig: f32 },
+    Marquee { start: Pos2, base: Vec<u64> },
+    Create { id: u64, start: Pos2 },
+    /// Menarik pegangan gradasi di canvas: 0/1 = ujung garis, 2+i = stop ke-i.
+    Gradient { id: u64, part: usize, orig: crate::doc::Gradient },
+}
+
+struct Inp {
+    pos: Option<Pos2>,
+    pressed: bool,
+    down: bool,
+    mid_pressed: bool,
+    mid_down: bool,
+    delta: Vec2,
+    mods: Modifiers,
+    space: bool,
+    zoom: f32,
+    scroll: Vec2,
+}
+
+struct Bench {
+    out: PathBuf,
+    frame: u32,
+    samples: Vec<f32>,
+    shot: bool,
+    phase: u8,
+    mark: u32,
+    /// Event pointer buatan untuk menguji interaksi mouse: (frame, event).
+    inject: Vec<(u32, egui::Event)>,
+}
+
+pub struct App {
+    doc: Doc,
+    view: View,
+    tool: Tool,
+    sel: Vec<u64>,
+    drag: Drag,
+    pre_drag: Option<Doc>,
+    undo: Vec<Doc>,
+    redo: Vec<Doc>,
+    fonts: FontManager,
+    editing: Option<u64>,
+    edit_frames: u32,
+    edit_pre: Option<Doc>,
+    path: Option<PathBuf>,
+    dirty: bool,
+    title: String,
+    font_search: String,
+    expanded: HashSet<u64>,
+    /// Group yang namanya sedang diedit di panel layer: (id group, teks, fokus sudah diminta).
+    group_rename: Option<(u64, String, bool)>,
+    status: String,
+    last_prop: (u64, f64),
+    canvas_rect: Rect,
+    fit_pending: bool,
+    labels: Vec<(u64, Rect)>,
+    drawn: usize,
+    frame_ms: f32,
+    last_zoom: (f32, f64),
+    show_ui: bool,
+    font_focus: bool,
+    ext: render::Ext,
+    bench: Option<Bench>,
+    /// Halaman awal (daftar file terbaru) sedang ditampilkan.
+    home: bool,
+    files: home::Files,
+    /// Remove background (Codex) yang sedang berjalan.
+    rembg: Option<rembg::Job>,
+    /// Remote control lewat soket lokal (untuk server MCP `kanvas-mcp`).
+    remote: Option<remote::Remote>,
+    /// Pengaturan magic wand.
+    wand: wand::Wand,
+}
+
+/// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
+/// export) mencampur warna; `from_rgba_unmultiplied` mengalikan di ruang linear sehingga warna
+/// semi-transparan tampak terlalu terang dan gradasi ke transparan tidak menyatu.
+fn col(c: [u8; 4]) -> Color32 {
+    let m = |v: u8| ((v as u16 * c[3] as u16 + 127) / 255) as u8;
+    Color32::from_rgba_premultiplied(m(c[0]), m(c[1]), m(c[2]), c[3])
+}
+
+// ---------------------------------------------------------------- render
+
+/// Titik pegangan resize dalam koordinat dunia.
+/// Dengan Scale tool semua jenis objek (termasuk teks dan garis) punya 8 pegangan.
+fn handles_local(n: &Node, scale: bool) -> Vec<(u8, f32, f32)> {
+    let boxed = |n: &Node| {
+        let (x0, y0, x1, y1) = n.bounds();
+        HANDLE_F.iter().enumerate().map(|(i, (fx, fy))| (i as u8, x0 + (x1 - x0) * fx, y0 + (y1 - y0) * fy)).collect()
+    };
+    match n.kind {
+        _ if scale => boxed(n),
+        // Teks: tinggi mengikuti isi, jadi tanpa pegangan tengah-atas/bawah.
+        Kind::Text => {
+            let all: Vec<(u8, f32, f32)> = boxed(n);
+            all.into_iter().filter(|h| h.0 != 1 && h.0 != 5).collect()
+        }
+        Kind::Line => vec![(0, n.x, n.y), (1, n.x + n.w, n.y + n.h)],
+        _ => boxed(n),
+    }
+}
+
+// ---------------------------------------------------------------- app
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, bench: Option<PathBuf>, open: Option<PathBuf>) -> Self {
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
+        theme::apply(&cc.egui_ctx);
+        let mut app = App {
+            doc: Doc::default(),
+            view: View { pan: vec2(80.0, 80.0), zoom: 1.0 },
+            tool: Tool::Select,
+            sel: Vec::new(),
+            drag: Drag::None,
+            pre_drag: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            fonts: FontManager::new(&cc.egui_ctx),
+            editing: None,
+            edit_frames: 0,
+            edit_pre: None,
+            path: None,
+            dirty: false,
+            title: String::new(),
+            font_search: String::new(),
+            expanded: HashSet::new(),
+            group_rename: None,
+            status: "Ready. Press F to create a frame.".to_owned(),
+            last_prop: (0, 0.0),
+            canvas_rect: Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0)),
+            fit_pending: false,
+            labels: Vec::new(),
+            drawn: 0,
+            frame_ms: 0.0,
+            last_zoom: (1.0, 0.0),
+            show_ui: true,
+            wand: Default::default(),
+            font_focus: false,
+            ext: Default::default(),
+            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new() }),
+            home: false,
+            files: home::Files::new(&cc.egui_ctx),
+            rembg: None,
+            remote: None,
+        };
+        app.home = app.bench.is_none();
+        if app.bench.is_none() {
+            app.remote = remote::Remote::start(&cc.egui_ctx);
+        }
+        if let Some(p) = open {
+            app.load(p);
+        }
+        app
+    }
+
+    // ------------------------------------------------------------ undo
+
+    fn push_undo(&mut self, pre: Doc) {
+        self.undo.push(pre);
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.touch();
+    }
+
+    /// Tandai dokumen berubah; auto-save menunggu sampai pengguna berhenti sebentar.
+    fn touch(&mut self) {
+        self.dirty = true;
+        self.ext.rev += 1;
+        self.files.last_change = std::time::Instant::now();
+    }
+
+    fn do_undo(&mut self) {
+        if let Some(d) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.doc, d));
+            self.after_history();
+        }
+    }
+
+    fn do_redo(&mut self) {
+        if let Some(d) = self.redo.pop() {
+            self.undo.push(std::mem::replace(&mut self.doc, d));
+            self.after_history();
+        }
+    }
+
+    fn after_history(&mut self) {
+        let doc = &self.doc;
+        self.sel.retain(|id| doc.find(*id).is_some());
+        self.touch();
+    }
+
+    // ------------------------------------------------------------ view
+
+    fn zoom_at(&mut self, p: Pos2, factor: f32) {
+        let o = self.canvas_rect.min;
+        let w = self.view.to_world(o, p);
+        self.view.zoom = (self.view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.view.pan = vec2(p.x - o.x - w.x * self.view.zoom, p.y - o.y - w.y * self.view.zoom);
+    }
+
+    fn zoom_to(&mut self, b: (f32, f32, f32, f32), max_zoom: f32) {
+        let size = self.canvas_rect.size();
+        let (bw, bh) = ((b.2 - b.0).max(1.0), (b.3 - b.1).max(1.0));
+        let zoom = ((size.x - 80.0).max(50.0) / bw).min((size.y - 80.0).max(50.0) / bh).clamp(MIN_ZOOM, max_zoom);
+        self.view.zoom = zoom;
+        self.view.pan = vec2(
+            size.x * 0.5 - (b.0 + bw * 0.5) * zoom,
+            size.y * 0.5 - (b.1 + bh * 0.5) * zoom,
+        );
+    }
+
+    fn fit_all(&mut self) {
+        match self.doc.bounds() {
+            Some(b) => self.zoom_to(b, 1.0),
+            None => self.view = View { pan: vec2(80.0, 80.0), zoom: 1.0 },
+        }
+    }
+
+    // ------------------------------------------------------------ selection helpers
+
+    /// Id terpilih tanpa anak yang frame induknya juga terpilih (supaya tidak digeser dua kali).
+    fn roots(&self) -> Vec<u64> {
+        self.sel
+            .iter()
+            .copied()
+            .filter(|id| self.doc.parent_of(*id).map_or(true, |p| !self.sel.contains(&p)))
+            .collect()
+    }
+
+    /// Move dan Scale sama-sama bisa memilih dan menggeser objek.
+    fn pointer_tool(&self) -> bool {
+        matches!(self.tool, Tool::Select | Tool::Scale)
+    }
+
+    fn align(&mut self, mode: u8) {
+        let ids = self.roots();
+        // Satu objek: rata terhadap frame induknya. Banyak objek: terhadap kotak seleksi.
+        let target = if ids.len() == 1 {
+            self.doc.parent_of(ids[0]).and_then(|p| self.doc.find(p)).map(|n| n.bounds())
+        } else {
+            ids.iter()
+                .filter_map(|id| self.doc.find(*id).map(|n| n.bounds()))
+                .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+        };
+        let Some(t) = target else { return };
+        let pre = self.doc.clone();
+        for id in ids {
+            if let Some(n) = self.doc.find_mut(id) {
+                let b = n.bounds();
+                let (dx, dy) = match mode {
+                    0 => (t.0 - b.0, 0.0),
+                    1 => (t.2 - b.2, 0.0),
+                    2 => ((t.0 + t.2 - b.0 - b.2) * 0.5, 0.0),
+                    3 => (0.0, t.1 - b.1),
+                    4 => (0.0, t.3 - b.3),
+                    _ => (0.0, (t.1 + t.3 - b.1 - b.3) * 0.5),
+                };
+                n.translate(dx.round(), dy.round());
+            }
+        }
+        self.push_undo(pre);
+    }
+
+    fn edit_selected(&mut self, f: impl Fn(&mut Node)) {
+        if self.sel.is_empty() {
+            return;
+        }
+        let pre = self.doc.clone();
+        for id in self.sel.clone() {
+            if let Some(n) = self.doc.find_mut(id) {
+                f(n);
+            }
+        }
+        self.push_undo(pre);
+    }
+
+    fn zoom_100(&mut self) {
+        let c = self.canvas_rect.center();
+        let f = 1.0 / self.view.zoom;
+        self.zoom_at(c, f);
+    }
+
+    fn zoom_selection(&mut self) {
+        let b = self
+            .sel
+            .iter()
+            .filter_map(|id| self.doc.find(*id).map(|n| n.bounds()))
+            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
+        if let Some(b) = b {
+            self.zoom_to(b, 8.0);
+        }
+    }
+
+    fn step_order(&mut self, up: bool) {
+        if self.sel.is_empty() {
+            return;
+        }
+        let pre = self.doc.clone();
+        for id in self.sel.clone() {
+            self.doc.reorder_step(id, up);
+        }
+        self.push_undo(pre);
+    }
+
+    fn hit(&self, p: Pos2, wp: Pos2, tol: f32) -> Option<u64> {
+        let label = || self.labels.iter().rev().find(|(_, r)| r.contains(p)).map(|(id, _)| *id);
+        match self.doc.hit(wp.x, wp.y, tol) {
+            // Seperti Figma: badan frame yang berisi objek tidak bisa dipegang, hanya labelnya.
+            Some(id) if self.body_locked(id) => label(),
+            Some(id) => Some(id),
+            None => label(),
+        }
+    }
+
+    /// Frame yang sudah berisi objek: badannya tidak memilih/menggeser frame (pakai label namanya).
+    /// Frame yang terlalu kecil di layar untuk punya label tetap bisa dipegang dari badannya.
+    fn body_locked(&self, id: u64) -> bool {
+        self.doc.find(id).is_some_and(|n| {
+            n.kind == Kind::Frame && n.children.iter().any(|c| c.visible) && n.w * self.view.zoom > 36.0
+        })
+    }
+
+    fn handle_at(&self, p: Pos2) -> Option<(u64, u8)> {
+        if self.sel.len() != 1 || !self.pointer_tool() {
+            return None;
+        }
+        let n = self.doc.find(self.sel[0])?;
+        let o = self.canvas_rect.min;
+        handles(n, self.tool == Tool::Scale).into_iter().find_map(|(i, x, y)| {
+            let hp = self.view.to_screen(o, x, y);
+            ((hp.x - p.x).abs() <= 6.0 && (hp.y - p.y).abs() <= 6.0).then_some((n.id, i))
+        })
+    }
+
+    /// Kotak pembatas seleksi kalau yang terpilih lebih dari satu objek (untuk pegangan resize bersama).
+    fn sel_box(&self) -> Option<(f32, f32, f32, f32)> {
+        if self.sel.len() < 2 || !self.pointer_tool() || self.editing.is_some() || self.ext.path_edit.is_some() {
+            return None;
+        }
+        let ids = self.roots();
+        if ids.len() < 2 {
+            return None;
+        }
+        ids.iter()
+            .filter_map(|id| self.doc.find(*id).map(|n| n.aabb()))
+            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+    }
+
+    fn multi_handle_at(&self, p: Pos2) -> Option<u8> {
+        let (x0, y0, x1, y1) = self.sel_box()?;
+        let o = self.canvas_rect.min;
+        HANDLE_F.iter().enumerate().find_map(|(i, (fx, fy))| {
+            let hp = self.view.to_screen(o, x0 + (x1 - x0) * fx, y0 + (y1 - y0) * fy);
+            ((hp.x - p.x).abs() <= 6.0 && (hp.y - p.y).abs() <= 6.0).then_some(i as u8)
+        })
+    }
+
+    // ------------------------------------------------------------ group
+
+    /// Node ini beserta semua anggota group-nya (atau hanya node ini kalau tidak digroup).
+    fn with_group(&self, id: u64) -> Vec<u64> {
+        match self.doc.find(id).map(|n| n.group) {
+            Some(g) if g != 0 => self.doc.group_members(&[g]),
+            _ => vec![id],
+        }
+    }
+
+    fn selected_groups(&self) -> Vec<u64> {
+        let mut groups: Vec<u64> =
+            self.sel.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.group).filter(|g| *g != 0).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    }
+
+    /// Id group kalau seleksi persis berisi semua anggota satu group.
+    fn selected_whole_group(&self) -> Option<u64> {
+        let groups = self.selected_groups();
+        let [g] = groups[..] else { return None };
+        let members = self.doc.group_members(&[g]);
+        (members.len() == self.sel.len() && members.iter().all(|id| self.sel.contains(id))).then_some(g)
+    }
+
+    /// Ganti nama group; ketikan beruntun digabung jadi satu langkah undo.
+    fn set_group_name(&mut self, g: u64, name: String, now: f64) {
+        if self.doc.group_name(g) == name {
+            return;
+        }
+        if self.last_prop.0 != g || now - self.last_prop.1 > 0.8 {
+            let pre = self.doc.clone();
+            self.push_undo(pre);
+        }
+        self.last_prop = (g, now);
+        self.doc.group_names.insert(g, name);
+        self.touch();
+    }
+
+    fn group_selection(&mut self) {
+        let ids = self.roots();
+        if ids.len() < 2 {
+            self.status = "Select two or more objects to group.".into();
+            return;
+        }
+        let pre = self.doc.clone();
+        self.doc.group(&ids);
+        self.sel = ids;
+        self.push_undo(pre);
+        self.status = format!("Grouped {} objects. Ctrl+Shift+G to ungroup.", self.sel.len());
+    }
+
+    fn ungroup_selection(&mut self) {
+        let groups = self.selected_groups();
+        if groups.is_empty() {
+            return;
+        }
+        let pre = self.doc.clone();
+        self.doc.ungroup(&groups);
+        self.push_undo(pre);
+        self.status = "Ungrouped.".into();
+    }
+
+    /// Objek terpilih yang bisa ikut clipping mask (semua kecuali frame).
+    fn clip_targets(&self) -> Vec<u64> {
+        self.sel.iter().copied().filter(|id| self.doc.find(*id).is_some_and(|n| n.kind != Kind::Frame)).collect()
+    }
+
+    /// Buat clipping mask dari seleksi, atau lepas kalau semuanya sudah di-clip.
+    fn toggle_clip(&mut self) {
+        let ids = self.clip_targets();
+        if ids.is_empty() {
+            self.status = "Select a layer (not a frame) to make a clipping mask.".into();
+            return;
+        }
+        let pre = self.doc.clone();
+        if ids.iter().all(|id| self.doc.find(*id).is_some_and(|n| n.clip)) {
+            self.doc.release_clip(&ids);
+            self.status = "Clipping mask released.".into();
+        } else if self.doc.make_clip(&ids) {
+            self.status = "Clipping mask created: the layer shows only inside the layer below it.".into();
+        } else {
+            self.status = "Nothing to clip to: put the layer above another layer first.".into();
+            return;
+        }
+        self.push_undo(pre);
+    }
+
+    fn marquee_pick(&self, a: Pos2, b: Pos2) -> Vec<u64> {
+        let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+        let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+        let inter = |n: &Node| {
+            let q = n.bounds();
+            n.visible && q.0 <= x1 && q.2 >= x0 && q.1 <= y1 && q.3 >= y0
+        };
+        // Marquee sepenuhnya di dalam satu frame: pilih isi frame itu.
+        let inside = self.doc.nodes.iter().rev().find(|n| {
+            let q = n.bounds();
+            n.kind == Kind::Frame && n.visible && q.0 <= x0 && q.1 <= y0 && q.2 >= x1 && q.3 >= y1
+        });
+        let picked: Vec<&Node> = match inside {
+            Some(f) => f.children.iter().filter(|c| inter(c)).collect(),
+            None => self.doc.nodes.iter().map(|n| &**n).filter(|n| inter(n)).collect(),
+        };
+        let mut ids: Vec<u64> = picked.iter().map(|n| n.id).collect();
+        // Menyentuh satu anggota group memilih seluruh group.
+        let mut groups: Vec<u64> = picked.iter().map(|n| n.group).filter(|g| *g != 0).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for id in self.doc.group_members(&groups) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    // ------------------------------------------------------------ editing ops
+
+    fn delete_selection(&mut self) {
+        if self.sel.is_empty() {
+            return;
+        }
+        let pre = self.doc.clone();
+        for id in std::mem::take(&mut self.sel) {
+            self.doc.remove(id);
+        }
+        self.push_undo(pre);
+    }
+
+    fn selected_nodes(&self) -> Vec<Node> {
+        self.roots().into_iter().filter_map(|id| self.doc.find(id).cloned()).collect()
+    }
+
+    fn copy(&self, ctx: &egui::Context) {
+        let nodes = self.selected_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(&serde_json::json!({ CLIP_TAG: nodes })) {
+            ctx.copy_text(json);
+        }
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        let parsed = serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|mut v| v.get_mut(CLIP_TAG).map(serde_json::Value::take))
+            .and_then(|v| serde_json::from_value::<Vec<Node>>(v).ok());
+        match parsed {
+            Some(nodes) => self.add_nodes(nodes, 24.0),
+            None => {
+                // Teks biasa dari clipboard: jadikan node teks di tengah layar.
+                let c = self.view.to_world(self.canvas_rect.min, self.canvas_rect.center());
+                let mut n = Node::new(0, Kind::Text, c.x.round(), c.y.round());
+                n.text = text.chars().take(5000).collect();
+                n.name = "Text".into();
+                n.fill = Some(if self.doc.frame_at(c.x, c.y, 0).is_some() { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
+                n.w = 100.0;
+                n.h = 20.0;
+                self.add_nodes(vec![n], 0.0);
+            }
+        }
+    }
+
+    fn add_nodes(&mut self, mut nodes: Vec<Node>, offset: f32) {
+        if nodes.is_empty() {
+            return;
+        }
+        let pre = self.doc.clone();
+        self.doc.regroup(&mut nodes);
+        self.sel.clear();
+        for mut n in nodes {
+            self.doc.reassign_ids(&mut n);
+            n.translate(offset, offset);
+            let (cx, cy) = n.center();
+            let parent = if n.kind == Kind::Frame { None } else { self.doc.frame_at(cx, cy, 0) };
+            self.sel.push(n.id);
+            self.doc.insert(n, parent);
+        }
+        self.push_undo(pre);
+    }
+
+    fn nudge(&mut self, dx: f32, dy: f32) {
+        let ids = self.roots();
+        if ids.is_empty() {
+            return;
+        }
+        let pre = self.doc.clone();
+        for id in ids {
+            if let Some(n) = self.doc.find_mut(id) {
+                n.translate(dx, dy);
+            }
+        }
+        self.push_undo(pre);
+    }
+
+    fn reorder(&mut self, to_front: bool) {
+        if self.sel.is_empty() {
+            return;
+        }
+        let pre = self.doc.clone();
+        for id in self.sel.clone() {
+            self.doc.reorder(id, to_front);
+        }
+        self.push_undo(pre);
+    }
+
+    fn start_text_edit(&mut self, id: u64, pre: Doc) {
+        self.editing = Some(id);
+        self.edit_frames = 0;
+        self.edit_pre = Some(pre);
+        self.sel = vec![id];
+    }
+
+    fn finish_text_edit(&mut self) {
+        let Some(id) = self.editing.take() else { return };
+        let pre = self.edit_pre.take();
+        let empty = self.doc.find(id).map_or(true, |n| n.text.trim().is_empty());
+        if empty {
+            self.doc.remove(id);
+            self.sel.retain(|s| *s != id);
+        }
+        if let Some(pre) = pre {
+            let changed = pre.find(id).map(|n| &n.text) != self.doc.find(id).map(|n| &n.text);
+            if changed {
+                self.push_undo(pre);
+            }
+        }
+        self.tool = Tool::Select;
+    }
+
+    // ------------------------------------------------------------ file ops
+
+    /// Boleh meninggalkan dokumen ini? File yang sudah punya lokasi disimpan otomatis;
+    /// hanya dokumen yang belum pernah disimpan yang perlu konfirmasi.
+    fn confirm_discard(&mut self) -> bool {
+        if self.path.is_some() {
+            return self.settle();
+        }
+        if !self.dirty {
+            return true;
+        }
+        rfd::MessageDialog::new()
+            .set_title("Kanvas")
+            .set_description("You have unsaved changes. Continue without saving?")
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show()
+            == rfd::MessageDialogResult::Yes
+    }
+
+    fn reset_session(&mut self) {
+        self.sel.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.editing = None;
+        self.drag = Drag::None;
+        self.dirty = false;
+        self.fit_pending = true;
+    }
+
+    fn new_doc(&mut self) {
+        if self.confirm_discard() {
+            self.doc = Doc::default();
+            self.path = None;
+            self.reset_session();
+            self.status = "New document.".into();
+        }
+    }
+
+    fn open_dialog(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
+        if let Some(p) = rfd::FileDialog::new().add_filter("Kanvas", &["kanvas"]).pick_file() {
+            self.load(p);
+        }
+    }
+
+    fn load(&mut self, path: PathBuf) -> bool {
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let result = std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice::<Doc>(&b).map_err(|e| e.to_string()));
+        match result {
+            Ok(mut doc) => {
+                // Pastikan id baru tidak bentrok dengan id di file.
+                let max_id = doc.nodes.iter().flat_map(|n| std::iter::once(n.id).chain(n.children.iter().map(|c| c.id))).max();
+                doc.next_id = doc.next_id.max(max_id.unwrap_or(0));
+                self.doc = doc;
+                self.status = format!("Opened: {}", path.display());
+                self.opened(&path);
+                self.path = Some(path);
+                self.reset_session();
+                true
+            }
+            Err(e) => {
+                self.status = format!("Couldn't open the file: {e}");
+                false
+            }
+        }
+    }
+
+    /// Hasil true = dokumen tersimpan (false juga kalau dialog lokasi dibatalkan).
+    fn save(&mut self, save_as: bool) -> bool {
+        let path = match (&self.path, save_as) {
+            (Some(p), false) => Some(p.clone()),
+            _ => rfd::FileDialog::new().add_filter("Kanvas", &["kanvas"]).set_file_name("Untitled.kanvas").save_file(),
+        };
+        let Some(path) = path else { return false };
+        match self.write_doc(&path) {
+            Ok(()) => {
+                self.status = format!("Saved: {}", path.display());
+                true
+            }
+            Err(e) => {
+                self.status = format!("Couldn't save: {e}");
+                false
+            }
+        }
+    }
+
+    /// Isi dokumen dengan 500 frame (±8.000 objek) untuk menguji performa.
+    fn stress_test(&mut self) {
+        const FONTS: [&str; 6] = ["Inter", "Poppins", "Playfair Display", "Space Grotesk", "Roboto Mono", "Lora"];
+        const COLORS: [[u8; 4]; 8] = [
+            [13, 153, 255, 255],
+            [255, 99, 71, 255],
+            [20, 174, 92, 255],
+            [151, 71, 255, 255],
+            [255, 205, 41, 255],
+            [242, 78, 30, 255],
+            [0, 181, 206, 255],
+            [255, 36, 189, 255],
+        ];
+        let pre = self.doc.clone();
+        let by = self.doc.bounds().map_or(0.0, |b| b.3 + 300.0);
+        let text = |doc: &mut Doc, s: &str, x: f32, y: f32, size: f32, weight: u16, font: &str, fill: [u8; 4]| {
+            let mut t = Node::new(doc.alloc_id(), Kind::Text, x, y);
+            t.name = s.lines().next().unwrap_or("Text").to_owned();
+            t.text = s.to_owned();
+            t.font = font.to_owned();
+            t.weight = weight;
+            t.font_size = size;
+            t.fill = Some(fill);
+            t.w = s.lines().map(|l| l.chars().count()).max().unwrap_or(1) as f32 * size * 0.55;
+            t.h = s.lines().count().max(1) as f32 * size * 1.2;
+            t
+        };
+        let shape = |doc: &mut Doc, kind: Kind, x: f32, y: f32, w: f32, h: f32, fill: [u8; 4], radius: f32| {
+            let mut n = Node::new(doc.alloc_id(), kind, x, y);
+            n.w = w;
+            n.h = h;
+            n.fill = Some(fill);
+            n.radius = radius;
+            n
+        };
+        for i in 0..500usize {
+            let (c, r) = ((i % 25) as f32, (i / 25) as f32);
+            let (x, y) = (c * 470.0, by + r * 964.0);
+            let accent = COLORS[i % COLORS.len()];
+            let font = FONTS[i % FONTS.len()];
+            let mut f = Node::new(self.doc.alloc_id(), Kind::Frame, x, y);
+            f.name = format!("Screen {}", i + 1);
+            f.w = 390.0;
+            f.h = 844.0;
+            f.fill = Some([255, 255, 255, 255]);
+            let d = &mut self.doc;
+            f.children.push(shape(d, Kind::Rect, x, y, 390.0, 104.0, accent, 0.0));
+            f.children.push(text(d, &format!("Screen {}", i + 1), x + 24.0, y + 40.0, 26.0, 700, font, [255, 255, 255, 255]));
+            f.children.push(shape(d, Kind::Ellipse, x + 318.0, y + 28.0, 48.0, 48.0, [255, 255, 255, 230], 0.0));
+            for k in 0..3 {
+                let cy = y + 132.0 + k as f32 * 196.0;
+                f.children.push(shape(d, Kind::Rect, x + 24.0, cy, 342.0, 176.0, [242, 243, 245, 255], 16.0));
+                f.children.push(text(d, &format!("Card {} · {}", k + 1, font), x + 44.0, cy + 22.0, 18.0, 700, font, [20, 20, 20, 255]));
+                f.children.push(text(
+                    d,
+                    "Infinite canvas, hundreds of frames,\nstill light and lag-free.",
+                    x + 44.0,
+                    cy + 58.0,
+                    14.0,
+                    400,
+                    font,
+                    [90, 90, 90, 255],
+                ));
+            }
+            let mut line = Node::new(d.alloc_id(), Kind::Line, x + 24.0, y + 728.0);
+            line.w = 342.0;
+            line.stroke = Some([220, 220, 220, 255]);
+            line.stroke_w = 1.0;
+            f.children.push(line);
+            f.children.push(shape(d, Kind::Rect, x + 24.0, y + 752.0, 342.0, 56.0, accent, 28.0));
+            f.children.push(text(d, "Continue", x + 152.0, y + 770.0, 17.0, 700, font, [255, 255, 255, 255]));
+            self.doc.insert(f, None);
+        }
+        self.push_undo(pre);
+        self.fit_pending = true;
+        self.status = "Added 500 frames. Try zooming and panning.".into();
+    }
+
+    // ------------------------------------------------------------ shortcuts
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let cmd = Modifiers::COMMAND;
+        let (save_as, save, open, new) = ctx.input_mut(|i| {
+            (
+                i.consume_key(cmd | Modifiers::SHIFT, Key::S),
+                i.consume_key(cmd, Key::S),
+                i.consume_key(cmd, Key::O),
+                i.consume_key(cmd, Key::N),
+            )
+        });
+        if save_as {
+            self.save(true);
+        } else if save {
+            self.save(false);
+        }
+        if open {
+            self.open_dialog();
+        }
+        if new {
+            self.new_doc();
+        }
+
+        // Eyedropper aktif: Esc membatalkan, shortcut lain ditahan supaya layar tetap sama dengan tangkapannya.
+        if self.ext.picker.eyedrop.is_some() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.ext.picker.eyedrop = None;
+            }
+            return;
+        }
+
+        // Sisanya hanya berlaku kalau tidak sedang mengetik.
+        if ctx.wants_keyboard_input() || self.editing.is_some() {
+            return;
+        }
+        let (clip_mask, redo, undo, dup, all, ungroup, group) = ctx.input_mut(|i| {
+            (
+                // Sebelum Ctrl+G: pola tanpa Alt juga cocok dengan Ctrl+Alt+G.
+                i.consume_key(cmd | Modifiers::ALT, Key::G),
+                i.consume_key(cmd | Modifiers::SHIFT, Key::Z) || i.consume_key(cmd, Key::Y),
+                i.consume_key(cmd, Key::Z),
+                i.consume_key(cmd, Key::D),
+                i.consume_key(cmd, Key::A),
+                i.consume_key(cmd | Modifiers::SHIFT, Key::G),
+                i.consume_key(cmd, Key::G),
+            )
+        });
+        if clip_mask {
+            self.toggle_clip();
+        } else if ungroup {
+            self.ungroup_selection();
+        } else if group {
+            self.group_selection();
+        }
+        if redo {
+            self.do_redo();
+        } else if undo {
+            self.do_undo();
+        }
+        if dup {
+            let nodes = self.selected_nodes();
+            self.add_nodes(nodes, 24.0);
+        }
+        if all && self.ext.path_edit.is_some() {
+            self.path_edit_select_all();
+        } else if all {
+            self.sel = self.doc.nodes.iter().map(|n| n.id).collect();
+        }
+        // Salin / potong / tempel datang sebagai event, bukan tombol.
+        let mut clip: Vec<(u8, String)> = Vec::new();
+        ctx.input(|i| {
+            for e in &i.events {
+                match e {
+                    egui::Event::Copy => clip.push((0, String::new())),
+                    egui::Event::Cut => clip.push((1, String::new())),
+                    egui::Event::Paste(t) => clip.push((2, t.clone())),
+                    _ => {}
+                }
+            }
+        });
+        for (kind, text) in clip {
+            match kind {
+                0 => self.copy(ctx),
+                1 => {
+                    self.copy(ctx);
+                    self.delete_selection();
+                }
+                _ => self.paste_text(&text),
+            }
+        }
+
+        // Shortcut mengikuti kebiasaan Figma.
+        let (keys, mods) = ctx.input(|i| {
+            let keys: Vec<Key> = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, .. } => Some(*key),
+                    _ => None,
+                })
+                .collect();
+            (keys, i.modifiers)
+        });
+        let (c, s, a) = (mods.command, mods.shift, mods.alt);
+        let plain = !c && !s && !a;
+        let step = if s { 10.0 } else { 1.0 };
+        let center = self.canvas_rect.center();
+        for key in keys {
+            match key {
+                // Pen: Enter atau Esc menyelesaikan path yang sedang digambar
+                Key::Enter | Key::Escape if self.ext.pen.is_some() => self.finish_pen(false),
+                Key::Backspace | Key::Delete if self.ext.pen.is_some() => self.pen_backspace(),
+                // Mode edit titik path
+                Key::Enter | Key::Escape if self.ext.path_edit.is_some() => self.ext.path_edit = None,
+                Key::Backspace | Key::Delete if self.ext.path_edit.is_some() => self.path_edit_delete(),
+                // Tool
+                Key::V if plain => self.tool = Tool::Select,
+                Key::K if plain => self.tool = Tool::Scale,
+                Key::Y if plain => self.tool = Tool::Wand,
+                Key::H if plain => self.tool = Tool::Hand,
+                Key::F if plain => self.tool = Tool::Frame,
+                Key::R if plain => self.tool = Tool::Rect,
+                Key::O if plain => self.tool = Tool::Ellipse,
+                Key::L if plain => self.tool = Tool::Line,
+                Key::T if plain => self.tool = Tool::Text,
+                Key::P if plain => self.tool = Tool::Pen,
+                Key::M if s && !c && !a => self.tool = Tool::ShapeBuilder,
+                Key::I if plain => self.toggle_eyedropper(),
+                // Rata: Alt+A/D kiri/kanan, Alt+W/S atas/bawah, Alt+H/V tengah
+                Key::A if a && !c => self.align(0),
+                Key::D if a && !c => self.align(1),
+                Key::H if a && !c => self.align(2),
+                Key::W if a && !c => self.align(3),
+                Key::S if a && !c => self.align(4),
+                Key::V if a && !c => self.align(5),
+                // Shift+X tukar fill dan stroke
+                Key::X if s && !c && !a => self.edit_selected(|n| {
+                    std::mem::swap(&mut n.fill, &mut n.stroke);
+                    if n.stroke.is_some() && n.stroke_w <= 0.0 {
+                        n.stroke_w = 1.0;
+                    }
+                }),
+                // Ctrl+Shift+H tampil/sembunyi
+                Key::H if c && s => self.edit_selected(|n| n.visible = !n.visible),
+                // Ctrl+\ tampil/sembunyikan panel
+                Key::Backslash if c => self.show_ui = !self.show_ui,
+                // Enter: edit teks terpilih
+                Key::Enter if plain && self.sel.len() == 1 => {
+                    let id = self.sel[0];
+                    if self.doc.find(id).is_some_and(|n| n.kind == Kind::Text) {
+                        let pre = self.doc.clone();
+                        self.start_text_edit(id, pre);
+                        // Seperti Figma: Enter masuk mode edit dengan seluruh teks terseleksi.
+                        self.ext.edit_pending = Some(render::EditPending::All);
+                    } else if self.doc.find(id).is_some_and(|n| n.kind == Kind::Path) {
+                        self.start_path_edit(id);
+                    }
+                }
+                Key::Delete | Key::Backspace => self.delete_selection(),
+                Key::Escape => {
+                    self.sel.clear();
+                    self.tool = Tool::Select;
+                }
+                // Mode edit titik: panah menggeser titik terpilih
+                Key::ArrowLeft if !c && !a && self.path_edit_nudge(-step, 0.0) => {}
+                Key::ArrowRight if !c && !a && self.path_edit_nudge(step, 0.0) => {}
+                Key::ArrowUp if !c && !a && self.path_edit_nudge(0.0, -step) => {}
+                Key::ArrowDown if !c && !a && self.path_edit_nudge(0.0, step) => {}
+                Key::ArrowLeft if !c && !a => self.nudge(-step, 0.0),
+                Key::ArrowRight if !c && !a => self.nudge(step, 0.0),
+                Key::ArrowUp if !c && !a => self.nudge(0.0, -step),
+                Key::ArrowDown if !c && !a => self.nudge(0.0, step),
+                // Zoom: Shift+0 / Ctrl+0 100%, Shift+1 semua, Shift+2 seleksi, + dan -
+                Key::Num0 if s || c => self.zoom_100(),
+                Key::Num1 | Key::Exclamationmark if s => self.fit_all(),
+                Key::Num2 if s => self.zoom_selection(),
+                // Angka: opacity 10% … 90%, 0 = 100%
+                Key::Num0 | Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 | Key::Num7 | Key::Num8 | Key::Num9
+                    if plain =>
+                {
+                    let digit = key.name().parse::<f32>().unwrap_or(0.0);
+                    let value = if digit == 0.0 { 1.0 } else { digit / 10.0 };
+                    self.edit_selected(|n| n.opacity = value);
+                }
+                Key::Plus | Key::Equals if !a => self.zoom_at(center, 1.25),
+                Key::Minus if !a => self.zoom_at(center, 0.8),
+                // Urutan: ] / [ paling depan/belakang, Ctrl+] / Ctrl+[ satu tingkat
+                Key::CloseBracket if c => self.step_order(true),
+                Key::OpenBracket if c => self.step_order(false),
+                Key::CloseBracket if !a => self.reorder(true),
+                Key::OpenBracket if !a => self.reorder(false),
+                _ => {}
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ panels
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        egui::menu::bar(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ui.button("Home").on_hover_text("Recent files").clicked() {
+                self.go_home();
+            }
+            ui.menu_button("File", |ui| {
+                if ui.add(egui::Button::new("New").shortcut_text("Ctrl+N")).clicked() {
+                    ui.close_menu();
+                    self.new_doc();
+                }
+                if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).clicked() {
+                    ui.close_menu();
+                    self.open_dialog();
+                }
+                if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
+                    ui.close_menu();
+                    self.save(false);
+                }
+                if ui.add(egui::Button::new("Save as…").shortcut_text("Ctrl+Shift+S")).clicked() {
+                    ui.close_menu();
+                    self.save(true);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                    ui.close_menu();
+                    self.do_undo();
+                }
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
+                    ui.close_menu();
+                    self.do_redo();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {
+                    ui.close_menu();
+                    let nodes = self.selected_nodes();
+                    self.add_nodes(nodes, 24.0);
+                }
+                if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
+                    ui.close_menu();
+                    self.delete_selection();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Group").shortcut_text("Ctrl+G")).clicked() {
+                    ui.close_menu();
+                    self.group_selection();
+                }
+                if ui.add(egui::Button::new("Ungroup").shortcut_text("Ctrl+Shift+G")).clicked() {
+                    ui.close_menu();
+                    self.ungroup_selection();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Bring to front").shortcut_text("]")).clicked() {
+                    ui.close_menu();
+                    self.reorder(true);
+                }
+                if ui.add(egui::Button::new("Send to back").shortcut_text("[")).clicked() {
+                    ui.close_menu();
+                    self.reorder(false);
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui.add(egui::Button::new("Zoom 100%").shortcut_text("Shift+0")).clicked() {
+                    ui.close_menu();
+                    self.zoom_100();
+                }
+                if ui.add(egui::Button::new("Zoom to selection").shortcut_text("Shift+2")).clicked() {
+                    ui.close_menu();
+                    self.zoom_selection();
+                }
+                if ui.add(egui::Button::new("Show/hide UI").shortcut_text("Ctrl+\\")).clicked() {
+                    ui.close_menu();
+                    self.show_ui = !self.show_ui;
+                }
+                if ui.add(egui::Button::new("Zoom to fit").shortcut_text("Shift+1")).clicked() {
+                    ui.close_menu();
+                    self.fit_all();
+                }
+                ui.separator();
+                if ui.button("Stress test: add 500 frames").clicked() {
+                    ui.close_menu();
+                    self.stress_test();
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("{:.0}%", self.view.zoom * 100.0));
+            });
+        });
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(&self.status);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(format!(
+                    "{} frames · {} layers · {} drawn · {:.1} ms/frame · {} fonts loaded",
+                    self.doc.frame_count(),
+                    self.doc.count(),
+                    self.drawn,
+                    self.frame_ms,
+                    self.fonts.loaded_count()
+                ));
+            });
+        });
+    }
+
+    fn layers(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        ui.label(theme::title("Layers").size(15.0));
+        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(2.0);
+        // Daftar datar (frame + anak yang dibuka), digambar virtual: hanya baris yang terlihat.
+        // Anggota group yang berurutan (seinduk) tampil di bawah satu baris group yang bisa dibuka/tutup.
+        #[derive(Clone, Copy)]
+        enum Row {
+            /// (indeks level atas, indeks anak, kedalaman indentasi)
+            Node(usize, Option<usize>, u8),
+            /// (id group, kedalaman indentasi)
+            Group(u64, u8),
+        }
+        // Menyisipkan baris group di awal tiap rangkaian; hasilnya: apakah anggotanya ditampilkan.
+        fn header(rows: &mut Vec<Row>, last: &mut u64, g: u64, depth: u8, expanded: &HashSet<u64>) -> bool {
+            if g != *last {
+                *last = g;
+                if g != 0 {
+                    rows.push(Row::Group(g, depth));
+                }
+            }
+            g == 0 || expanded.contains(&g)
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(self.doc.nodes.len());
+        let mut last = 0u64;
+        for (ti, n) in self.doc.nodes.iter().enumerate().rev() {
+            if !header(&mut rows, &mut last, n.group, 0, &self.expanded) {
+                continue;
+            }
+            let depth = (n.group != 0) as u8;
+            rows.push(Row::Node(ti, None, depth));
+            if n.kind == Kind::Frame && self.expanded.contains(&n.id) {
+                let mut last = 0u64;
+                for ci in (0..n.children.len()).rev() {
+                    let g = n.children[ci].group;
+                    if header(&mut rows, &mut last, g, depth + 1, &self.expanded) {
+                        rows.push(Row::Node(ti, Some(ci), depth + 1 + (g != 0) as u8));
+                    }
+                }
+            }
+        }
+        let row_h = 30.0;
+        let mut click: Option<(u64, bool, bool)> = None; // (id, shift, double)
+        let mut click_group: Option<(u64, bool)> = None; // (id group, shift)
+        let mut toggle: Option<u64> = None;
+        let mut menu: Option<u8> = None;
+        let targets = self.clip_targets();
+        let can_clip = !targets.is_empty();
+        let clipped = can_clip && targets.iter().all(|id| self.doc.find(*id).is_some_and(|n| n.clip));
+        let grouped = !self.selected_groups().is_empty();
+        // Menu klik kanan baris layer; hasilnya dijalankan setelah daftar selesai digambar.
+        let layer_menu = |ui: &mut egui::Ui, menu: &mut Option<u8>| {
+            let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, key: &str, action: u8| {
+                let button = egui::Button::new(label).shortcut_text(key);
+                if ui.add_enabled(enabled, button).clicked() {
+                    *menu = Some(action);
+                    ui.close_menu();
+                }
+            };
+            ui.set_min_width(230.0);
+            let label = if clipped { "Release clipping mask" } else { "Create clipping mask" };
+            item(ui, can_clip, label, "Ctrl+Alt+G", 0);
+            ui.separator();
+            item(ui, true, "Group", "Ctrl+G", 1);
+            item(ui, grouped, "Ungroup", "Ctrl+Shift+G", 2);
+            ui.separator();
+            item(ui, true, "Bring to front", "]", 3);
+            item(ui, true, "Send to back", "[", 4);
+            ui.separator();
+            item(ui, true, "Delete", "Del", 5);
+        };
+        let mut rename = self.group_rename.take();
+        let mut renamed: Option<(u64, String)> = None;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
+            for i in range {
+                let (ti, ci, depth) = match rows[i] {
+                    Row::Node(ti, ci, depth) => (ti, ci, depth),
+                    Row::Group(g, depth) => {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                        let members = self.doc.group_members(&[g]);
+                        let selected = !members.is_empty() && members.iter().all(|id| self.sel.contains(id));
+                        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                        if selected {
+                            painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), CornerRadius::same(8), ACCENT.gamma_multiply(0.35));
+                        } else if resp.hovered() {
+                            painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), CornerRadius::same(8), ui.visuals().widgets.hovered.weak_bg_fill);
+                        }
+                        let x = rect.left() + 10.0 + 26.0 * depth as f32;
+                        let weak = ui.visuals().weak_text_color();
+                        let open = self.expanded.contains(&g);
+                        painter.text(pos2(x + 5.0, rect.center().y), Align2::CENTER_CENTER, if open { "⏷" } else { "⏵" }, FontId::proportional(12.5), weak);
+                        // Ikon group: kotak bergaris putus-putus.
+                        let icon = Rect::from_center_size(pos2(x + 23.0, rect.center().y), vec2(11.0, 11.0));
+                        let c = [icon.left_top(), icon.right_top(), icon.right_bottom(), icon.left_bottom(), icon.left_top()];
+                        painter.extend(egui::Shape::dashed_line(&c, Stroke::new(1.2_f32, weak), 2.5, 2.0));
+                        if rename.as_ref().is_some_and(|r| r.0 == g) {
+                            // Sedang mengganti nama: kotak teks di tempat nama. Enter / klik di luar = simpan, Esc = batal.
+                            let (_, text, focused) = rename.as_mut().unwrap();
+                            let area = Rect::from_min_max(pos2(x + 34.0, rect.top() + 3.0), pos2(rect.right() - 4.0, rect.bottom() - 3.0));
+                            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
+                            let edit = child.add(egui::TextEdit::singleline(text).font(FontId::proportional(14.0)).desired_width(area.width()));
+                            if !*focused {
+                                *focused = true;
+                                edit.request_focus();
+                            }
+                            if edit.lost_focus() {
+                                if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    renamed = Some((g, text.trim().to_owned()));
+                                }
+                                rename = None;
+                            }
+                            continue;
+                        }
+                        painter.text(pos2(x + 40.0, rect.center().y), Align2::LEFT_CENTER, self.doc.group_name(g), FontId::proportional(14.0), ui.visuals().text_color());
+                        // Klik kanan pada group yang belum terpilih: pilih dulu, lalu menu berlaku untuknya.
+                        if resp.secondary_clicked() && !selected {
+                            click_group = Some((g, false));
+                        }
+                        resp.context_menu(|ui| layer_menu(ui, &mut menu));
+                        if resp.clicked() {
+                            let px = resp.interact_pointer_pos().map_or(f32::MAX, |p| p.x);
+                            if px < x + 14.0 {
+                                toggle = Some(g);
+                            } else if resp.double_clicked() {
+                                rename = Some((g, self.doc.group_name(g).to_owned(), false));
+                            } else {
+                                click_group = Some((g, ui.input(|i| i.modifiers.shift)));
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let top = &self.doc.nodes[ti];
+                let n: &Node = match ci {
+                    Some(ci) => &top.children[ci],
+                    None => top,
+                };
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                let selected = self.sel.contains(&n.id);
+                let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                if selected {
+                    painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), CornerRadius::same(8), ACCENT.gamma_multiply(0.35));
+                } else if resp.hovered() {
+                    painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), CornerRadius::same(8), ui.visuals().widgets.hovered.weak_bg_fill);
+                }
+                let indent = 10.0 + 26.0 * depth as f32;
+                let mut x = rect.left() + indent;
+                let is_frame = n.kind == Kind::Frame && ci.is_none();
+                if n.clip {
+                    // Panah siku: layer ini di-clip ke layer di bawahnya.
+                    let (c, s) = (pos2(x + 4.0, rect.center().y), Stroke::new(1.3_f32, ACCENT));
+                    painter.line_segment([c + vec2(-3.0, -5.0), c + vec2(-3.0, 3.0)], s);
+                    painter.line_segment([c + vec2(-3.0, 3.0), c + vec2(4.0, 3.0)], s);
+                    painter.line_segment([c + vec2(1.5, 0.5), c + vec2(4.0, 3.0)], s);
+                    painter.line_segment([c + vec2(1.5, 5.5), c + vec2(4.0, 3.0)], s);
+                    x += 15.0;
+                }
+                if is_frame {
+                    let open = self.expanded.contains(&n.id);
+                    painter.text(
+                        pos2(x + 5.0, rect.center().y),
+                        Align2::CENTER_CENTER,
+                        if open { "⏷" } else { "⏵" },
+                        FontId::proportional(12.5),
+                        ui.visuals().weak_text_color(),
+                    );
+                    x += 18.0;
+                }
+                let tag = match n.kind {
+                    Kind::Frame => "#",
+                    Kind::Rect => "▭",
+                    Kind::Ellipse => "○",
+                    Kind::Line => "/",
+                    Kind::Text => "T",
+                    Kind::Path => "✎",
+                    Kind::Image => "▣",
+                };
+                painter.text(pos2(x + 5.0, rect.center().y), Align2::CENTER_CENTER, tag, FontId::proportional(13.0), ui.visuals().weak_text_color());
+                let color = if n.visible { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
+                let weight = if is_frame { FontId::new(14.0, theme::strong()) } else { FontId::proportional(14.0) };
+                painter.text(pos2(x + 22.0, rect.center().y), Align2::LEFT_CENTER, &n.name, weight, color);
+                // Klik kanan pada layer yang belum terpilih: pilih dulu, lalu menu berlaku untuknya.
+                if resp.secondary_clicked() && !selected {
+                    click = Some((n.id, false, false));
+                }
+                resp.context_menu(|ui| layer_menu(ui, &mut menu));
+                if resp.clicked() || resp.double_clicked() {
+                    let px = resp.interact_pointer_pos().map_or(f32::MAX, |p| p.x);
+                    if is_frame && px < rect.left() + indent + 18.0 {
+                        toggle = Some(n.id);
+                    } else {
+                        click = Some((n.id, ui.input(|i| i.modifiers.shift), resp.double_clicked()));
+                    }
+                }
+            }
+        });
+        if let Some(id) = toggle {
+            if !self.expanded.remove(&id) {
+                self.expanded.insert(id);
+            }
+        }
+        self.group_rename = rename;
+        if let Some((g, name)) = renamed {
+            if !name.is_empty() {
+                let now = ui.input(|i| i.time);
+                self.set_group_name(g, name, now);
+            }
+        }
+        if let Some((g, shift)) = click_group {
+            let members = self.doc.group_members(&[g]);
+            if shift {
+                for id in members {
+                    if !self.sel.contains(&id) {
+                        self.sel.push(id);
+                    }
+                }
+            } else {
+                self.sel = members;
+            }
+        }
+        if let Some((id, shift, double)) = click {
+            if shift {
+                if !self.sel.contains(&id) {
+                    self.sel.push(id);
+                }
+            } else {
+                self.sel = vec![id];
+            }
+            if double {
+                if let Some(b) = self.doc.find(id).map(|n| n.bounds()) {
+                    self.zoom_to(b, 4.0);
+                }
+            }
+        }
+        match menu {
+            Some(0) => self.toggle_clip(),
+            Some(1) => self.group_selection(),
+            Some(2) => self.ungroup_selection(),
+            Some(3) => self.reorder(true),
+            Some(4) => self.reorder(false),
+            Some(5) => self.delete_selection(),
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------ canvas
+
+    // ------------------------------------------------------------ pointer
+
+    // ------------------------------------------------------------ bench
+
+    fn run_bench(&mut self, ctx: &egui::Context) {
+        let Some(mut b) = self.bench.take() else { return };
+        b.frame += 1;
+        ctx.request_repaint();
+        let center = self.canvas_rect.center();
+        match b.frame {
+            1 => self.stress_test(),
+            2..=9 => {}
+            10..=99 => {
+                b.samples.push(self.frame_ms);
+                self.zoom_at(center, 1.05);
+            }
+            100..=189 => {
+                b.samples.push(self.frame_ms);
+                self.view.pan += vec2(-14.0, -9.0);
+                self.zoom_at(center, 1.0 / 1.05);
+            }
+            190 => {
+                self.fit_all();
+                // Pilih satu teks supaya panel font (dengan preview) ikut terlihat di tangkapan layar.
+                self.bench_demo();
+                let target = self.doc.nodes.get(30).map(|n| n.bounds());
+                let _ = target;
+            }
+            _ => {
+                let ready = !self.fonts.any_loading() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
+                if !b.shot && (ready || b.frame > 1500) {
+                    b.shot = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                }
+                if b.phase == 1 {
+                    if b.frame == b.mark + 84 {
+                        // Selesai mengedit, lalu tarik pegangan kanan-tengah kotak teks ke kiri.
+                        self.finish_text_edit();
+                        if let Some(n) = self.sel.first().and_then(|id| self.doc.find(*id)) {
+                            let o = self.canvas_rect.min;
+                            let from = self.view.to_screen(o, n.x + n.w, n.y + n.h * 0.5);
+                            let to = from - vec2(n.w * 0.45 * self.view.zoom, 0.0);
+                            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                            let f = b.frame;
+                            b.inject.extend([(f + 2, egui::Event::PointerMoved(from)), (f + 4, button(from, true))]);
+                            for s in 1..=4u32 {
+                                b.inject.push((f + 4 + s, egui::Event::PointerMoved(from + (to - from) * (s as f32 / 4.0))));
+                            }
+                            b.inject.push((f + 10, button(to, false)));
+                        }
+                    }
+                    if b.frame == b.mark + 115 {
+                        b.phase = 2;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                    }
+                }
+                let image = ctx.input(|i| {
+                    i.events.iter().find_map(|e| match e {
+                        egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                        _ => None,
+                    })
+                });
+                if let Some(img) = image {
+                    let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                    if b.phase == 2 {
+                        let _ = export::save_rgba(&b.out.with_file_name("bench-edit.png"), img.size[0] as u32, img.size[1] as u32, &rgba);
+                        self.dirty = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    let shot = export::save_rgba(&b.out, img.size[0] as u32, img.size[1] as u32, &rgba);
+                    // Export frame demo juga, supaya jalur export bisa diperiksa dari gambar hasilnya.
+                    if let Some(demo) = self.doc.nodes.iter().find(|n| n.name == "Feature demo").map(|n| n.id) {
+                        if let Some((svg, w, h)) = export::to_svg(&self.doc, Some(demo), &mut self.fonts, ctx) {
+                            let _ = export::save_raster(&svg, w, h, 1.0, false, &b.out.with_file_name("bench-export.png"));
+                        }
+                    }
+                    let mut s = b.samples.clone();
+                    s.sort_by(|a, b| a.total_cmp(b));
+                    let avg = s.iter().sum::<f32>() / s.len().max(1) as f32;
+                    let p95 = s.get(s.len() * 95 / 100).copied().unwrap_or(0.0);
+                    let report = format!(
+                        "frames={} objects={} doc_frames={} avg_ms={:.2} p95_ms={:.2} max_ms={:.2} fonts_loaded={} screenshot={:?}\n",
+                        s.len(),
+                        self.doc.count(),
+                        self.doc.frame_count(),
+                        avg,
+                        p95,
+                        s.last().copied().unwrap_or(0.0),
+                        self.fonts.loaded_count(),
+                        shot
+                    );
+                    let _ = std::fs::write(b.out.with_extension("txt"), report);
+                    // Fase kedua: buka editor teks pada judul, seleksi dua huruf, lalu tangkap layar lagi.
+                    let headline = self.doc.nodes.iter().flat_map(|n| n.children.iter()).find(|c| c.name == "Headline").map(|c| c.id);
+                    if let Some(id) = headline {
+                        b.phase = 1;
+                        b.mark = b.frame;
+                        if let Some(n) = self.doc.find(id) {
+                            let o = self.canvas_rect.min;
+                            let row = n.y + n.h * 0.25;
+                            let p1 = self.view.to_screen(o, n.x + n.w * 0.3, row);
+                            let p2 = self.view.to_screen(o, n.x + n.w * 0.52, row);
+                            let p3 = self.view.to_screen(o, n.x + 2.0, row);
+                            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                            let f = b.frame;
+                            let mv = egui::Event::PointerMoved;
+                            b.inject.extend([(f + 8, mv(p1)), (f + 10, button(p1, true)), (f + 11, button(p1, false)), (f + 13, button(p1, true)), (f + 14, button(p1, false))]);
+                            b.inject.extend([(f + 40, mv(p2)), (f + 42, button(p2, true)), (f + 44, button(p2, false)), (f + 60, egui::Event::Text("X".into()))]);
+                            b.inject.extend([(f + 62, mv(p3)), (f + 63, button(p3, true))]);
+                            for s in 1..=6u32 {
+                                b.inject.push((f + 63 + s, mv(p3 + (p2 - p3) * (s as f32 / 6.0))));
+                            }
+                            b.inject.extend([(f + 71, button(p2, false)), (f + 80, egui::Event::Text("Y".into()))]);
+                        }
+                        self.bench = Some(b);
+                        return;
+                    }
+                    self.dirty = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+            }
+        }
+        self.bench = Some(b);
+    }
+}
+
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(theme::title(title));
+}
+
+fn sub(ui: &mut egui::Ui, title: &str) {
+    ui.label(egui::RichText::new(title).size(11.5).weak());
+}
+
+/// Kolom angka dengan label di dalamnya (mis. "X  120").
+fn field(ui: &mut egui::Ui, width: f32, label: &str, v: &mut f32) {
+    ui.add_sized(
+        [width, 28.0],
+        egui::DragValue::new(v).speed(1.0).max_decimals(2).prefix(format!("{label}  ")),
+    );
+}
+
+fn icon_button(ui: &mut egui::Ui, selected: bool, tip: &str, draw: impl FnOnce(&egui::Painter, Pos2, Color32)) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 28.0), Sense::click());
+    let bg = if selected {
+        Color32::from_gray(88)
+    } else if resp.hovered() && ui.is_enabled() {
+        Color32::from_gray(64)
+    } else {
+        Color32::from_gray(48)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
+    let color = if ui.is_enabled() { Color32::from_gray(232) } else { Color32::from_gray(105) };
+    draw(ui.painter(), rect.center(), color);
+    resp.on_hover_text(tip).clicked()
+}
+
+/// Enam tombol rata; hasilnya mode untuk `App::align`.
+fn align_buttons(ui: &mut egui::Ui) -> Option<u8> {
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (i, (mode, tip)) in [
+            (0u8, "Align left  (Alt+A)"),
+            (2, "Align horizontal centers  (Alt+H)"),
+            (1, "Align right  (Alt+D)"),
+            (3, "Align top  (Alt+W)"),
+            (5, "Align vertical centers  (Alt+V)"),
+            (4, "Align bottom  (Alt+S)"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if i == 3 {
+                ui.add_space(8.0);
+            }
+            if icon_button(ui, false, tip, |p, c, color| align_icon(p, c, mode, color)) {
+                picked = Some(mode);
+            }
+        }
+    });
+    picked
+}
+
+fn align_icon(p: &egui::Painter, c: Pos2, mode: u8, color: Color32) {
+    let (variant, vertical) = match mode {
+        0 => (0, false),
+        1 => (1, false),
+        2 => (2, false),
+        3 => (0, true),
+        4 => (1, true),
+        _ => (2, true),
+    };
+    let at = |a: f32, b: f32| if vertical { pos2(c.x + b, c.y + a) } else { pos2(c.x + a, c.y + b) };
+    let (guide, bars): (f32, [(f32, f32); 2]) = match variant {
+        0 => (-7.0, [(-5.0, 6.0), (-5.0, 1.0)]),
+        1 => (7.0, [(-6.0, 5.0), (-1.0, 5.0)]),
+        _ => (0.0, [(-6.5, 6.5), (-3.5, 3.5)]),
+    };
+    p.line_segment([at(guide, -7.5), at(guide, 7.5)], Stroke::new(1.2_f32, color));
+    for (i, (a0, a1)) in bars.iter().enumerate() {
+        let b0 = if i == 0 { -5.0 } else { 1.5 };
+        p.rect_filled(Rect::from_two_pos(at(*a0, b0), at(*a1, b0 + 3.5)), CornerRadius::same(1), color);
+    }
+}
+
+fn text_align_icon(p: &egui::Painter, c: Pos2, mode: u8, color: Color32) {
+    for (i, w) in [14.0_f32, 9.0, 14.0, 7.0].into_iter().enumerate() {
+        let y = c.y - 6.0 + i as f32 * 4.0;
+        let x0 = match mode {
+            1 => c.x - w * 0.5,
+            2 => c.x + 7.0 - w,
+            _ => c.x - 7.0,
+        };
+        p.line_segment([pos2(x0, y), pos2(x0 + w, y)], Stroke::new(1.4_f32, color));
+    }
+}
+
+
+/// Titik pegangan dalam koordinat dunia, mengikuti rotasi node.
+fn handles(n: &Node, scale: bool) -> Vec<(u8, f32, f32)> {
+    let mut list = handles_local(n, scale);
+    if n.rotation != 0.0 {
+        let (cx, cy) = n.center();
+        for h in &mut list {
+            (h.1, h.2) = crate::doc::rotate(h.1, h.2, cx, cy, n.rotation);
+        }
+    }
+    list
+}
