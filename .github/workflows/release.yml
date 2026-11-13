@@ -1,0 +1,139 @@
+# Builds Kanvas for Windows, macOS and Linux.
+#
+# - Pushing a tag like `v0.1.1` builds all three and publishes a GitHub release with the files.
+# - "Run workflow" (manual) only builds; the files are kept as workflow artifacts for testing.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            asset: Kanvas.exe
+          # Apple Silicon only: ONNX Runtime (remove background) has no prebuilt Intel macOS library.
+          - name: macOS
+            os: macos-14
+            asset: Kanvas-macos-arm64.zip
+          - name: Linux
+            os: ubuntu-24.04
+            asset: Kanvas-linux-x86_64.tar.gz
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install Linux build packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build
+        run: cargo build --release --locked --bin kanvas
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist
+          cp target/release/kanvas.exe dist/Kanvas.exe
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          version=$(cargo pkgid | sed 's/.*[#@]//')
+          app=dist/Kanvas.app
+          mkdir -p "$app/Contents/MacOS"
+          cp target/release/kanvas "$app/Contents/MacOS/kanvas"
+          cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $version" \
+            -c "Set :CFBundleVersion $version" \
+            "$app/Contents/Info.plist"
+          # Ad-hoc signature: Apple Silicon refuses to run a binary with no signature at all.
+          codesign --force --deep --sign - "$app"
+          codesign --verify --verbose "$app"
+          ditto -c -k --keepParent "$app" "dist/${{ matrix.asset }}"
+          rm -rf "$app"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir dist
+          tar -C target/release -czf "dist/${{ matrix.asset }}" kanvas
+
+      # Opens the real app, lets its scripted demo run, and saves a screenshot. It needs a display
+      # and the network (fonts), so a failure here is reported but does not block the release.
+      - name: Smoke test
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get install -y xvfb libgl1-mesa-dri libegl1 libgl1 libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2
+            xvfb-run -a -s "-screen 0 1600x1000x24" target/release/kanvas --bench "smoke-${{ matrix.name }}.png"
+          else
+            target/release/kanvas --bench "smoke-${{ matrix.name }}.png"
+          fi
+          ls -l "smoke-${{ matrix.name }}.png"
+
+      - name: Upload smoke test screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.name }}
+          path: smoke-*.png
+          if-no-files-found: ignore
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.name }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release, or add the files to an existing one
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            # Passing the files here publishes the release only after they are all uploaded.
+            gh release create "$TAG" dist/* --title "Kanvas ${TAG#v}" --generate-notes --verify-tag
+          fi
