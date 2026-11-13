@@ -1038,8 +1038,8 @@ impl App {
         let pre = self.doc.clone();
         let mut out = json!({ "ok": true });
         match action {
-            "front" | "back" => ids.iter().for_each(|id| self.doc.reorder(*id, action == "front")),
-            "forward" | "backward" => ids.iter().for_each(|id| self.doc.reorder_step(*id, action == "forward")),
+            "front" | "back" => self.doc.reorder(&ids, action == "front"),
+            "forward" | "backward" => self.doc.reorder_step(&ids, action == "forward"),
             "group" => {
                 if ids.len() < 2 {
                     return Err("grouping needs at least two nodes".into());
