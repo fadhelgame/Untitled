@@ -81,7 +81,7 @@ pub fn weight_name(w: u16) -> &'static str {
     }
 }
 
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(p).join("Kanvas");
     }

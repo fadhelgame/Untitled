@@ -17,7 +17,7 @@ mod panel;
 mod pen;
 mod picker;
 mod presets;
-mod rembg;
+pub mod rembg;
 mod remote;
 pub(crate) mod render;
 mod theme;

@@ -15,6 +15,17 @@ fn main() -> eframe::Result {
         .position(|a| a == "--bench")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from);
+    // `--rembg <masukan> <keluaran.png>`: remove background tanpa membuka jendela.
+    if let Some(i) = args.iter().position(|a| a == "--rembg") {
+        let result = match (args.get(i + 1), args.get(i + 2)) {
+            (Some(input), Some(output)) => app::rembg::cli(input.as_ref(), output.as_ref()),
+            _ => Err("usage: kanvas --rembg <input> <output.png>".into()),
+        };
+        if let Err(e) = &result {
+            eprintln!("{e}");
+        }
+        std::process::exit(result.is_err() as i32);
+    }
     let open = args
         .iter()
         .skip(1)

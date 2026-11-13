@@ -115,7 +115,7 @@ Every screenshot here is the real app.
       <h3>Select smarter</h3>
       The <b>Magic wand</b> selects every object that shares a property with the one you click, with a tolerance for near-matching colors. Objects snap to edges and centers of their neighbors with guide lines as you move them.
       <h3>Images</h3>
-      Drop or paste PNG, JPEG, WebP, GIF, BMP and SVG. Round the corners, tint an icon with a color overlay, or use a clipping mask. <i>Remove background</i> is available if you have the Codex CLI installed and signed in.
+      Drop or paste PNG, JPEG, WebP, GIF, BMP and SVG. Round the corners, tint an icon with a color overlay, or use a clipping mask. <i>Remove background</i> runs on your computer in a couple of seconds; the first use downloads a 170 MB model.
       <h3>Export exactly what you see</h3>
       Export a frame, a selection or the whole document to <b>PNG, JPG or SVG</b>, from 0.1x up to 16x. Text is exported as outlines, so the file looks the same on every computer.
     </td>

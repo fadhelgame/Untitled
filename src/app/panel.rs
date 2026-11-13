@@ -182,12 +182,12 @@ impl App {
                 if self.rembg_running(id) {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.weak("Removing background with Codex…");
+                        ui.weak("Removing background…");
                     });
                 } else {
                     let btn = ui
                         .add_enabled(self.rembg.is_none(), egui::Button::new("Remove background").min_size(vec2(ui.available_width(), 28.0)))
-                        .on_hover_text("Sends the image to Codex (needs the Codex CLI, signed in)");
+                        .on_hover_text("Runs on this computer. The first use downloads a 170 MB model.");
                     if btn.clicked() {
                         remove_bg = true;
                     }
