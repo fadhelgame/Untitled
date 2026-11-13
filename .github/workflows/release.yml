@@ -47,7 +47,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
       - name: Build
-        run: cargo build --release --locked --bin kanvas
+        run: cargo build --release --locked --bin kanvas --bin kanvas-mcp
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
 
@@ -56,6 +56,8 @@ jobs:
         run: |
           mkdir dist
           cp target/release/kanvas.exe dist/Kanvas.exe
+          # The MCP server is a separate download; next to Kanvas.exe it can start the app by itself.
+          cp target/release/kanvas-mcp.exe dist/kanvas-mcp.exe
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
@@ -66,12 +68,15 @@ jobs:
           app=dist/Kanvas.app
           mkdir -p "$app/Contents/MacOS"
           cp target/release/kanvas "$app/Contents/MacOS/kanvas"
+          # The MCP server lives next to the app binary, so it can start the app by itself.
+          cp target/release/kanvas-mcp "$app/Contents/MacOS/kanvas-mcp"
           cp packaging/macos/Info.plist "$app/Contents/Info.plist"
           /usr/libexec/PlistBuddy \
             -c "Set :CFBundleShortVersionString $version" \
             -c "Set :CFBundleVersion $version" \
             "$app/Contents/Info.plist"
           # Ad-hoc signature: Apple Silicon refuses to run a binary with no signature at all.
+          codesign --force --sign - "$app/Contents/MacOS/kanvas-mcp"
           codesign --force --deep --sign - "$app"
           codesign --verify --verbose "$app"
           ditto -c -k --keepParent "$app" "dist/${{ matrix.asset }}"
@@ -81,7 +86,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir dist
-          tar -C target/release -czf "dist/${{ matrix.asset }}" kanvas
+          tar -C target/release -czf "dist/${{ matrix.asset }}" kanvas kanvas-mcp
 
       # Opens the real app, lets its scripted demo run, and saves a screenshot. It needs a display
       # and the network (fonts), so a failure here is reported but does not block the release.
@@ -109,7 +114,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.name }}
-          path: dist/${{ matrix.asset }}
+          path: dist/*
           if-no-files-found: error
 
   release:

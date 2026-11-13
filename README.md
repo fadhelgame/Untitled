@@ -1,20 +1,23 @@
 <h1 align="center">Kanvas</h1>
 
 <p align="center">
-  <b>A lightweight, native design editor for Windows, written in Rust.</b><br>
+  <b>A lightweight, native design editor for Windows, macOS and Linux, written in Rust.</b><br>
   Infinite canvas, unlimited frames, the whole Google Fonts catalog, vector tools and clean exports,<br>
-  in a single 35 MB file with nothing to install.
+  in a single small download with nothing to install.
 </p>
 
 <p align="center">
   <img alt="100% Rust" src="https://img.shields.io/badge/100%25-Rust-b7410e?style=flat-square&logo=rust">
   <img alt="Windows 64-bit" src="https://img.shields.io/badge/Windows-64--bit-2f7bf5?style=flat-square">
-  <img alt="Single 35 MB exe" src="https://img.shields.io/badge/single%20exe-35%20MB-2e8b6f?style=flat-square">
+  <img alt="macOS Apple Silicon" src="https://img.shields.io/badge/macOS-Apple%20Silicon-8e8e93?style=flat-square">
+  <img alt="Linux x86-64" src="https://img.shields.io/badge/Linux-x86--64-e95420?style=flat-square">
   <img alt="No install" src="https://img.shields.io/badge/install-not%20needed-3a3a3a?style=flat-square">
 </p>
 
 <p align="center">
-  <a href="https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas.exe"><img alt="Download Kanvas for Windows" src="https://img.shields.io/badge/Download%20Kanvas.exe-0d99ff?style=for-the-badge&logo=windows&logoColor=white" height="40"></a>
+  <a href="https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas.exe"><img alt="Download Kanvas for Windows" src="https://img.shields.io/badge/Windows-0d99ff?style=for-the-badge&logo=windows&logoColor=white" height="40"></a>
+  <a href="https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas-macos-arm64.zip"><img alt="Download Kanvas for macOS" src="https://img.shields.io/badge/macOS-0d99ff?style=for-the-badge&logo=apple&logoColor=white" height="40"></a>
+  <a href="https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas-linux-x86_64.tar.gz"><img alt="Download Kanvas for Linux" src="https://img.shields.io/badge/Linux-0d99ff?style=for-the-badge&logo=linux&logoColor=white" height="40"></a>
 </p>
 
 <br>
@@ -45,7 +48,7 @@
     </td>
     <td width="25%" valign="top">
       <h3>📦 Nothing to install</h3>
-      One 35 MB <code>.exe</code>. Download it, double-click it, start designing. No account and no sign-in.
+      One file per platform. Download it, open it, start designing. No installer, no account and no sign-in.
     </td>
     <td width="25%" valign="top">
       <h3>🔤 Every Google Font</h3>
@@ -62,13 +65,38 @@
 
 ## Download
 
-**[⬇ Download Kanvas.exe](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas.exe)** · Windows 64-bit · about 35 MB
+| | Download | Runs on |
+|---|---|---|
+| **Windows** | [Kanvas.exe](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas.exe) | Windows 64-bit |
+| **macOS** | [Kanvas-macos-arm64.zip](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas-macos-arm64.zip) | Apple Silicon (M1 or newer) |
+| **Linux** | [Kanvas-linux-x86_64.tar.gz](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas-linux-x86_64.tar.gz) | x86-64, X11 or Wayland |
 
-1. Download the file.
-2. Double-click `Kanvas.exe`. There is no installer.
+The macOS and Linux builds are new and **experimental**. If something misbehaves, please [open an issue](https://github.com/fadhelgame/Untitled/issues).
+
+**Windows.** Double-click `Kanvas.exe`. There is no installer.
 
 > [!NOTE]
 > The first time you open it, Windows may show **"Windows protected your PC"**, because the app is not code-signed yet. Click **More info → Run anyway**.
+
+**macOS.** Unzip the download and move `Kanvas.app` to Applications.
+
+> [!NOTE]
+> The app is not signed with an Apple developer certificate, so macOS blocks it the first time. Open it once, dismiss the warning, then go to **System Settings → Privacy & Security** and click **Open Anyway**. Or clear the download flag in Terminal:
+>
+> ```sh
+> xattr -cr /Applications/Kanvas.app
+> ```
+>
+> Intel Macs are not supported yet.
+
+**Linux.** Unpack the archive and run the `kanvas` file inside:
+
+```sh
+tar -xzf Kanvas-linux-x86_64.tar.gz
+./kanvas
+```
+
+It is built on Ubuntu 24.04, so an older distribution may be missing the system libraries it needs. The open and save dialogs use the XDG desktop portal.
 
 Google Fonts need an internet connection the first time a font is used. Everything else works offline.
 
@@ -179,7 +207,7 @@ Every screenshot here is the real app.
 | | | `Shift+X` | Swap fill and stroke |
 | | | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 
-While resizing, hold `Shift` to keep the ratio and `Alt` to resize from the center. Drag just outside a corner to rotate.
+On macOS, use `Cmd` wherever this table says `Ctrl`. While resizing, hold `Shift` to keep the ratio and `Alt` to resize from the center. Drag just outside a corner to rotate.
 
 ## Built for AI assistants
 
@@ -187,7 +215,13 @@ Kanvas ships with `kanvas-mcp`, a small [Model Context Protocol](https://modelco
 
 The assistant gets 11 tools: `get_document`, `create_nodes`, `update_nodes`, `delete_nodes`, `arrange`, `select_nodes`, `screenshot`, `export`, `file`, `history` and `list_fonts`. Every change appears on your canvas immediately and is one undo step.
 
-`kanvas-mcp` is not part of the download above; build it from source (see below), then register it with your assistant:
+Get `kanvas-mcp` first:
+
+- **Windows.** Download [kanvas-mcp.exe](https://github.com/fadhelgame/Untitled/releases/latest/download/kanvas-mcp.exe) and put it in the same folder as `Kanvas.exe`.
+- **macOS.** It is inside the app: `/Applications/Kanvas.app/Contents/MacOS/kanvas-mcp`.
+- **Linux.** It is in the download archive, next to `kanvas`.
+
+Then register it with your assistant, using the full path to the file:
 
 ```json
 {
@@ -196,6 +230,21 @@ The assistant gets 11 tools: `get_document`, `create_nodes`, `update_nodes`, `de
   }
 }
 ```
+
+On Windows, write each backslash in the path twice, as above, or use forward slashes (`C:/path/to/kanvas-mcp.exe`).
+
+Where that block goes depends on the assistant:
+
+| Assistant | Where to put it |
+|---|---|
+| **Claude Code** | A `.mcp.json` file in your project folder, or run `claude mcp add kanvas -- C:\path\to\kanvas-mcp.exe` |
+| **Claude Desktop** | **Settings → Developer → Edit Config** (`claude_desktop_config.json`), then restart the app |
+| **Antigravity** | Agent panel **⋯ → MCP Servers → Manage MCP Servers → View raw config** (`mcp_config.json`), then click **Refresh** |
+
+Any other assistant that supports local (stdio) MCP servers works the same way.
+
+> [!NOTE]
+> `kanvas-mcp` talks to the running app. If Kanvas is closed, it starts the app for you, as long as the two files sit in the same folder; otherwise open Kanvas yourself first.
 
 ## Build from source
 
@@ -207,7 +256,7 @@ cd Untitled
 cargo build --release
 ```
 
-The app is `target/release/kanvas.exe` and the MCP server is `target/release/kanvas-mcp.exe`.
+The app is `target/release/kanvas` and the MCP server is `target/release/kanvas-mcp` (with `.exe` on Windows). On Linux you also need `pkg-config` and the OpenSSL headers (`libssl-dev` on Debian and Ubuntu).
 
 ## Under the hood
 
