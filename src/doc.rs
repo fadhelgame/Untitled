@@ -284,6 +284,10 @@ pub struct Node {
     pub opacity: f32,
     #[serde(default = "yes")]
     pub visible: bool,
+    /// Terkunci: tidak bisa dipilih atau digeser dari canvas (masih bisa dipilih di panel layer).
+    /// Frame yang terkunci ikut mengunci isinya.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
     /// Id group (0 = tidak digroup). Node dengan id group yang sama dipilih dan diubah bersama.
     #[serde(default)]
     pub group: u64,
@@ -449,6 +453,7 @@ impl Node {
             blend: 0,
             opacity: 1.0,
             visible: true,
+            locked: false,
             group: 0,
             clip: false,
             shadow: None,
@@ -976,13 +981,13 @@ impl Doc {
     /// Node paling depan di titik ini (anak frame didahulukan dari frame-nya).
     pub fn hit(&self, x: f32, y: f32, tol: f32) -> Option<u64> {
         for n in self.nodes.iter().rev() {
-            if !n.visible {
+            if !n.visible || n.locked {
                 continue;
             }
             if n.kind == Kind::Frame {
                 if n.contains(x, y, 0.0) {
                     for c in n.children.iter().rev() {
-                        if c.visible && c.contains(x, y, tol) {
+                        if c.visible && !c.locked && c.contains(x, y, tol) {
                             return Some(c.id);
                         }
                     }

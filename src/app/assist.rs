@@ -124,7 +124,7 @@ impl App {
 
     /// Kursor tepat di luar salah satu sudut objek terpilih: zona untuk memutar.
     pub(super) fn rotate_zone(&self, p: Pos2) -> Option<u64> {
-        if self.sel.len() != 1 || !self.pointer_tool() || self.editing.is_some() || self.ext.path_edit.is_some() {
+        if self.sel.len() != 1 || !self.pointer_tool() || self.editing.is_some() || self.ext.path_edit.is_some() || self.sel_locked() {
             return None;
         }
         let n = self.doc.find(self.sel[0])?;

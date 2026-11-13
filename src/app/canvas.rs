@@ -949,6 +949,9 @@ impl App {
                     } else if !self.sel.contains(&id) {
                         self.sel = members;
                     }
+                    // Layer terkunci yang ikut terpilih (dari panel layer) tidak ikut digeser.
+                    let fixed: Vec<u64> = self.sel.iter().copied().filter(|id| self.locked(*id)).collect();
+                    self.sel.retain(|id| !fixed.contains(id));
                     // Alt (duplikat) dicek selama drag, jadi boleh ditekan sebelum atau sesudah mulai menggeser.
                     self.pre_drag = Some(self.doc.clone());
                     self.drag = Drag::Move { start: wp, applied: Vec2::ZERO, moved: false, dup: None };

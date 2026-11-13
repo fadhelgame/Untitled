@@ -318,6 +318,9 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     if !n.visible {
         put("visible", json!(false));
     }
+    if n.locked {
+        put("locked", json!(true));
+    }
     if n.blend != 0 {
         put("blend", json!(blend::CSS[(n.blend as usize).min(blend::CSS.len() - 1)]));
     }
@@ -744,6 +747,7 @@ impl App {
                 "rotation" => n.rotation = num(k, v)?,
                 "opacity" => n.opacity = num(k, v)?.clamp(0.0, 1.0),
                 "visible" => n.visible = flag(k, v)?,
+                "locked" => n.locked = flag(k, v)?,
                 "blend" => {
                     let name = string(k, v)?.to_lowercase().replace('_', "-");
                     let at = blend::CSS.iter().position(|b| *b == name).or_else(|| blend::NAMES.iter().position(|b| b.to_lowercase() == name));

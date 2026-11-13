@@ -572,8 +572,28 @@ impl App {
         self.push_undo(pre);
     }
 
+    /// Layer ini terkunci, sendiri atau lewat frame induknya.
+    fn locked(&self, id: u64) -> bool {
+        self.doc.find(id).is_some_and(|n| n.locked) || self.doc.parent_of(id).and_then(|p| self.doc.find(p)).is_some_and(|p| p.locked)
+    }
+
+    /// Ada layer terkunci di dalam seleksi (seleksinya dibuat dari panel layer).
+    fn sel_locked(&self) -> bool {
+        self.sel.iter().any(|id| self.locked(*id))
+    }
+
+    /// Ctrl+Shift+L: kunci seleksi; kalau semuanya sudah terkunci, buka kuncinya.
+    fn toggle_lock(&mut self) {
+        if self.sel.is_empty() {
+            return;
+        }
+        let lock = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| !n.locked));
+        self.edit_selected(|n| n.locked = lock);
+        self.status = if lock { "Locked. Unlock from the Layers panel or with Ctrl+Shift+L.".into() } else { "Unlocked.".into() };
+    }
+
     fn hit(&self, p: Pos2, wp: Pos2, tol: f32) -> Option<u64> {
-        let label = || self.labels.iter().rev().find(|(_, r)| r.contains(p)).map(|(id, _)| *id);
+        let label = || self.labels.iter().rev().find(|(id, r)| r.contains(p) && !self.locked(*id)).map(|(id, _)| *id);
         match self.doc.hit(wp.x, wp.y, tol) {
             // Seperti Figma: badan frame yang berisi objek tidak bisa dipegang, hanya labelnya.
             Some(id) if self.body_locked(id) => label(),
@@ -591,7 +611,7 @@ impl App {
     }
 
     fn handle_at(&self, p: Pos2) -> Option<(u64, u8)> {
-        if self.sel.len() != 1 || !self.pointer_tool() {
+        if self.sel.len() != 1 || !self.pointer_tool() || self.sel_locked() {
             return None;
         }
         let n = self.doc.find(self.sel[0])?;
@@ -617,6 +637,9 @@ impl App {
     }
 
     fn multi_handle_at(&self, p: Pos2) -> Option<u8> {
+        if self.sel_locked() {
+            return None;
+        }
         let (x0, y0, x1, y1) = self.sel_box()?;
         let o = self.canvas_rect.min;
         HANDLE_F.iter().enumerate().find_map(|(i, (fx, fy))| {
@@ -719,7 +742,7 @@ impl App {
         let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
         let inter = |n: &Node| {
             let q = n.bounds();
-            n.visible && q.0 <= x1 && q.2 >= x0 && q.1 <= y1 && q.3 >= y0
+            n.visible && !n.locked && q.0 <= x1 && q.2 >= x0 && q.1 <= y1 && q.3 >= y0
         };
         // Marquee sepenuhnya di dalam satu frame: pilih isi frame itu.
         let inside = self.doc.nodes.iter().rev().find(|n| {
@@ -727,6 +750,8 @@ impl App {
             n.kind == Kind::Frame && n.visible && q.0 <= x0 && q.1 <= y0 && q.2 >= x1 && q.3 >= y1
         });
         let picked: Vec<&Node> = match inside {
+            // Frame terkunci: isinya tidak ikut terpilih.
+            Some(f) if f.locked => Vec::new(),
             Some(f) => f.children.iter().filter(|c| inter(c)).collect(),
             None => self.doc.nodes.iter().map(|n| &**n).filter(|n| inter(n)).collect(),
         };
@@ -811,7 +836,7 @@ impl App {
 
     fn nudge(&mut self, dx: f32, dy: f32) {
         let ids = self.roots();
-        if ids.is_empty() {
+        if ids.is_empty() || self.sel_locked() {
             return;
         }
         let pre = self.doc.clone();
@@ -1093,7 +1118,7 @@ impl App {
         if all && self.ext.path_edit.is_some() {
             self.path_edit_select_all();
         } else if all {
-            self.sel = self.doc.nodes.iter().map(|n| n.id).collect();
+            self.sel = self.doc.nodes.iter().filter(|n| !n.locked).map(|n| n.id).collect();
         }
         // Salin / potong / tempel datang sebagai event, bukan tombol.
         let mut clip: Vec<(u8, String)> = Vec::new();
@@ -1171,6 +1196,8 @@ impl App {
                 }),
                 // Ctrl+Shift+H tampil/sembunyi
                 Key::H if c && s => self.edit_selected(|n| n.visible = !n.visible),
+                // Ctrl+Shift+L kunci/buka kunci
+                Key::L if c && s => self.toggle_lock(),
                 // Ctrl+\ tampil/sembunyikan panel
                 Key::Backslash if c => self.show_ui = !self.show_ui,
                 // Enter: edit teks terpilih
@@ -1381,6 +1408,7 @@ impl App {
         let mut click: Option<(u64, bool, bool)> = None; // (id, shift, double)
         let mut click_group: Option<(u64, bool)> = None; // (id group, shift)
         let mut toggle: Option<u64> = None;
+        let mut lock_toggle: Option<u64> = None;
         let mut menu: Option<u8> = None;
         let targets = self.clip_targets();
         let can_clip = !targets.is_empty();
@@ -1518,6 +1546,12 @@ impl App {
                 let color = if n.visible { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
                 let weight = if is_frame { FontId::new(14.0, theme::strong()) } else { FontId::proportional(14.0) };
                 painter.text(pos2(x + 22.0, rect.center().y), Align2::LEFT_CENTER, &n.name, weight, color);
+                // Gembok di ujung kanan baris: selalu tampil kalau terkunci, samar saat baris disorot.
+                let lock_zone = Rect::from_min_max(pos2(rect.right() - 28.0, rect.top()), rect.max);
+                if n.locked || resp.hovered() {
+                    let tint = if n.locked { ui.visuals().text_color() } else { ui.visuals().weak_text_color().gamma_multiply(0.6) };
+                    lock_icon(&painter, lock_zone.center(), n.locked, tint);
+                }
                 // Klik kanan pada layer yang belum terpilih: pilih dulu, lalu menu berlaku untuknya.
                 if resp.secondary_clicked() && !selected {
                     click = Some((n.id, false, false));
@@ -1525,7 +1559,9 @@ impl App {
                 resp.context_menu(|ui| layer_menu(ui, &mut menu));
                 if resp.clicked() || resp.double_clicked() {
                     let px = resp.interact_pointer_pos().map_or(f32::MAX, |p| p.x);
-                    if is_frame && px < rect.left() + indent + 18.0 {
+                    if resp.interact_pointer_pos().is_some_and(|p| lock_zone.contains(p)) {
+                        lock_toggle = Some(n.id);
+                    } else if is_frame && px < rect.left() + indent + 18.0 {
                         toggle = Some(n.id);
                     } else {
                         click = Some((n.id, ui.input(|i| i.modifiers.shift), resp.double_clicked()));
@@ -1533,6 +1569,13 @@ impl App {
                 }
             }
         });
+        if let Some(id) = lock_toggle {
+            let pre = self.doc.clone();
+            if let Some(n) = self.doc.find_mut(id) {
+                n.locked = !n.locked;
+            }
+            self.push_undo(pre);
+        }
         if let Some(id) = toggle {
             if !self.expanded.remove(&id) {
                 self.expanded.insert(id);
@@ -1627,6 +1670,18 @@ impl App {
                     let at = pos2(ctx.screen_rect().right() - 150.0, 500.0);
                     let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
                     b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
+                }
+                // `KANVAS_BENCH_LOCK=1`: kunci isi frame demo dan buka frame-nya di panel layer.
+                if std::env::var("KANVAS_BENCH_LOCK").is_ok() {
+                    let demo: Vec<(u64, Vec<u64>)> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").map(|n| (n.id, n.children.iter().map(|c| c.id).collect())).collect();
+                    for (frame, ids) in demo {
+                        self.expanded.insert(frame);
+                        for id in ids {
+                            if let Some(n) = self.doc.find_mut(id) {
+                                n.locked = true;
+                            }
+                        }
+                    }
                 }
                 if let Ok(q) = std::env::var("KANVAS_BENCH_PHOTOS") {
                     self.photos.open = true;
@@ -1745,6 +1800,24 @@ impl App {
         }
         self.bench = Some(b);
     }
+}
+
+/// Gembok kecil untuk panel layer: tertutup (terkunci) atau terbuka.
+fn lock_icon(p: &egui::Painter, c: Pos2, locked: bool, color: Color32) {
+    let s = Stroke::new(1.4_f32, color);
+    let body = Rect::from_center_size(c + vec2(0.0, 2.5), vec2(10.0, 7.5));
+    if locked {
+        p.rect_filled(body, CornerRadius::same(2), color);
+    } else {
+        p.rect_stroke(body, CornerRadius::same(2), s, StrokeKind::Inside);
+    }
+    // Lengkung gembok; versi terbuka terangkat di sisi kanan.
+    let lift = if locked { 0.0 } else { -2.5 };
+    let (l, r, top) = (c.x - 3.0, c.x + 3.0, c.y - 5.5);
+    p.add(egui::Shape::line(
+        vec![pos2(l, body.top()), pos2(l, top + 1.5), pos2(c.x - 1.5, top), pos2(c.x + 1.5, top), pos2(r, top + 1.5), pos2(r, body.top() + lift)],
+        s,
+    ));
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {

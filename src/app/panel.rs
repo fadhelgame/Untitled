@@ -160,6 +160,7 @@ impl App {
                     .on_hover_text("Blend mode");
                 ui.checkbox(&mut n.visible, "Visible");
             });
+            ui.checkbox(&mut n.locked, "Locked").on_hover_text("Can't be selected or moved on the canvas. Select it in the Layers panel to unlock (Ctrl+Shift+L).");
 
             if n.kind == Kind::Text {
                 self.typography(ui, &ctx, &mut n, editing, range, None);

@@ -99,12 +99,12 @@ impl App {
         let mut check = |c: &Node, parent: Option<u64>| {
             // Frame hanya ikut kalau yang diklik juga frame.
             let frame_ok = c.kind != Kind::Frame || r.kind == Kind::Frame;
-            if c.visible && frame_ok && scope.map_or(true, |s| s == parent) && self.wand.matches(r, c) {
+            if c.visible && !c.locked && frame_ok && scope.map_or(true, |s| s == parent) && self.wand.matches(r, c) {
                 out.push(c.id);
             }
         };
         for top in &self.doc.nodes {
-            if !top.visible {
+            if !top.visible || top.locked {
                 continue;
             }
             check(top, None);
