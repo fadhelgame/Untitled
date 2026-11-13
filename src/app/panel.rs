@@ -806,6 +806,13 @@ impl App {
                             if resp.on_hover_text("Icons").clicked() {
                                 self.toggle_icons();
                             }
+                            // Photos: buka/tutup jendela pencarian foto stok.
+                            let active = self.photos.open;
+                            let (rect, resp) = button(ui, active);
+                            super::photos::toolbar_icon(ui.painter(), rect.center(), if active { Color32::WHITE } else { Color32::from_gray(225) });
+                            if resp.on_hover_text("Photos").clicked() {
+                                self.toggle_photos();
+                            }
                             // Export: popup di atas toolbar dengan skala dan format.
                             separator(ui);
                             let popup_id = ui.make_persistent_id("export_popup");
@@ -867,6 +874,7 @@ impl eframe::App for App {
         self.ext.poll(ctx);
         self.rembg_poll();
         self.icons.poll(ctx);
+        self.photos_poll(ctx);
         self.remote_poll(ctx);
         self.frame_ms = frame.info().cpu_usage.unwrap_or(0.0) * 1000.0;
         self.close_flow(ctx);
@@ -912,6 +920,7 @@ impl eframe::App for App {
             .show(ctx, |ui| self.canvas(ui));
         self.toolbar(ctx);
         self.icons_window(ctx);
+        self.photos_window(ctx);
         self.eyedropper(ctx);
 
         let name = self.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled".into(), |n| n.to_string_lossy());

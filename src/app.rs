@@ -16,6 +16,7 @@ mod home;
 mod icons;
 mod panel;
 mod pen;
+mod photos;
 mod picker;
 mod presets;
 pub mod rembg;
@@ -310,6 +311,8 @@ pub struct App {
     wand: wand::Wand,
     /// Jendela pencarian icon (Iconify).
     icons: icons::Icons,
+    /// Jendela pencarian foto stok (Openverse).
+    photos: photos::Photos,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -384,6 +387,7 @@ impl App {
             rembg: None,
             remote: None,
             icons: Default::default(),
+            photos: Default::default(),
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -1606,11 +1610,16 @@ impl App {
                     self.icons.query = q;
                     self.icons.search(ctx);
                 }
+                if let Ok(q) = std::env::var("KANVAS_BENCH_PHOTOS") {
+                    self.photos.open = true;
+                    self.photos.query = q;
+                    self.photos.search(ctx);
+                }
                 let target = self.doc.nodes.get(30).map(|n| n.bounds());
                 let _ = target;
             }
             _ => {
-                let ready = !self.fonts.any_loading() && !self.icons.busy() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
+                let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
@@ -1636,8 +1645,11 @@ impl App {
                         if let Some(i) = self.first_ready_icon() {
                             self.add_icon(i);
                         }
+                        if let Some(i) = self.first_ready_photo() {
+                            self.add_photo(i, ctx);
+                        }
                     }
-                    if b.frame == b.mark + 115 {
+                    if b.frame >= b.mark + 115 && !self.photos.busy() {
                         b.phase = 2;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
                     }
