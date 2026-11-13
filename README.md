@@ -68,7 +68,7 @@
 | | Download | Runs on |
 |---|---|---|
 | **Windows** | [Kanvas.exe](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas.exe) | Windows 64-bit |
-| **macOS** | [Kanvas-macos-arm64.zip](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas-macos-arm64.zip) | Apple Silicon (M1 or newer) |
+| **macOS** | [Kanvas-macos-arm64.zip](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas-macos-arm64.zip) | Apple Silicon (M1 or newer), macOS 13.4 or newer |
 | **Linux** | [Kanvas-linux-x86_64.tar.gz](https://github.com/fadhelgame/Untitled/releases/latest/download/Kanvas-linux-x86_64.tar.gz) | x86-64, X11 or Wayland |
 
 The macOS and Linux builds are new and **experimental**. If something misbehaves, please [open an issue](https://github.com/fadhelgame/Untitled/issues).

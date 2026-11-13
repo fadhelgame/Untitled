@@ -49,7 +49,8 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin kanvas --bin kanvas-mcp
         env:
-          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          # The prebuilt ONNX Runtime is built for macOS 13.4, so the app cannot promise anything older.
+          MACOSX_DEPLOYMENT_TARGET: "13.4"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

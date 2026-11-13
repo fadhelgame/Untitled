@@ -1,0 +1,8 @@
+# macOS: the prebuilt ONNX Runtime (remove background) uses `@available` checks, which need a helper
+# (`___isPlatformVersionAtLeast`) from clang's runtime library. Rust does not link that library by
+# itself, so ask the linker for it; without this the link step fails with "Undefined symbols".
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-fapple-link-rtlib"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-fapple-link-rtlib"]
