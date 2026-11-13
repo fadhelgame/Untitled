@@ -164,6 +164,7 @@ fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
         shadow.blur *= s;
     }
     n.radius *= s;
+    n.blur *= s;
     n.font_size = (n.font_size * s).max(1.0);
     for span in &mut n.spans {
         span.style.size = (span.style.size * s).max(1.0);
@@ -1701,6 +1702,32 @@ impl App {
                     let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
                     b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
                 }
+                // `KANVAS_BENCH_BLUR=1`: layer blur di frame demo — satu kotak, satu group (elips +
+                // bintang, buram sebagai satu gambar), teks, alas clipping mask, dan objek ber-blend.
+                if std::env::var("KANVAS_BENCH_BLUR").is_ok() {
+                    let kids: Vec<(u64, String)> =
+                        self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| (c.id, c.name.clone()))).collect();
+                    if kids.len() > 2 {
+                        self.sel = vec![kids[1].0, kids[2].0];
+                        self.group_selection();
+                        for (id, name) in &kids {
+                            let blur = match name.as_str() {
+                                "Linear gradient" => 10.0,
+                                "Headline" => 3.0,
+                                "Mask base" => 8.0,
+                                "Multiply" => 12.0,
+                                _ if *id == kids[1].0 || *id == kids[2].0 => 14.0,
+                                _ => 0.0,
+                            };
+                            if let Some(n) = self.doc.find_mut(*id) {
+                                n.blur = blur;
+                            }
+                        }
+                        let at = pos2(ctx.screen_rect().right() - 150.0, 500.0);
+                        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
+                        b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
+                    }
+                }
                 // `KANVAS_BENCH_LOCK=1`: kunci isi frame demo dan buka frame-nya di panel layer.
                 if std::env::var("KANVAS_BENCH_LOCK").is_ok() {
                     let demo: Vec<(u64, Vec<u64>)> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").map(|n| (n.id, n.children.iter().map(|c| c.id).collect())).collect();
@@ -1797,6 +1824,14 @@ impl App {
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                    // Export frame demo juga, untuk dibandingkan dengan tampilan canvas.
+                    if std::env::var("KANVAS_BENCH_BLUR").is_ok() {
+                        if let Some(id) = self.doc.nodes.iter().find(|n| n.name == "Feature demo").map(|n| n.id) {
+                            if let Some((svg, w, h)) = export::to_svg(&self.doc, Some(id), &mut self.fonts, ctx) {
+                                let _ = export::save_raster(&svg, w, h, 1.0, false, &b.out.with_file_name("bench-blur-export.png"));
+                            }
+                        }
+                    }
                 }
                 if b.phase == 1 {
                     if b.frame == b.mark + 84 {
@@ -1943,6 +1978,11 @@ fn field(ui: &mut egui::Ui, width: f32, label: &str, v: &mut f32) {
         [width, 28.0],
         egui::DragValue::new(v).speed(1.0).max_decimals(2).prefix(format!("{label}  ")),
     );
+}
+
+/// Kolom nilai layer blur (0 = mati).
+fn blur_field(ui: &mut egui::Ui, width: f32, v: &mut f32) -> egui::Response {
+    ui.add_sized([width, 28.0], egui::DragValue::new(v).speed(0.25).range(0.0..=500.0).max_decimals(1).prefix("Blur  "))
 }
 
 fn icon_button(ui: &mut egui::Ui, selected: bool, tip: &str, draw: impl FnOnce(&egui::Painter, Pos2, Color32)) -> bool {

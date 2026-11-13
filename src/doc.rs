@@ -307,6 +307,11 @@ pub struct Node {
     /// Drop shadow di belakang objek.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<Shadow>,
+    /// Layer blur: seluruh objek (beserta bayangannya, dan isi frame) diburamkan. Satuan dokumen,
+    /// kebiasaan CSS/Figma (simpangan baku = setengah nilai ini); 0 = tidak buram.
+    /// Anggota satu group yang nilainya sama diburamkan sebagai satu kesatuan (lihat `blur_run`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub blur: f32,
     /// Color style yang dipakai fill / stroke, dan text style (id ke `Doc::colors` / `Doc::type_styles`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_style: Option<u64>,
@@ -360,10 +365,33 @@ impl Node {
             _ => 0.0,
         }
     }
+
+    /// Seberapa jauh layer blur melebar keluar dari objeknya (3 simpangan baku).
+    pub fn blur_pad(&self) -> f32 {
+        if self.blur > 0.0 {
+            self.blur * 1.5 + 1.0
+        } else {
+            0.0
+        }
+    }
 }
 
 fn is_zero(v: &f32) -> bool {
     *v == 0.0
+}
+
+/// Rangkaian layer blur mulai dari `nodes[i]`: indeks akhirnya (eksklusif). Node yang diburamkan
+/// dan menjadi anggota group digabung dengan anggota berikutnya yang nilai blur-nya sama, supaya
+/// group itu buram sebagai satu gambar (bukan tiap anggota sendiri-sendiri).
+pub fn blur_run<T: AsRef<Node>>(nodes: &[T], i: usize) -> usize {
+    let n = nodes[i].as_ref();
+    let mut j = i + 1;
+    if n.blur > 0.0 && n.group != 0 {
+        while nodes.get(j).map(|m| m.as_ref()).is_some_and(|m| m.group == n.group && m.blur == n.blur) {
+            j += 1;
+        }
+    }
+    j
 }
 
 impl AsRef<Node> for Node {
@@ -502,6 +530,7 @@ impl Node {
             gap: 0.0,
             stroke_align: None,
             shadow: None,
+            blur: 0.0,
             fill_style: None,
             stroke_style: None,
             type_style: None,

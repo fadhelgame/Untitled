@@ -182,18 +182,16 @@ fn list_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, font
     while i < nodes.len() {
         let (j, k) = crate::doc::clip_run(nodes, i);
         if k == j {
-            for n in &nodes[i..j] {
-                node_svg(out, n.as_ref(), assets, fonts, ctx);
-            }
+            run_svg(out, &nodes[i..j], assets, fonts, ctx);
         } else {
             let id = nodes[i].as_ref().id;
             let _ = write!(out, r#"<g id="b{id}">"#);
             let mut area: Option<(f32, f32, f32, f32)> = None;
+            run_svg(out, &nodes[i..j], assets, fonts, ctx);
             for n in &nodes[i..j] {
                 let n = n.as_ref();
-                node_svg(out, n, assets, fonts, ctx);
-                // Stroke dan glyph bisa keluar sedikit dari kotak pembatas.
-                let (b, pad) = (n.aabb(), n.stroke_w.max(0.0) + if n.kind == Kind::Text { n.max_size() } else { 0.0 });
+                // Stroke, glyph, dan layer blur bisa keluar dari kotak pembatas.
+                let (b, pad) = (n.aabb(), n.stroke_w.max(0.0) + n.blur_pad() + if n.kind == Kind::Text { n.max_size() } else { 0.0 });
                 let b = (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad);
                 area = Some(area.map_or(b, |a| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))));
             }
@@ -204,9 +202,7 @@ fn list_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, font
                 x1 - x0,
                 y1 - y0
             );
-            for n in &nodes[j..k] {
-                node_svg(out, n.as_ref(), assets, fonts, ctx);
-            }
+            run_svg(out, &nodes[j..k], assets, fonts, ctx);
             out.push_str("</g>");
         }
         i = k;
@@ -220,10 +216,84 @@ enum Fx {
     Full,
     /// Hanya bayangannya (tekstur bayangan di canvas).
     ShadowOnly,
+    /// Seperti `Full` tapi tanpa blend mode: blend dipasang pembungkusnya (grup layer blur).
+    NoBlend,
 }
 
-fn node_svg(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) {
-    node_fx(out, n, assets, fonts, ctx, Fx::Full);
+/// Potongan daftar saudara: node biasa ditulis apa adanya, rangkaian ber-layer-blur dibungkus
+/// satu grup berfilter.
+fn run_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) {
+    let mut i = 0;
+    while i < nodes.len() {
+        let end = crate::doc::blur_run(nodes, i);
+        if nodes[i].as_ref().blur > 0.0 {
+            blur_group(out, &nodes[i..end], assets, fonts, ctx, true);
+        } else {
+            node_fx(out, nodes[i].as_ref(), assets, fonts, ctx, Fx::Full);
+        }
+        i = end;
+    }
+}
+
+/// Area dunia yang dicakup satu rangkaian layer blur, termasuk luberan blur, stroke, glyph, dan
+/// bayangan. `None`: tidak ada anggota yang terlihat.
+pub fn blur_region<T: AsRef<Node>>(nodes: &[T]) -> Option<(f32, f32, f32, f32)> {
+    let mut area: Option<(f32, f32, f32, f32)> = None;
+    for n in nodes.iter().map(|n| n.as_ref()).filter(|n| n.visible) {
+        let text = if n.kind == Kind::Text { n.max_size() } else { 0.0 };
+        let pad = n.blur_pad() + n.stroke_w.max(0.0) + text + n.shadow.filter(|s| s.color[3] > 0).map_or(0.0, |s| s.pad());
+        let b = n.aabb();
+        let b = (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad);
+        area = Some(area.map_or(b, |a| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))));
+    }
+    area
+}
+
+/// Blend mode satu rangkaian layer blur: dipakai kalau semua anggota yang terlihat memakai mode
+/// yang sama (hasil buramnya lalu di-blend sebagai satu gambar); kalau berbeda-beda, 0 (Normal).
+pub fn run_blend<T: AsRef<Node>>(nodes: &[T]) -> u8 {
+    let mut modes = nodes.iter().map(|n| n.as_ref()).filter(|n| n.visible).map(|n| n.blend);
+    let first = modes.next().unwrap_or(0);
+    if modes.all(|m| m == first) {
+        first
+    } else {
+        0
+    }
+}
+
+/// Satu rangkaian layer blur: anggotanya digambar ke satu grup, lalu grup itu diburamkan.
+/// `blend`: pasang blend mode bersama di grupnya (di canvas, blend dikerjakan GPU).
+fn blur_group<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context, blend: bool) {
+    let Some((x0, y0, x1, y1)) = blur_region(nodes) else { return };
+    let first = nodes[0].as_ref();
+    let mode = run_blend(nodes);
+    let _ = write!(
+        out,
+        r#"<filter id="bl{id}" filterUnits="userSpaceOnUse" x="{x0}" y="{y0}" width="{}" height="{}" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="{}"/></filter><g filter="url(#bl{id})""#,
+        x1 - x0,
+        y1 - y0,
+        first.blur * 0.5,
+        id = first.id
+    );
+    if mode != 0 && blend {
+        let _ = write!(out, r#" style="mix-blend-mode:{}""#, blend::CSS[(mode as usize).min(blend::CSS.len() - 1)]);
+    }
+    out.push('>');
+    for n in nodes {
+        node_fx(out, n.as_ref(), assets, fonts, ctx, if mode != 0 { Fx::NoBlend } else { Fx::Full });
+    }
+    out.push_str("</g>");
+}
+
+/// SVG satu rangkaian layer blur (sudah buram), untuk tekstur di canvas. Blend mode bersama tidak
+/// ikut: canvas yang mengerjakannya. Hasil: (svg, area dunia yang dicakup).
+pub fn blur_svg<T: AsRef<Node>>(nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32))> {
+    let region = blur_region(nodes)?;
+    let (w, h) = (region.2 - region.0, region.3 - region.1);
+    let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{} {} {w} {h}">"#, region.0, region.1);
+    blur_group(&mut out, nodes, assets, fonts, ctx, false);
+    out.push_str("</svg>");
+    Some((out, region))
 }
 
 /// Jarak aman di sekeliling objek supaya bayangannya tidak terpotong.
@@ -319,7 +389,7 @@ fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager,
         // Objek ditulis sekali lalu dipakai dua kali: salinan berfilter untuk bayangan, dan objek
         // aslinya di atasnya tanpa filter. Dengan begitu hanya bayangan yang menjadi bitmap di PDF;
         // objeknya sendiri tetap vektor.
-        (Some(filter), Fx::Full) => {
+        (Some(filter), _) => {
             let _ = write!(out, r#"<defs><g id="n{}">"#, n.id);
             node_inner(out, n, assets, fonts, ctx);
             let _ = write!(out, r##"</g></defs><use href="#n{id}"{filter}/><use href="#n{id}"/>"##, id = n.id);
@@ -469,6 +539,8 @@ pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui:
             let pad = if matches!(n.kind, Kind::Line | Kind::Path) && n.stroke.is_some() { n.stroke_w * 0.5 } else { 0.0 };
             // Bayangan ikut masuk hasil export, kecuali untuk frame (ukuran halaman harus tetap).
             let pad = pad + n.shadow.filter(|s| s.color[3] > 0 && n.kind != Kind::Frame).map_or(0.0, |s| s.pad());
+            // Begitu juga luberan layer blur.
+            let pad = pad + if n.kind == Kind::Frame { 0.0 } else { n.blur_pad() };
             let b = n.aabb();
             (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad)
         }
@@ -479,7 +551,7 @@ pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui:
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{x0} {y0} {w} {h}">"#
     );
     match target {
-        Some(n) => node_svg(&mut out, n, assets, fonts, ctx),
+        Some(n) => run_svg(&mut out, std::slice::from_ref(n), assets, fonts, ctx),
         None => list_svg(&mut out, &doc.nodes, assets, fonts, ctx),
     }
     out.push_str("</svg>");
@@ -702,6 +774,44 @@ mod tests {
         // Alas 50% hitam di atas putih = abu 128, lalu merah 50% di atasnya.
         assert!((180..200).contains(&mid[0]) && (55..75).contains(&mid[1]), "half-transparent base: half red, got {mid:?}");
         assert_eq!(right.0, [255, 255, 255, 255], "outside the base: nothing drawn");
+    }
+
+    #[test]
+    fn layer_blur_softens_edges_and_groups_blur_as_one() {
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        let mut doc = Doc::default();
+        let mut bg = Node::new(doc.alloc_id(), Kind::Rect, 0.0, 0.0);
+        (bg.w, bg.h, bg.fill) = (300.0, 100.0, Some([255, 255, 255, 255]));
+        doc.insert(bg, None);
+        // Dua kotak hitam yang saling menempel (x 50..100 dan 100..150), satu group, blur 20.
+        for x in [50.0, 100.0] {
+            let mut r = Node::new(doc.alloc_id(), Kind::Rect, x, 0.0);
+            (r.w, r.h, r.fill, r.group, r.blur) = (50.0, 100.0, Some([0, 0, 0, 255]), 7, 20.0);
+            doc.insert(r, None);
+        }
+        // Kotak hitam tajam sebagai pembanding.
+        let mut sharp = Node::new(doc.alloc_id(), Kind::Rect, 220.0, 0.0);
+        (sharp.w, sharp.h, sharp.fill) = (50.0, 100.0, Some([0, 0, 0, 255]));
+        doc.insert(sharp, None);
+        assert_eq!(crate::doc::blur_run(&doc.nodes, 1), 3);
+        assert_eq!(crate::doc::blur_run(&doc.nodes, 3), 4);
+        let (svg, w, h) = to_svg(&doc, None, &mut fonts, &ctx).unwrap();
+        assert_eq!(svg.matches("<feGaussianBlur").count(), 1, "the group is blurred by one filter");
+        let (png, ..) = render_png(&svg, w, h, 1.0).unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        let gray = |x: u32| img.get_pixel(x, 50)[0];
+        // Tepi luar group jadi gradasi: di tepinya setengah gelap, 10 px di luarnya masih kena.
+        assert!((100..160).contains(&gray(50)), "group edge is half covered, got {}", gray(50));
+        assert!((180..250).contains(&gray(40)), "blur spills outside, got {}", gray(40));
+        // Sambungan di dalam group tetap pekat: kalau tiap anggota diburamkan sendiri-sendiri,
+        // sambungan ini akan tembus pandang.
+        assert!(gray(100) < 12, "seam inside the group stays solid, got {}", gray(100));
+        // Objek tanpa blur tidak berubah.
+        assert_eq!((gray(219), gray(221)), (255, 0));
+        // Export satu node: kanvasnya dilebarkan supaya luberan blur tidak terpotong.
+        let (_, w, _) = to_svg(&doc, Some(2), &mut fonts, &ctx).unwrap();
+        assert_eq!(w, 50.0 + 2.0 * 31.0);
     }
 
     #[test]

@@ -309,6 +309,9 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     if let Some(s) = n.shadow {
         put("shadow", json!({ "x": r2(s.x), "y": r2(s.y), "blur": r2(s.blur), "color": hex(s.color) }));
     }
+    if n.blur != 0.0 {
+        put("blur", r2(n.blur));
+    }
     if n.rotation != 0.0 {
         put("rotation", r2(n.rotation));
     }
@@ -744,6 +747,7 @@ impl App {
                         Some(crate::doc::Shadow { x: f("x", d.x), y: f("y", d.y), blur: f("blur", d.blur).max(0.0), color })
                     };
                 }
+                "blur" => n.blur = if v.is_null() { 0.0 } else { num(k, v)?.clamp(0.0, 500.0) },
                 "rotation" => n.rotation = num(k, v)?,
                 "opacity" => n.opacity = num(k, v)?.clamp(0.0, 1.0),
                 "visible" => n.visible = flag(k, v)?,

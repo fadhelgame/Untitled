@@ -265,6 +265,8 @@ impl App {
                     ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.blur).speed(0.25).range(0.0..=500.0).max_decimals(1).prefix("Blur  "));
                 });
             }
+            section(ui, "Layer blur");
+            blur_field(ui, half, &mut n.blur).on_hover_text("Blurs the whole layer, with its shadow. On a frame, the contents are blurred too. 0 = off");
             self.export_section(ui, &ctx);
             ui.add_space(12.0);
         });
@@ -354,6 +356,7 @@ impl App {
         let mixed_fill = !all(&|n| n.fill == first.fill && n.gradient == first.gradient);
         let mixed_stroke = !all(&|n| n.stroke == first.stroke && n.stroke_w == first.stroke_w);
         let mixed_look = !all(&|n| n.opacity == first.opacity && n.blend == first.blend && n.radius == first.radius);
+        let mixed_blur = !all(&|n| n.blur == first.blur);
         let title = if same_kind { format!("{} × {}", first.kind.label(), nodes.len()) } else { "Design".to_owned() };
         let mut n = (*first).clone();
         n.children.clear();
@@ -443,6 +446,15 @@ impl App {
                     );
                 }
             }
+            section(ui, "Layer blur");
+            if mixed_blur {
+                ui.weak(MIXED);
+            }
+            blur_field(ui, half, &mut n.blur).on_hover_text(if group.is_some() {
+                "Blurs the whole group as one layer. 0 = off"
+            } else {
+                "Blurs each selected layer. Group them first to blur them together as one. 0 = off"
+            });
             self.export_section(ui, ctx);
             ui.add_space(12.0);
         });
@@ -472,6 +484,9 @@ impl App {
             }
             if n.blend != before.blend {
                 t.blend = n.blend;
+            }
+            if n.blur != before.blur {
+                t.blur = n.blur;
             }
             if n.radius != before.radius && matches!(t.kind, Kind::Rect | Kind::Image) {
                 t.radius = n.radius;

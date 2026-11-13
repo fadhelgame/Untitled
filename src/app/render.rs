@@ -98,6 +98,19 @@ struct ShadowTex {
 
 type ShadowDone = (Node, usize, f32, (f32, f32, f32, f32), Result<ColorImage, String>);
 
+/// Tekstur satu rangkaian layer blur (satu node, atau anggota group yang buram bersama), sudah
+/// dalam keadaan buram. Arti field-nya sama dengan `ShadowTex`; kuncinya id node pertama.
+struct BlurTex {
+    nodes: Vec<Node>,
+    scale: f32,
+    region: (f32, f32, f32, f32),
+    fonts: usize,
+    tex: TextureHandle,
+    frame: u64,
+}
+
+type BlurDone = (Vec<Node>, usize, f32, (f32, f32, f32, f32), Result<ColorImage, String>);
+
 struct DetailReq {
     node: u64,
     key: TexKey,
@@ -161,6 +174,12 @@ pub struct Ext {
     shadow_failed: HashSet<u64>,
     sh_tx: mpsc::Sender<ShadowDone>,
     sh_rx: mpsc::Receiver<ShadowDone>,
+    /// Tekstur layer blur per rangkaian, yang sedang dirender, dan yang gagal dirender.
+    blurs: HashMap<u64, BlurTex>,
+    blur_busy: HashSet<u64>,
+    blur_failed: HashSet<u64>,
+    bl_tx: mpsc::Sender<BlurDone>,
+    bl_rx: mpsc::Receiver<BlurDone>,
     pub export_scale: f32,
     pub export_fmt: usize,
     pub v_plain: bool,
@@ -172,7 +191,13 @@ impl Default for Ext {
         let (img_tx, img_rx) = mpsc::channel();
         let (det_tx, det_rx) = mpsc::channel();
         let (sh_tx, sh_rx) = mpsc::channel();
+        let (bl_tx, bl_rx) = mpsc::channel();
         Ext {
+            blurs: HashMap::new(),
+            blur_busy: HashSet::new(),
+            blur_failed: HashSet::new(),
+            bl_tx,
+            bl_rx,
             svg: HashMap::new(),
             details: HashMap::new(),
             detail_busy: HashSet::new(),
@@ -270,7 +295,21 @@ impl Ext {
                 }
             }
         }
+        while let Ok((nodes, fonts, scale, region, result)) = self.bl_rx.try_recv() {
+            let Some(key) = nodes.first().map(|n| n.id) else { continue };
+            self.blur_busy.remove(&key);
+            match result {
+                Ok(image) => {
+                    let tex = ctx.load_texture(format!("blur-{key}"), image, egui::TextureOptions::LINEAR);
+                    self.blurs.insert(key, BlurTex { nodes, scale, region, fonts, tex, frame: self.frame });
+                }
+                Err(_) => {
+                    self.blur_failed.insert(key);
+                }
+            }
+        }
         let frame = self.frame;
+        self.blurs.retain(|_, b| b.frame + 300 > frame);
         self.details.retain(|_, d| d.frame + 300 > frame);
         self.shadows.retain(|_, s| s.frame + 300 > frame);
         if self.tex.len() > 6 {
@@ -933,6 +972,131 @@ fn shadow_layer(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
     }
 }
 
+// ---------------------------------------------------------------- layer blur
+
+/// Resolusi tekstur layer blur: seperti bayangan, gambar yang buram cukup dengan resolusi rendah.
+fn blur_scale(blur: f32, screen: f32, side: f32) -> f32 {
+    screen.min(8.0 / blur.max(0.5)).min(4096.0 / side.max(1.0)).max(1e-3)
+}
+
+/// Ukur teks lebar-otomatis yang tidak lewat `paint_node` (karena digambar sebagai tekstur buram),
+/// supaya ukuran kotaknya tetap mengikuti isi dan font-nya.
+fn measure_texts(pc: &mut PaintCx, n: &Node) {
+    if !n.visible {
+        return;
+    }
+    for c in &n.children {
+        measure_texts(pc, c);
+    }
+    if n.kind != Kind::Text || n.text.is_empty() {
+        return;
+    }
+    let (max, z) = (n.max_size(), pc.view.zoom);
+    if max * z < 3.0 {
+        return;
+    }
+    let (lay, k) = glyph_scale(max * z, pc.moving, pc.ctx.pixels_per_point());
+    let layout = layout_text(pc.ctx, n, &n.text, pc.fonts, lay / max, 1.0, true);
+    let width = if n.wrap { n.w } else { layout.width * k / z };
+    pc.measures.push((n.id, width, layout.height * k / z));
+}
+
+/// Gambar satu rangkaian layer blur sebagai tekstur yang sudah buram. Seperti bayangan, teksturnya
+/// dirasterkan di thread lain dari SVG jalur export; selama versi baru belum jadi, tekstur lama
+/// tetap dipakai (digeser mengikuti node). Hasil `false`: belum ada tekstur sama sekali, atau
+/// teksnya sedang diedit — pemanggil menggambar node-nya seperti biasa (tajam).
+fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[T], alpha: f32) -> bool {
+    let first = run[0].as_ref();
+    if let Some(id) = pc.editing {
+        if run.iter().map(|n| n.as_ref()).any(|n| n.id == id || n.children.iter().any(|c| c.id == id)) {
+            return false;
+        }
+    }
+    let Some(now) = crate::export::blur_region(run) else { return true };
+    if now.2 < pc.vis.0 || now.0 > pc.vis.2 || now.3 < pc.vis.1 || now.1 > pc.vis.3 {
+        return true;
+    }
+    for n in run {
+        measure_texts(pc, n.as_ref());
+    }
+    let (key, frame) = (first.id, pc.ext.frame);
+    let screen = pc.view.zoom * pc.ctx.pixels_per_point();
+    let fonts = pc.fonts.usable_count();
+    let same = |nodes: &[Node]| nodes.len() == run.len() && nodes.iter().zip(run).all(|(a, b)| a == b.as_ref());
+    let fresh = pc.ext.blurs.get_mut(&key).is_some_and(|c| {
+        c.frame = frame;
+        let (dx, dy) = (first.x - c.nodes[0].x, first.y - c.nodes[0].y);
+        if (dx != 0.0 || dy != 0.0) && c.nodes.len() == run.len() {
+            // Hanya digeser: isi teksturnya tetap sama, cukup pindahkan areanya.
+            let mut moved = c.nodes.clone();
+            for n in &mut moved {
+                n.translate(dx, dy);
+            }
+            if same(&moved) {
+                c.nodes = moved;
+                c.region = (c.region.0 + dx, c.region.1 + dy, c.region.2 + dx, c.region.3 + dy);
+            }
+        }
+        let want = blur_scale(first.blur, screen, (c.region.2 - c.region.0).max(c.region.3 - c.region.1));
+        same(&c.nodes) && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
+    });
+    if !fresh && !pc.ext.blur_busy.contains(&key) && !pc.ext.blur_failed.contains(&key) {
+        if let Some((svg, region)) = crate::export::blur_svg(run, pc.assets, pc.fonts, pc.ctx) {
+            let scale = blur_scale(first.blur, screen, (region.2 - region.0).max(region.3 - region.1));
+            pc.ext.blur_busy.insert(key);
+            let nodes: Vec<Node> = run.iter().map(|n| n.as_ref().clone()).collect();
+            let (tx, ctx) = (pc.ext.bl_tx.clone(), pc.ctx.clone());
+            std::thread::spawn(move || {
+                let image = render_shadow(&svg, region, scale);
+                let _ = tx.send((nodes, fonts, scale, region, image));
+                ctx.request_repaint();
+            });
+        }
+    }
+    let Some(c) = pc.ext.blurs.get(&key) else { return false };
+    let (dx, dy) = (first.x - c.nodes[0].x, first.y - c.nodes[0].y);
+    let r = Rect::from_min_max(
+        pc.view.to_screen(pc.o, c.region.0 + dx, c.region.1 + dy),
+        pc.view.to_screen(pc.o, c.region.2 + dx, c.region.3 + dy),
+    );
+    // Opacity tiap node sudah termasuk di tekstur; yang dikalikan di sini hanya milik induknya.
+    let tint = Color32::WHITE.gamma_multiply(alpha);
+    let shape: Shape = egui::epaint::RectShape::filled(r, CornerRadius::ZERO, tint).with_texture(c.tex.id(), UV_FULL).into();
+    let mode = crate::export::run_blend(run);
+    pc.drawn += 1;
+    if pc.capture.is_none() && mode == 0 {
+        painter.add(shape);
+        return true;
+    }
+    let meshes = tessellate(pc.ctx, vec![shape]);
+    match &mut pc.capture {
+        Some(capture) => capture.extend(meshes),
+        None => {
+            painter.add(blend::callback(pc.ext.blend_gl.clone(), painter.clip_rect(), meshes, mode));
+        }
+    }
+    true
+}
+
+/// Potongan daftar saudara: rangkaian ber-layer-blur digambar sebagai satu tekstur buram, sisanya
+/// lewat `paint_node`. `after` dipanggil setelah tiap node digambar.
+fn paint_run<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, nodes: &[T], alpha: f32, after: &mut dyn FnMut(&Node)) {
+    let mut i = 0;
+    while i < nodes.len() {
+        let end = crate::doc::blur_run(nodes, i);
+        let run = &nodes[i..end];
+        if !(run[0].as_ref().blur > 0.0 && blur_layer(pc, painter, run, alpha)) {
+            for n in run {
+                paint_node(pc, painter, n.as_ref(), alpha);
+            }
+        }
+        for n in run {
+            after(n.as_ref());
+        }
+        i = end;
+    }
+}
+
 /// Penampung bentuk. Node biasa langsung masuk painter; node yang dirotasi atau memakai
 /// blend mode dikumpulkan dulu supaya bisa di-tessellate, diputar, dan digambar khusus.
 struct Sink<'p> {
@@ -980,20 +1144,13 @@ pub fn paint_list<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, nod
     let mut i = 0;
     while i < nodes.len() {
         let (j, k) = crate::doc::clip_run(nodes, i);
-        for n in &nodes[i..j] {
-            paint_node(pc, painter, n.as_ref(), alpha);
-            after(n.as_ref());
-        }
+        paint_run(pc, painter, &nodes[i..j], alpha, after);
         if k > j {
             // Alas dan isi ditampung sebagai mesh, lalu digabung di GPU: isi × alpha alas.
             let outer = pc.capture.replace(Vec::new());
-            for n in &nodes[i..j] {
-                paint_node(pc, painter, n.as_ref(), 1.0);
-            }
+            paint_run(pc, painter, &nodes[i..j], 1.0, &mut |_| {});
             let mask = pc.capture.replace(Vec::new()).unwrap_or_default();
-            for n in &nodes[j..k] {
-                paint_node(pc, painter, n.as_ref(), alpha);
-            }
+            paint_run(pc, painter, &nodes[j..k], alpha, &mut |_| {});
             let content = std::mem::replace(&mut pc.capture, outer).unwrap_or_default();
             if !mask.is_empty() && !content.is_empty() {
                 painter.add(blend::masked(pc.ext.blend_gl.clone(), painter.clip_rect(), mask, content));
