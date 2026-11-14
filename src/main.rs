@@ -32,11 +32,19 @@ fn main() -> eframe::Result {
         .find(|a| a.ends_with(".kanvas"))
         .map(std::path::PathBuf::from);
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    // Window icon (title bar, taskbar, Alt+Tab). The .exe file icon itself comes from `build.rs`.
+    let icon = image::load_from_memory(include_bytes!("../assets/icon-256.png")).map(|i| i.to_rgba8()).ok();
+
+    let viewport = egui::ViewportBuilder::default()
             .with_title("Kanvas")
             .with_inner_size([1360.0, 840.0])
-            .with_min_inner_size([720.0, 480.0]),
+            .with_min_inner_size([720.0, 480.0]);
+    let viewport = match icon {
+        Some(i) => viewport.with_icon(egui::IconData { width: i.width(), height: i.height(), rgba: i.into_raw() }),
+        None => viewport,
+    };
+    let options = eframe::NativeOptions {
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

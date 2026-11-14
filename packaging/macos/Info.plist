@@ -10,6 +10,9 @@
 	<string>io.github.fadhelgame.kanvas</string>
 	<key>CFBundleExecutable</key>
 	<string>kanvas</string>
+	<!-- Kanvas.icns is built from icon-1024.png by the release workflow. -->
+	<key>CFBundleIconFile</key>
+	<string>Kanvas</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>

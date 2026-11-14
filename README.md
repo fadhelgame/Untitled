@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon-256.png" alt="Kanvas logo" width="128" height="128"></p>
+
 <h1 align="center">Kanvas</h1>
 
 <p align="center">

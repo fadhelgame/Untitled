@@ -72,6 +72,15 @@ jobs:
           # The MCP server lives next to the app binary, so it can start the app by itself.
           cp target/release/kanvas-mcp "$app/Contents/MacOS/kanvas-mcp"
           cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+          # App icon: scale the 1024px master into an iconset and pack it as .icns.
+          iconset=dist/Kanvas.iconset
+          mkdir -p "$iconset" "$app/Contents/Resources"
+          for s in 16 32 128 256 512; do
+            sips -z $s $s packaging/macos/icon-1024.png --out "$iconset/icon_${s}x${s}.png" >/dev/null
+            sips -z $((s * 2)) $((s * 2)) packaging/macos/icon-1024.png --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/Kanvas.icns"
+          rm -rf "$iconset"
           /usr/libexec/PlistBuddy \
             -c "Set :CFBundleShortVersionString $version" \
             -c "Set :CFBundleVersion $version" \
