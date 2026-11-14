@@ -1,6 +1,6 @@
 [package]
 name = "kanvas"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Editor desain native yang ringan: canvas infinite, frame tanpa batas, Google Fonts"
 # `src/bin/kanvas-mcp.rs` = server MCP; `cargo run` tetap menjalankan aplikasinya.
@@ -21,6 +21,9 @@ i_overlay = "9.1.0"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-31"] }
 svg2pdf = { version = "0.13", default-features = false, features = ["image", "filters"] }
 pdf-writer = "0.12"
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.dev]
 opt-level = 1
