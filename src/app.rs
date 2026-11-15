@@ -15,6 +15,7 @@ mod canvas;
 mod home;
 mod icons;
 mod library;
+mod pacer;
 mod pages;
 mod panel;
 mod pen;
@@ -291,6 +292,9 @@ struct Bench {
     mark: u32,
     /// Event pointer buatan untuk menguji interaksi mouse: (frame, event).
     inject: Vec<(u32, egui::Event)>,
+    /// Jarak waktu antar frame (ms) selama fase zoom/pan: menunjukkan refresh rate yang benar-benar dicapai.
+    intervals: Vec<f32>,
+    last: Option<std::time::Instant>,
 }
 
 pub struct App {
@@ -322,6 +326,8 @@ pub struct App {
     labels: Vec<(u64, Rect)>,
     drawn: usize,
     frame_ms: f32,
+    /// Waktu menunggu refresh layar pada frame sebelumnya (lihat `pacer`); bukan beban kerja.
+    pace_ms: f32,
     last_zoom: (f32, f64),
     show_ui: bool,
     font_focus: bool,
@@ -414,12 +420,13 @@ impl App {
             labels: Vec::new(),
             drawn: 0,
             frame_ms: 0.0,
+            pace_ms: 0.0,
             last_zoom: (1.0, 0.0),
             show_ui: true,
             wand: Default::default(),
             font_focus: false,
             ext: Default::default(),
-            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new() }),
+            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new(), intervals: Vec::new(), last: None }),
             home: false,
             files: home::Files::new(&cc.egui_ctx),
             rembg: None,
@@ -1793,6 +1800,11 @@ impl App {
         let Some(mut b) = self.bench.take() else { return };
         b.frame += 1;
         ctx.request_repaint();
+        let now = std::time::Instant::now();
+        if let (Some(last), 11..=189) = (b.last, b.frame) {
+            b.intervals.push((now - last).as_secs_f32() * 1000.0);
+        }
+        b.last = Some(now);
         let center = self.canvas_rect.center();
         match b.frame {
             1 => self.stress_test(),
@@ -2071,14 +2083,19 @@ impl App {
                     s.sort_by(|a, b| a.total_cmp(b));
                     let avg = s.iter().sum::<f32>() / s.len().max(1) as f32;
                     let p95 = s.get(s.len() * 95 / 100).copied().unwrap_or(0.0);
+                    let mut iv = b.intervals.clone();
+                    iv.sort_by(|a, b| a.total_cmp(b));
+                    let interval = iv.get(iv.len() / 2).copied().unwrap_or(0.0);
                     let report = format!(
-                        "frames={} objects={} doc_frames={} avg_ms={:.2} p95_ms={:.2} max_ms={:.2} fonts_loaded={} screenshot={:?}\n",
+                        "frames={} objects={} doc_frames={} avg_ms={:.2} p95_ms={:.2} max_ms={:.2} interval_ms={:.2} fps={:.0} fonts_loaded={} screenshot={:?}\n",
                         s.len(),
                         self.doc.count(),
                         self.doc.frame_count(),
                         avg,
                         p95,
                         s.last().copied().unwrap_or(0.0),
+                        interval,
+                        if interval > 0.0 { 1000.0 / interval } else { 0.0 },
                         self.fonts.loaded_count(),
                         shot
                     );

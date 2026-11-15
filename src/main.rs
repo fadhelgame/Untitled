@@ -45,6 +45,9 @@ fn main() -> eframe::Result {
     };
     let options = eframe::NativeOptions {
         viewport,
+        // macOS: OpenGL vsync paints in uneven pairs on ProMotion displays and looks like 60 fps.
+        // There the app follows the display's refresh clock itself; see `app::pacer`.
+        vsync: !cfg!(target_os = "macos"),
         ..Default::default()
     };
     eframe::run_native(
