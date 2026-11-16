@@ -17,7 +17,9 @@ use std::sync::{mpsc, Arc};
 const MAX_IMAGE_SIDE: u32 = 2048;
 const GRADIENT_SIDE: usize = 256;
 /// Ukuran glyph terbesar (piksel layar) yang masih diambil dari atlas bitmap egui.
-const GLYPH_ATLAS_MAX: f32 = 160.0;
+/// Sengaja kecil: luas glyph tumbuh kuadratik, dan atlas 2048px yang penuh dikosongkan lalu
+/// diunggah ulang seluruhnya oleh egui (terasa sebagai sendatan saat zoom).
+const GLYPH_ATLAS_MAX: f32 = 64.0;
 const UV_FULL: Rect = Rect { min: pos2(0.0, 0.0), max: pos2(1.0, 1.0) };
 
 /// Titik path dalam koordinat dunia; pegangan bezier relatif terhadap titiknya.
@@ -892,13 +894,15 @@ pub fn layout_text(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontMa
 }
 
 /// Ukuran layout glyph untuk teks setinggi `px` piksel di layar: (ukuran layout, faktor skala).
-/// Glyph dirender paling besar 160px lalu diskalakan, supaya atlas font tetap kecil.
+/// Glyph dirender paling besar `GLYPH_ATLAS_MAX` lalu diskalakan, supaya atlas font tetap kecil.
+/// Selama zoom bergerak ukurannya bertingkat (dua tingkat per penggandaan zoom, diperkecil paling
+/// jauh ke 0.71x): tiap ukuran baru menambah satu set glyph per font ke atlas.
 /// Di atas ukuran itu canvas memakai mesh vector (`vtext`), jadi tidak ada bitmap yang diperbesar.
 /// Ukuran layout selalu bilangan bulat piksel fisik: egui membulatkan ukuran font ke piksel,
 /// jadi ukuran pecahan membuat glyph tidak sebesar yang diminta (teks tampak membesar-mengecil).
 pub fn glyph_scale(px: f32, moving: bool, ppp: f32) -> (f32, f32) {
     let cap = px.clamp(1.0, GLYPH_ATLAS_MAX);
-    let lay = if moving { (2f32.powf((cap.log2() * 4.0).ceil() / 4.0) * ppp).ceil() } else { (cap * ppp).round() };
+    let lay = if moving { (2f32.powf((cap.log2() * 2.0).ceil() / 2.0) * ppp).ceil() } else { (cap * ppp).round() };
     let lay = lay.max(1.0) / ppp;
     (lay, px / lay)
 }
