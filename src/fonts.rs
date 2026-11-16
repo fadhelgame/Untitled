@@ -60,6 +60,15 @@ pub struct FontManager {
     rx: mpsc::Receiver<Msg>,
     dir: PathBuf,
     frame: u64,
+    /// Layout acuan teks canvas (lihat `reference_layout`), per hash LayoutJob-nya.
+    reference: HashMap<u64, Arc<egui::Galley>>,
+    /// Jumlah font yang bisa dipakai di frame ini (bagian dari kunci `reference`).
+    usable: usize,
+    /// Bagian atlas font yang terisi glyph acuan sejak atlas terakhir dikosongkan.
+    ref_weight: f32,
+    /// Ada layout acuan baru di frame ini / isi atlas di awal frame lalu.
+    ref_missed: bool,
+    last_fill: f32,
 }
 
 pub fn key(family: &str, weight: u16, italic: bool) -> String {
@@ -256,6 +265,9 @@ fn fetch_font(dir: &Path, family: &str, variant: Option<(u16, bool)>) -> Result<
     Ok(bytes)
 }
 
+/// Bagian atlas font yang boleh terisi glyph acuan sebelum atlasnya dikosongkan.
+const REF_WEIGHT_MAX: f32 = 0.15;
+
 /// Nama family egui untuk judul UI (semibold).
 pub const UI_STRONG: &str = "ui-strong";
 
@@ -332,6 +344,11 @@ impl FontManager {
             rx,
             dir,
             frame: 0,
+            reference: HashMap::new(),
+            usable: 0,
+            ref_weight: 0.0,
+            ref_missed: false,
+            last_fill: 0.0,
         };
         m.load_catalog(ctx);
         m
@@ -387,6 +404,58 @@ impl FontManager {
         if changed {
             ctx.set_fonts(self.defs.clone());
         }
+        self.usable = self.usable_count();
+        // Atlas font baru saja dikosongkan (oleh egui karena penuh, atau lewat `set_fonts`):
+        // glyph acuan ikut hilang.
+        let fill = ctx.fonts(|f| f.font_atlas_fill_ratio());
+        if changed || fill + 0.02 < self.last_fill {
+            self.ref_weight = 0.0;
+        }
+        self.last_fill = fill;
+        // Glyph acuan hanya dipakai sekali (posisinya sudah tersimpan di `reference`), tetapi tetap
+        // memakan tempat di atlas. Begitu layout acuan sudah tenang, kosongkan atlas supaya
+        // tempatnya dipakai glyph yang benar-benar digambar.
+        if self.ref_weight > REF_WEIGHT_MAX && !self.ref_missed && !changed {
+            self.ref_weight = 0.0;
+            // `set_fonts` mengabaikan definisi yang sama persis dengan yang sedang dipakai, jadi satu
+            // family penanda ditambah atau dicabut bergantian supaya atlasnya benar-benar dibuat ulang.
+            let marker = FontFamily::Name("atlas-reset".into());
+            if self.defs.families.remove(&marker).is_none() {
+                let chain = self.defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+                self.defs.families.insert(marker, chain);
+            }
+            ctx.set_fonts(self.defs.clone());
+        }
+        self.ref_missed = false;
+    }
+
+    /// Layout acuan untuk teks canvas: yang dipakai hanya posisi glyph-nya, jadi hasilnya
+    /// disimpan di sini, di luar cache egui.
+    ///
+    /// egui ikut merasterkan glyph berukuran acuan (besar) ke atlas font setiap kali layout ini
+    /// dihitung, dan membuang cache-nya sendiri bersama atlas tiap atlas penuh. Tanpa simpanan ini
+    /// glyph acuan langsung mengisi lagi separuh atlas 2048px, atlas cepat penuh lagi, dan tiap
+    /// pengosongan (unggah ulang seluruh atlas + layout ulang) terasa sebagai sendatan saat zoom.
+    pub fn reference_layout(&mut self, ctx: &egui::Context, job: egui::text::LayoutJob) -> Arc<egui::Galley> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&job, self.usable, ctx.pixels_per_point().to_bits()).hash(&mut h);
+        let key = h.finish();
+        if let Some(g) = self.reference.get(&key) {
+            return g.clone();
+        }
+        if self.reference.len() >= 8192 {
+            self.reference.clear();
+        }
+        let (galley, added) = ctx.fonts(|f| {
+            let before = f.font_atlas_fill_ratio();
+            let galley = f.layout_job(job);
+            (galley, f.font_atlas_fill_ratio() - before)
+        });
+        self.ref_weight += added.max(0.0);
+        self.ref_missed = true;
+        self.reference.insert(key, galley.clone());
+        galley
     }
 
     fn lookup(&mut self, k: String, family: &str, variant: Option<(u16, bool)>) -> Option<FontFamily> {

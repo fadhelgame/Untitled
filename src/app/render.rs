@@ -757,7 +757,8 @@ fn stable_galley(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontMana
     // Tanpa wrap: urutan glyph sama dengan acuan, pemenggalan baris mengikuti acuan.
     let mut flat = job.clone();
     flat.wrap.max_width = f32::INFINITY;
-    let (reference, render) = ctx.fonts(|ft| (ft.layout_job(ref_job), ft.layout_job(flat)));
+    let reference = fonts.reference_layout(ctx, ref_job);
+    let render = ctx.fonts(|ft| ft.layout_job(flat));
 
     // Glyph layar berurutan, masing-masing dengan 4 vertex-nya (kalau terlihat).
     let mut src = Vec::new();
