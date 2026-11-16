@@ -1,4 +1,4 @@
-use crate::doc::{Doc, Kind, Node};
+use crate::doc::{Doc, Kind, Node, LAYER_COLORS};
 use crate::export;
 use crate::fonts::{weight_name, CatalogState, FontManager};
 use eframe::egui::{
@@ -1493,6 +1493,11 @@ impl App {
         let can_clip = !targets.is_empty();
         let clipped = can_clip && targets.iter().all(|id| self.doc.find(*id).is_some_and(|n| n.clip));
         let grouped = !self.selected_groups().is_empty();
+        // Warna penanda yang sama di seluruh pilihan (untuk menandai bulatan aktif di menu).
+        let sel_tag = {
+            let mut tags = self.sel.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.tag);
+            tags.next().filter(|t| tags.all(|u| u == *t))
+        };
         // Menu klik kanan baris layer; hasilnya dijalankan setelah daftar selesai digambar.
         let layer_menu = |ui: &mut egui::Ui, menu: &mut Option<u8>| {
             let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, key: &str, action: u8| {
@@ -1513,7 +1518,37 @@ impl App {
             item(ui, true, "Send to back", "[", 4);
             ui.separator();
             item(ui, true, "Delete", "Del", 5);
+            ui.separator();
+            // Warna penanda layer: deretan bulatan; yang pertama = tanpa warna.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.label("Color");
+                ui.add_space(4.0);
+                for (i, (name, _)) in LAYER_COLORS.iter().enumerate() {
+                    let (r, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+                    let resp = resp.on_hover_text(*name);
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, CornerRadius::same(5), ui.visuals().widgets.hovered.weak_bg_fill);
+                    }
+                    let c = r.center();
+                    if i == 0 {
+                        let s = Stroke::new(1.3_f32, ui.visuals().weak_text_color());
+                        ui.painter().circle_stroke(c, 6.0, s);
+                        ui.painter().line_segment([c + vec2(-4.2, 4.2), c + vec2(4.2, -4.2)], s);
+                    } else {
+                        ui.painter().circle_filled(c, 6.0, tag_color(i as u8));
+                    }
+                    if sel_tag == Some(i as u8) {
+                        ui.painter().circle_stroke(c, 8.5, Stroke::new(1.5_f32, ui.visuals().text_color()));
+                    }
+                    if resp.clicked() {
+                        *menu = Some(10 + i as u8);
+                        ui.close_menu();
+                    }
+                }
+            });
         };
+
         let mut rename = self.group_rename.take();
         let mut renamed: Option<(u64, String)> = None;
         // Tarik-lepas layer: tujuan lepas dihitung dari baris di bawah pointer.
@@ -1542,6 +1577,12 @@ impl App {
                         let members = self.doc.group_members(&[g]);
                         let selected = !members.is_empty() && members.iter().all(|id| self.sel.contains(id));
                         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                        // Group berwarna kalau semua anggotanya memakai warna penanda yang sama.
+                        let tag = {
+                            let mut tags = members.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.tag);
+                            tags.next().filter(|t| tags.all(|u| u == *t)).unwrap_or(0)
+                        };
+                        tag_row(&painter, rect, tag);
                         if selected {
                             painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), CornerRadius::same(8), ACCENT.gamma_multiply(0.35));
                         } else if resp.hovered() {
@@ -1609,6 +1650,7 @@ impl App {
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 let selected = self.sel.contains(&n.id);
                 let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                tag_row(&painter, rect, n.tag);
                 if selected {
                     painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), CornerRadius::same(8), ACCENT.gamma_multiply(0.35));
                 } else if resp.hovered() {
@@ -1645,8 +1687,12 @@ impl App {
                     painter.line_segment([c + vec2(-3.0, 3.0), c + vec2(4.0, 3.0)], s);
                     painter.line_segment([c + vec2(1.5, 0.5), c + vec2(4.0, 3.0)], s);
                     painter.line_segment([c + vec2(1.5, 5.5), c + vec2(4.0, 3.0)], s);
-                    x += 15.0;
+                    // Layer biasa: panah menempati kolom panah buka/tutup, supaya ikon tetap sejajar.
+                    if is_frame {
+                        x += 15.0;
+                    }
                 }
+                let chevron = x;
                 if is_frame {
                     let open = self.expanded.contains(&n.id);
                     painter.text(
@@ -1656,8 +1702,9 @@ impl App {
                         FontId::proportional(12.5),
                         ui.visuals().weak_text_color(),
                     );
-                    x += 18.0;
                 }
+                // Kolom panah selalu disisihkan, jadi ikon dan nama sejajar di semua baris (seperti baris group).
+                x += 18.0;
                 let tag = match n.kind {
                     Kind::Frame => "#",
                     Kind::Rect => "▭",
@@ -1686,7 +1733,7 @@ impl App {
                     let px = resp.interact_pointer_pos().map_or(f32::MAX, |p| p.x);
                     if resp.interact_pointer_pos().is_some_and(|p| lock_zone.contains(p)) {
                         lock_toggle = Some(n.id);
-                    } else if is_frame && px < rect.left() + indent + 18.0 {
+                    } else if is_frame && px < chevron + 16.0 {
                         toggle = Some(n.id);
                     } else {
                         click = Some((n.id, ui.input(|i| i.modifiers.shift), resp.double_clicked()));
@@ -1807,6 +1854,10 @@ impl App {
             Some(3) => self.reorder(true),
             Some(4) => self.reorder(false),
             Some(5) => self.delete_selection(),
+            Some(c @ 10..=18) => {
+                self.edit_selected(|n| n.tag = c - 10);
+                self.status = if c == 10 { "Layer color removed.".into() } else { format!("Layer color: {}.", LAYER_COLORS[(c - 10) as usize].0) };
+            }
             _ => {}
         }
     }
@@ -1928,6 +1979,28 @@ impl App {
                             if let Some(n) = self.doc.find_mut(id) {
                                 n.locked = true;
                             }
+                        }
+                    }
+                }
+                // `KANVAS_BENCH_TAGS=x,y`: buka frame demo di panel layer, group dua isinya, beri warna
+                // penanda ke beberapa layer, lalu klik kanan di (x,y) supaya menu warnanya ikut tampil.
+                if let Ok(spec) = std::env::var("KANVAS_BENCH_TAGS") {
+                    if let Some((frame, kids)) = self.doc.nodes.iter().find(|n| n.name == "Feature demo").map(|n| (n.id, n.children.iter().map(|c| c.id).collect::<Vec<_>>())) {
+                        self.expanded.insert(frame);
+                        if kids.len() > 2 {
+                            self.sel = vec![kids[1], kids[2]];
+                            self.group_selection();
+                            self.sel.clear();
+                        }
+                        for (i, id) in kids.iter().enumerate() {
+                            if let Some(n) = self.doc.find_mut(*id) {
+                                n.tag = [1, 4, 4, 0, 6, 0, 2][i % 7];
+                            }
+                        }
+                        let v: Vec<f32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                        if let [x, y] = v[..] {
+                            let button = |pressed| egui::Event::PointerButton { pos: pos2(x, y), button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
+                            b_inject(&mut b.inject, &[(200, egui::Event::PointerMoved(pos2(x, y))), (202, button(true)), (204, button(false))]);
                         }
                     }
                 }
@@ -2193,6 +2266,22 @@ impl App {
 /// Mode `--bench`: jadwalkan event pointer buatan.
 fn b_inject(queue: &mut Vec<(u32, egui::Event)>, events: &[(u32, egui::Event)]) {
     queue.extend(events.iter().cloned());
+}
+
+/// Warna penanda layer dari indeksnya (lihat `LAYER_COLORS`).
+fn tag_color(tag: u8) -> Color32 {
+    let [r, g, b] = LAYER_COLORS[(tag as usize).min(LAYER_COLORS.len() - 1)].1;
+    Color32::from_rgb(r, g, b)
+}
+
+/// Latar baris layer yang diberi warna penanda: sapuan tipis selebar baris dan garis tegas di tepi kiri.
+fn tag_row(p: &egui::Painter, rect: Rect, tag: u8) {
+    if tag == 0 {
+        return;
+    }
+    let (r, c) = (rect.shrink2(vec2(0.0, 1.0)), tag_color(tag));
+    p.rect_filled(r, CornerRadius::same(8), c.gamma_multiply(0.2));
+    p.rect_filled(Rect::from_min_max(r.min + vec2(0.0, 4.0), pos2(r.left() + 3.0, r.bottom() - 4.0)), CornerRadius::same(2), c);
 }
 
 /// Gembok kecil untuk panel layer: tertutup (terkunci) atau terbuka.

@@ -324,6 +324,9 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     if n.locked {
         put("locked", json!(true));
     }
+    if n.tag != 0 {
+        put("layer_color", json!(crate::doc::LAYER_COLORS[(n.tag as usize).min(crate::doc::LAYER_COLORS.len() - 1)].0.to_lowercase()));
+    }
     if n.blend != 0 {
         put("blend", json!(blend::CSS[(n.blend as usize).min(blend::CSS.len() - 1)]));
     }
@@ -758,6 +761,11 @@ impl App {
                 "opacity" => n.opacity = num(k, v)?.clamp(0.0, 1.0),
                 "visible" => n.visible = flag(k, v)?,
                 "locked" => n.locked = flag(k, v)?,
+                "layer_color" => {
+                    let name = if v.is_null() { "none".to_owned() } else { string(k, v)?.to_lowercase() };
+                    let at = crate::doc::LAYER_COLORS.iter().position(|c| c.0.to_lowercase() == name);
+                    n.tag = at.ok_or_else(|| format!("unknown layer color \"{name}\"; use one of: none, red, orange, yellow, green, blue, purple, pink, gray"))? as u8;
+                }
                 "blend" => {
                     let name = string(k, v)?.to_lowercase().replace('_', "-");
                     let at = blend::CSS.iter().position(|b| *b == name).or_else(|| blend::NAMES.iter().position(|b| b.to_lowercase() == name));

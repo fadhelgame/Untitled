@@ -292,6 +292,9 @@ pub struct Node {
     /// Frame yang terkunci ikut mengunci isinya.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
+    /// Warna penanda di panel layer: indeks ke `LAYER_COLORS` (0 = tanpa warna). Tidak memengaruhi gambar.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub tag: u8,
     /// Id group (0 = tidak digroup). Node dengan id group yang sama dipilih dan diubah bersama.
     #[serde(default)]
     pub group: u64,
@@ -383,6 +386,23 @@ impl Node {
 fn is_zero_usize(v: &usize) -> bool {
     *v == 0
 }
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+/// Warna penanda layer (nama, RGB). Indeks 0 = tanpa warna.
+pub const LAYER_COLORS: [(&str, [u8; 3]); 9] = [
+    ("None", [0, 0, 0]),
+    ("Red", [242, 72, 72]),
+    ("Orange", [255, 150, 50]),
+    ("Yellow", [255, 205, 41]),
+    ("Green", [20, 174, 92]),
+    ("Blue", [13, 153, 255]),
+    ("Purple", [151, 71, 255]),
+    ("Pink", [255, 102, 196]),
+    ("Gray", [140, 140, 150]),
+];
 
 fn is_zero(v: &f32) -> bool {
     *v == 0.0
@@ -606,6 +626,7 @@ impl Node {
             opacity: 1.0,
             visible: true,
             locked: false,
+            tag: 0,
             group: 0,
             clip: false,
             dash: 0.0,
