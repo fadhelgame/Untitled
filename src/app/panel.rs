@@ -834,6 +834,13 @@ impl App {
             },
             _ => "whole document".to_owned(),
         };
+        if self.exporting.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("Exporting…");
+            });
+            return;
+        }
         let label = format!("Export {}", target.chars().take(22).collect::<String>());
         if ui.add_sized([ui.available_width().max(150.0), 28.0], egui::Button::new(label)).clicked() {
             self.export_now(ctx);
@@ -874,10 +881,34 @@ impl App {
         let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{safe}.pdf")).save_file() else {
             return;
         };
-        self.status = match export::save_pdf(&pages, &path) {
+        self.export_spawn(ctx, move || match export::save_pdf(&pages, &path) {
             Ok(()) => format!("Exported {} page(s): {}", pages.len(), path.display()),
             Err(e) => format!("Export failed: {e}"),
+        });
+    }
+
+    /// Jalankan export di thread lain supaya jendela tidak macet ("Not Responding") selama
+    /// gambar besar dirender; hasil `work` menjadi teks status bar.
+    fn export_spawn(&mut self, ctx: &egui::Context, work: impl FnOnce() -> String + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+            ctx.request_repaint();
+        });
+        self.exporting = Some(rx);
+        self.status = "Exporting…".into();
+    }
+
+    /// Tiap frame: ambil hasil export yang sudah selesai.
+    fn export_poll(&mut self) {
+        let Some(rx) = &self.exporting else { return };
+        self.status = match rx.try_recv() {
+            Ok(status) => status,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => "Export failed: the export stopped unexpectedly (out of memory?)".into(),
         };
+        self.exporting = None;
     }
 
     fn export_now(&mut self, ctx: &egui::Context) {
@@ -902,14 +933,16 @@ impl App {
         else {
             return;
         };
-        let result = match fmt {
-            2 => std::fs::write(&path, svg).map_err(|e| e.to_string()),
-            _ => export::save_raster(&svg, w, h, scale, fmt == 1, &path),
-        };
-        self.status = match result {
-            Ok(()) => format!("Exported: {}", path.display()),
-            Err(e) => format!("Export failed: {e}"),
-        };
+        self.export_spawn(ctx, move || {
+            let result = match fmt {
+                2 => std::fs::write(&path, svg).map_err(|e| e.to_string()),
+                _ => export::save_raster(&svg, w, h, scale, fmt == 1, &path),
+            };
+            match result {
+                Ok(()) => format!("Exported: {}", path.display()),
+                Err(e) => format!("Export failed: {e}"),
+            }
+        });
     }
 
     // ------------------------------------------------------------ toolbar
@@ -1108,6 +1141,7 @@ impl eframe::App for App {
             self.status = notice;
         }
         self.rembg_poll();
+        self.export_poll();
         self.icons.poll(ctx);
         self.photos_poll(ctx);
         self.library.poll(ctx);

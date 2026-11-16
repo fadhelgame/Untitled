@@ -390,6 +390,8 @@ pub struct App {
     files: home::Files,
     /// Remove background (Codex) yang sedang berjalan.
     rembg: Option<rembg::Job>,
+    /// Export yang sedang berjalan di thread lain; hasilnya teks untuk status bar.
+    exporting: Option<std::sync::mpsc::Receiver<String>>,
     /// Remote control lewat soket lokal (untuk server MCP `kanvas-mcp`).
     remote: Option<remote::Remote>,
     /// Pengaturan magic wand.
@@ -484,6 +486,7 @@ impl App {
             home: false,
             files: home::Files::new(&cc.egui_ctx),
             rembg: None,
+            exporting: None,
             remote: None,
             icons: Default::default(),
             photos: Default::default(),
