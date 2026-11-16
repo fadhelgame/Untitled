@@ -151,7 +151,11 @@ impl App {
                         sub(ui, "Corner radius");
                         let dv = ui.add_sized([half, 28.0], egui::DragValue::new(&mut n.radius).speed(0.5).range(0.0..=2000.0).max_decimals(1));
                         if n.kind == Kind::Path {
-                            dv.on_hover_text("Rounds the sharp corners of this vector. The anchor points stay editable.");
+                            // Angka di panel berlaku untuk semua sudut: jari-jari per sudut dihapus.
+                            if dv.changed() {
+                                n.clear_corner_radii();
+                            }
+                            dv.on_hover_text("Rounds every sharp corner of this vector. Drag a corner widget on the canvas instead; hold Alt to round one corner only.");
                         }
                     });
                 }
@@ -503,6 +507,7 @@ impl App {
             }
             if n.radius != before.radius && matches!(t.kind, Kind::Rect | Kind::Image | Kind::Path) {
                 t.radius = n.radius;
+                t.clear_corner_radii();
             }
             if paint {
                 t.fill = n.fill;

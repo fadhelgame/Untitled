@@ -35,7 +35,7 @@ pub(super) fn points(o: &Options) -> Vec<PathPoint> {
         (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
     }
     let (w, h) = ((x1 - x0).max(1e-6), (y1 - y0).max(1e-6));
-    raw.into_iter().map(|(x, y)| PathPoint { x: (x - x0) / w, y: (y - y0) / h, hin: [0.0, 0.0], hout: [0.0, 0.0] }).collect()
+    raw.into_iter().map(|(x, y)| PathPoint { x: (x - x0) / w, y: (y - y0) / h, hin: [0.0, 0.0], hout: [0.0, 0.0], r: None }).collect()
 }
 
 impl App {

@@ -215,6 +215,9 @@ pub struct PathPoint {
     pub y: f32,
     pub hin: [f32; 2],
     pub hout: [f32; 2],
+    /// Jari-jari sudut khusus titik ini (satuan dunia). `None` = ikut `Node::radius`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r: Option<f32>,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -704,10 +707,19 @@ impl Node {
     /// corners: titik aslinya tidak berubah, pembulatan hanya diterapkan saat digambar / diekspor.
     /// Yang dibulatkan: titik tanpa pegangan di antara dua ruas lurus. Tiap sudut paling jauh
     /// memakan setengah ruas kalau ujung ruas satunya juga dibulatkan (seluruh ruas kalau tidak).
+    /// Titik boleh punya jari-jari sendiri (`PathPoint::r`).
+    /// Hapus jari-jari khusus per titik, sehingga semua sudut kembali mengikuti `radius`.
+    pub fn clear_corner_radii(&mut self) {
+        for q in self.points.iter_mut().chain(self.holes.iter_mut().flatten()) {
+            q.r = None;
+        }
+    }
+
     pub fn rounded_points(&self, points: &[PathPoint], closed: bool) -> Vec<PathPoint> {
         let n = points.len();
         let (w, h) = (self.w, self.h);
-        if self.kind != Kind::Path || self.radius <= 0.0 || n < 3 || w.abs() < 1e-3 || h.abs() < 1e-3 {
+        let radius = |i: usize| points[i].r.unwrap_or(self.radius).max(0.0);
+        if self.kind != Kind::Path || n < 3 || w.abs() < 1e-3 || h.abs() < 1e-3 || (0..n).all(|i| radius(i) <= 0.0) {
             return points.to_vec();
         }
         let zero = [0.0f32; 2];
@@ -717,7 +729,7 @@ impl Node {
         let mut out = Vec::with_capacity(n * 2);
         for i in 0..n {
             let p = points[i];
-            if !corner(i) {
+            if !corner(i) || radius(i) <= 0.0 {
                 out.push(p);
                 continue;
             }
@@ -737,14 +749,14 @@ impl Node {
                 continue;
             }
             let tan_half = ((1.0 - cos) / (1.0 + cos)).sqrt();
-            let limit = |len: f32, j: usize| if corner(j) { len * 0.5 } else { len };
+            let limit = |len: f32, j: usize| if corner(j) && radius(j) > 0.0 { len * 0.5 } else { len };
             // Jarak titik singgung dari sudut, lalu jari-jari yang benar-benar muat.
-            let t = (self.radius / tan_half).min(limit(l1, ia)).min(limit(l2, ib));
+            let t = (radius(i) / tan_half).min(limit(l1, ia)).min(limit(l2, ib));
             let r = t * tan_half;
             // Busur didekati satu bezier kubik.
             let k = 4.0 / 3.0 * ((std::f32::consts::PI - cos.acos()) / 4.0).tan() * r;
-            out.push(PathPoint { x: p.x + d1.0 * t / w, y: p.y + d1.1 * t / h, hin: zero, hout: [-d1.0 * k / w, -d1.1 * k / h] });
-            out.push(PathPoint { x: p.x + d2.0 * t / w, y: p.y + d2.1 * t / h, hin: [-d2.0 * k / w, -d2.1 * k / h], hout: zero });
+            out.push(PathPoint { x: p.x + d1.0 * t / w, y: p.y + d1.1 * t / h, hin: zero, hout: [-d1.0 * k / w, -d1.1 * k / h], r: None });
+            out.push(PathPoint { x: p.x + d2.0 * t / w, y: p.y + d2.1 * t / h, hin: [-d2.0 * k / w, -d2.1 * k / h], hout: zero, r: None });
         }
         out
     }
@@ -1865,7 +1877,7 @@ mod tests {
 
     #[test]
     fn path_radius_rounds_sharp_corners() {
-        let p = |x: f32, y: f32| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2] };
+        let p = |x: f32, y: f32| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2], r: None };
         let mut n = Node::new(1, Kind::Path, 0.0, 0.0);
         (n.w, n.h, n.closed) = (100.0, 60.0, true);
         n.points = vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)];
@@ -1882,6 +1894,15 @@ mod tests {
         n.radius = 500.0;
         let r = n.rounded_points(&n.points, true);
         assert!((r[0].y * 60.0 - 30.0).abs() < 1e-3 && (r[1].x * 100.0 - 30.0).abs() < 1e-3);
+        // Jari-jari per titik menang atas jari-jari node; 0 = sudut itu tetap tajam.
+        n.radius = 10.0;
+        n.points[2].r = Some(0.0);
+        n.points[3].r = Some(20.0);
+        let r = n.rounded_points(&n.points, true);
+        assert_eq!(r.len(), 7);
+        assert!((r[5].x * 100.0 - 20.0).abs() < 1e-3 && (r[6].y * 60.0 - 40.0).abs() < 1e-3, "{:?} {:?}", r[5], r[6]);
+        n.clear_corner_radii();
+        assert_eq!(n.rounded_points(&n.points, true).len(), 8);
         // Titik berpegangan (kurva) dan tetangganya tidak disentuh.
         n.points[0].hout = [0.1, 0.0];
         assert_eq!(n.rounded_points(&n.points, true).len(), 6);
@@ -1892,7 +1913,7 @@ mod tests {
         let mut n = Node::new(1, Kind::Path, 10.0, 10.0);
         n.w = 100.0;
         n.h = 100.0;
-        let p = |x, y| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2] };
+        let p = |x, y| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2], r: None };
         n.points = vec![p(0.0, 0.0), p(1.0, 0.0), p(0.0, 1.0)];
         n.closed = true;
         n.fill = Some([0, 0, 0, 255]);

@@ -712,6 +712,7 @@ impl App {
                     y: o.1 + num("y", p.get("y").unwrap_or(&Value::Null))?,
                     hin: handle("in")?,
                     hout: handle("out")?,
+                    r: None,
                 });
             }
             set_world_points(n, &pts);

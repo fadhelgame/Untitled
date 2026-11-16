@@ -21,6 +21,7 @@ fn to_world(n: &Node, pts: &[PathPoint]) -> Vec<PenPt> {
             y: n.y + p.y * n.h,
             hin: [p.hin[0] * n.w, p.hin[1] * n.h],
             hout: [p.hout[0] * n.w, p.hout[1] * n.h],
+            r: p.r,
         })
         .collect()
 }
@@ -96,7 +97,7 @@ pub fn geo(n: &Node) -> Geo {
 
 /// Tulis geometri dunia ke node. Rotasi node jadi 0 (sudah "dipanggang" ke titik-titiknya).
 pub fn set_geo(n: &mut Node, g: &Geo) {
-    let raw = |pts: &Vec<PenPt>| pts.iter().map(|q| PathPoint { x: q.x, y: q.y, hin: q.hin, hout: q.hout }).collect::<Vec<_>>();
+    let raw = |pts: &Vec<PenPt>| pts.iter().map(|q| PathPoint { x: q.x, y: q.y, hin: q.hin, hout: q.hout, r: q.r }).collect::<Vec<_>>();
     // Sementara w = h = 1 di (0,0), sehingga titik "ternormalisasi" = koordinat dunia.
     (n.x, n.y, n.w, n.h) = (0.0, 0.0, 1.0, 1.0);
     n.rotation = 0.0;
@@ -169,7 +170,7 @@ fn split(pts: &mut Vec<PenPt>, seg: usize, t: f32) {
     let (q0, q1, q2) = (lerp(p0, p1), lerp(p1, p2), lerp(p2, p3));
     let (r0, r1) = (lerp(q0, q1), lerp(q1, q2));
     let m = lerp(r0, r1);
-    let mut new = PenPt { x: m.0, y: m.1, hin: ZERO, hout: ZERO };
+    let mut new = PenPt { x: m.0, y: m.1, hin: ZERO, hout: ZERO, r: None };
     if !straight {
         pts[ia].hout = [q0.0 - p0.0, q0.1 - p0.1];
         pts[ib].hin = [q2.0 - p3.0, q2.1 - p3.1];
@@ -306,7 +307,7 @@ impl App {
                     let (dx, dy) = constrain45(x - last.x, y - last.y);
                     (x, y) = ((last.x + dx).round(), (last.y + dy).round());
                 }
-                pts.push(PenPt { x, y, hin: ZERO, hout: ZERO });
+                pts.push(PenPt { x, y, hin: ZERO, hout: ZERO, r: None });
                 self.ext.pen_drag = true;
             }
             PenHover::Continue { id, start } => {
@@ -491,7 +492,7 @@ impl App {
                 let (dx, dy) = constrain45(x - last.x, y - last.y);
                 (x, y) = (last.x + dx, last.y + dy);
             }
-            let target = if closing { pts[0] } else { PenPt { x, y, hin: ZERO, hout: ZERO } };
+            let target = if closing { pts[0] } else { PenPt { x, y, hin: ZERO, hout: ZERO, r: None } };
             painter.add(curve(last, &target, Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.6))));
         }
         for (i, q) in pts.iter().enumerate() {
@@ -869,7 +870,7 @@ mod tests {
     use super::*;
 
     fn pt(x: f32, y: f32) -> PenPt {
-        PenPt { x, y, hin: ZERO, hout: ZERO }
+        PenPt { x, y, hin: ZERO, hout: ZERO, r: None }
     }
 
     #[test]
@@ -895,8 +896,8 @@ mod tests {
     #[test]
     fn split_keeps_the_curve_shape() {
         let mut pts = vec![
-            PenPt { x: 0.0, y: 0.0, hin: ZERO, hout: [30.0, -40.0] },
-            PenPt { x: 100.0, y: 0.0, hin: [-30.0, -40.0], hout: ZERO },
+            PenPt { x: 0.0, y: 0.0, hin: ZERO, hout: [30.0, -40.0], r: None },
+            PenPt { x: 100.0, y: 0.0, hin: [-30.0, -40.0], hout: ZERO, r: None },
         ];
         let before = bezier(&pts[0], &pts[1], 0.5);
         split(&mut pts, 0, 0.5);

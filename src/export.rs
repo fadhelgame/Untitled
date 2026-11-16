@@ -828,7 +828,7 @@ mod tests {
         let mut n = Node::new(doc.alloc_id(), Kind::Path, 0.0, 0.0);
         n.w = 100.0;
         n.h = 100.0;
-        let p = |x, y| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2] };
+        let p = |x, y| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2], r: None };
         n.points = vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)];
         n.closed = true;
         n.fill = Some([0, 0, 0, 255]);

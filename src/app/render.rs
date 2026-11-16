@@ -29,6 +29,8 @@ pub struct PenPt {
     pub y: f32,
     pub hin: [f32; 2],
     pub hout: [f32; 2],
+    /// Jari-jari sudut khusus titik ini (lihat `PathPoint::r`).
+    pub r: Option<f32>,
 }
 
 /// Mode edit titik untuk satu path.

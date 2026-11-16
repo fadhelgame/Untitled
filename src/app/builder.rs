@@ -627,7 +627,7 @@ fn fit_closed(poly: &[P2]) -> Vec<PenPt> {
         p.pop();
     }
     let m = p.len();
-    let corner_pt = |q: P2| PenPt { x: q.0 as f32, y: q.1 as f32, hin: [0.0; 2], hout: [0.0; 2] };
+    let corner_pt = |q: P2| PenPt { x: q.0 as f32, y: q.1 as f32, hin: [0.0; 2], hout: [0.0; 2], r: None };
     if m < 3 {
         return p.into_iter().map(corner_pt).collect();
     }

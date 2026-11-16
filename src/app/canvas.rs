@@ -262,6 +262,7 @@ impl App {
         }
         self.paint_pen(&painter, inp.pos, inp.mods.shift);
         self.paint_path_edit(&painter, inp.pos);
+        self.paint_corners(&painter, inp.pos.filter(|_| hovered));
         if self.tool == Tool::ShapeBuilder {
             self.paint_builder(&painter, inp.pos.filter(|_| hovered && idle && !space), inp.mods.alt);
         }
@@ -612,6 +613,7 @@ impl App {
             Drag::TextBox { cur, .. } => *cur = wp,
             Drag::Gradient { id, part, .. } => self.grad_drag(*id, *part, p, inp.mods.shift),
             Drag::Crop { part, start, geom } => self.crop_drag(*part, *start, *geom, wp, inp.mods.shift),
+            Drag::Corner { id, at, single, r0, s0 } => self.corner_drag(*id, *at, *single, *r0, *s0, wp),
             Drag::Move { start, applied, moved, dup } => {
                 let t = wp - *start;
                 if *moved || t.length() * z > 3.0 {
@@ -951,6 +953,10 @@ impl App {
                         let (orig, scale) = (self.selected_nodes(), self.tool == Tool::Scale);
                         self.drag = Drag::MultiResize { handle, bounds, start: wp, orig, scale };
                     }
+                } else if let Some((id, at, r0, s0)) = self.corner_hit(p) {
+                    // Widget sudut vector: tarik = semua sudut, Alt+tarik = sudut itu saja.
+                    self.pre_drag = Some(self.doc.clone());
+                    self.drag = Drag::Corner { id, at, single: inp.mods.alt, r0, s0 };
                 } else if let Some(id) = self.rotate_zone(p) {
                     // Tarik dari luar sudut: putar terhadap pusat objek.
                     if let Some((cx, cy, orig)) = self.doc.find(id).map(|n| (n.center().0, n.center().1, n.rotation)) {
@@ -1064,6 +1070,12 @@ impl App {
                     self.push_undo(pre);
                 }
             }
+            Drag::Corner { id, .. } => {
+                let changed = pre.as_ref().is_some_and(|d| d.find(id) != self.doc.find(id));
+                if let (true, Some(pre)) = (changed, pre) {
+                    self.push_undo(pre);
+                }
+            }
             Drag::Gradient { id, orig, .. } => {
                 let changed = self.doc.find(id).is_some_and(|n| n.gradient.as_ref() != Some(&orig));
                 if let (true, Some(pre)) = (changed, pre) {
@@ -1163,7 +1175,7 @@ impl App {
             .map(|i| {
                 let a = std::f32::consts::PI * (i as f32 / 5.0 - 0.5);
                 let r = if i % 2 == 0 { 0.5 } else { 0.21 };
-                PathPoint { x: 0.5 + r * a.cos(), y: 0.5 + r * a.sin(), hin: [0.0; 2], hout: [0.0; 2] }
+                PathPoint { x: 0.5 + r * a.cos(), y: 0.5 + r * a.sin(), hin: [0.0; 2], hout: [0.0; 2], r: None }
             })
             .collect();
         star.closed = true;
@@ -1173,7 +1185,7 @@ impl App {
 
         let mut wave = Node::new(self.doc.alloc_id(), Kind::Path, fx + 900.0, fy + 60.0);
         (wave.w, wave.h) = (250.0, 160.0);
-        let curve = |x: f32, y: f32, hx: f32, hy: f32| PathPoint { x, y, hin: [-hx, -hy], hout: [hx, hy] };
+        let curve = |x: f32, y: f32, hx: f32, hy: f32| PathPoint { x, y, hin: [-hx, -hy], hout: [hx, hy], r: None };
         wave.points = vec![curve(0.0, 0.5, 0.15, -0.6), curve(0.5, 0.5, 0.15, 0.6), curve(1.0, 0.5, 0.15, -0.6)];
         wave.stroke = Some([20, 174, 92, 255]);
         wave.stroke_w = 6.0;

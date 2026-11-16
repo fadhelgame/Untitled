@@ -12,6 +12,7 @@ mod assist;
 pub(crate) mod blend;
 mod builder;
 mod canvas;
+mod corners;
 mod crop;
 mod home;
 mod icons;
@@ -168,6 +169,9 @@ fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
         shadow.blur *= s;
     }
     n.radius *= s;
+    for q in n.points.iter_mut().chain(n.holes.iter_mut().flatten()) {
+        q.r = q.r.map(|r| r * s);
+    }
     n.blur *= s;
     n.font_size = (n.font_size * s).max(1.0);
     for span in &mut n.spans {
@@ -271,6 +275,9 @@ enum Drag {
     Gradient { id: u64, part: usize, orig: crate::doc::Gradient },
     /// Mode crop gambar: menarik pegangan crop, pegangan gambar, atau gambarnya. `geom` = keadaan awal.
     Crop { part: crop::Part, start: Pos2, geom: crop::Geom },
+    /// Menarik widget sudut sebuah vector. `at` = (kontur, titik); `single` = hanya sudut itu (Alt);
+    /// `r0` / `s0` = jari-jari dan posisi pointer sepanjang garis bagi saat mulai menarik.
+    Corner { id: u64, at: (usize, usize), single: bool, r0: f32, s0: f32 },
 }
 
 struct Inp {
@@ -1991,6 +1998,27 @@ impl App {
                         }
                     }
                     self.sel = ids.into_iter().take(1).collect();
+                }
+                // `KANVAS_BENCH_CORNER=<piksel>`: pilih vector pertama di frame demo, lalu tarik widget
+                // sudut pertamanya ke dalam sejauh itu. Akhiran `,hold`: tombol tidak dilepas.
+                if let Ok(spec) = std::env::var("KANVAS_BENCH_CORNER") {
+                    let id = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter()).find(|c| c.kind == Kind::Path).map(|c| c.id);
+                    if let Some(b0) = id.and_then(|id| self.doc.find(id)).map(|n| n.aabb()) {
+                        self.sel = id.into_iter().collect();
+                        self.zoom_to((b0.0 - 60.0, b0.1 - 60.0, b0.2 + 60.0, b0.3 + 60.0), 8.0);
+                        // Tarik widget sudut pertama menuju pusat vector.
+                        let px: f32 = spec.split(',').next().and_then(|s| s.parse().ok()).unwrap_or(30.0);
+                        if let Some(p) = self.bench_corner() {
+                            let mid = self.view.to_screen(self.canvas_rect.min, (b0.0 + b0.2) * 0.5, (b0.1 + b0.3) * 0.5);
+                            let to = p + (mid - p).normalized() * px;
+                            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                            let mv = egui::Event::PointerMoved;
+                            b_inject(&mut b.inject, &[(200, mv(p)), (202, button(p, true)), (204, mv(p + (to - p) * 0.5)), (206, mv(to))]);
+                            if !spec.ends_with("hold") {
+                                b_inject(&mut b.inject, &[(208, button(to, false)), (210, mv(to + vec2(60.0, 60.0)))]);
+                            }
+                        }
+                    }
                 }
                 // `KANVAS_BENCH_TAGS=x,y`: buka frame demo di panel layer, group dua isinya, beri warna
                 // penanda ke beberapa layer, lalu klik kanan di (x,y) supaya menu warnanya ikut tampil.
