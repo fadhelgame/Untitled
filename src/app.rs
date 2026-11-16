@@ -302,6 +302,8 @@ struct Bench {
     mark: u32,
     /// Event pointer buatan untuk menguji interaksi mouse: (frame, event).
     inject: Vec<(u32, egui::Event)>,
+    /// Id node yang dipakai skenario uji yang berjalan lintas frame.
+    ids: Vec<u64>,
     /// Jarak waktu antar frame (ms) selama fase zoom/pan: menunjukkan refresh rate yang benar-benar dicapai.
     intervals: Vec<f32>,
     last: Option<std::time::Instant>,
@@ -438,7 +440,7 @@ impl App {
             wand: Default::default(),
             font_focus: false,
             ext: Default::default(),
-            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new(), intervals: Vec::new(), last: None }),
+            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new(), ids: Vec::new(), intervals: Vec::new(), last: None }),
             home: false,
             files: home::Files::new(&cc.egui_ctx),
             rembg: None,
@@ -2175,6 +2177,34 @@ impl App {
                 let _ = target;
             }
             _ => {
+                // `KANVAS_BENCH_TEXTUNDO=1`: ketik di satu teks, pindah ke teks lain, ketik, lalu Ctrl+Z.
+                // Yang ter-undo harus ketikan di teks kedua saja; hasilnya dicetak ke stderr.
+                if std::env::var("KANVAS_BENCH_TEXTUNDO").is_ok() {
+                    let find = |app: &Self, name: &str| app.doc.nodes.iter().flat_map(|n| n.children.iter()).find(|c| c.name == name).map(|c| c.id);
+                    match b.frame {
+                        200 => {
+                            b.ids = [find(self, "Headline"), find(self, "Paragraph")].into_iter().flatten().collect();
+                            if let Some(id) = b.ids.first().copied() {
+                                let before: Vec<String> = b.ids.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.text.clone()).collect();
+                                eprintln!("TEXTUNDO before: {before:?}");
+                                self.start_text_edit(id, self.doc.clone());
+                            }
+                            let key = egui::Event::Key { key: Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers { ctrl: true, command: true, ..Default::default() } };
+                            b.inject.extend([(206, egui::Event::Text("AAA".into())), (228, egui::Event::Text("BBB".into())), (236, key)]);
+                        }
+                        214 => self.finish_text_edit(),
+                        220 => {
+                            if let Some(id) = b.ids.get(1).copied() {
+                                self.start_text_edit(id, self.doc.clone());
+                            }
+                        }
+                        232 | 244 => {
+                            let now: Vec<String> = b.ids.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.text.clone()).collect();
+                            eprintln!("TEXTUNDO frame {}: {now:?}", b.frame);
+                        }
+                        _ => {}
+                    }
+                }
                 if b.frame == 240 && std::env::var("KANVAS_BENCH_OVERLAY").is_ok() {
                     self.edit_selected(|n| n.fill = Some([0, 102, 227, 255]));
                 }

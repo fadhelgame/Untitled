@@ -372,6 +372,13 @@ impl App {
         if first {
             self.ext.edit_sel = None;
             self.ext.edit_drag = false;
+            // Riwayat undo `TextEdit` tersimpan per id widget, dan id itu dipakai semua teks. Tanpa
+            // dikosongkan, Ctrl+Z di sini mengembalikan isi teks lain yang diedit sebelumnya.
+            let widget_id = egui::Id::new("kanvas_text_edit_widget");
+            if let Some(mut state) = egui::TextEdit::load_state(ctx, widget_id) {
+                state.clear_undoer();
+                state.store(ctx, widget_id);
+            }
         }
         let o = self.canvas_rect.min;
         let z = self.view.zoom;
