@@ -141,6 +141,7 @@ impl App {
             measures: Vec::new(),
             drawn: 0,
             capture: None,
+            skip_shadow: false,
         };
         self.labels.clear();
         let (labels, sel, view) = (&mut self.labels, &self.sel, self.view);
@@ -272,7 +273,7 @@ impl App {
         if hovered || !idle {
             let icon = match (&self.drag, self.tool) {
                 (Drag::Pan, _) => CursorIcon::Grabbing,
-                (Drag::Rotate { .. }, _) => CursorIcon::None,
+                (Drag::Rotate { .. } | Drag::MultiRotate { .. }, _) => CursorIcon::None,
                 _ if space => CursorIcon::Grab,
                 (_, Tool::Hand) => CursorIcon::Grab,
                 (_, Tool::Text) => CursorIcon::Text,
@@ -295,7 +296,7 @@ impl App {
                     },
                     Some(_) => CursorIcon::Crosshair,
                     // Tepat di luar sudut: zona putar.
-                    None if inp.pos.is_some_and(|p| self.rotate_zone(p).is_some()) => CursorIcon::None,
+                    None if inp.pos.is_some_and(|p| self.rotate_zone(p).is_some() || self.multi_rotate_zone(p).is_some()) => CursorIcon::None,
                     None => CursorIcon::Default,
                 },
                 _ => CursorIcon::Crosshair,
@@ -878,6 +879,22 @@ impl App {
                     n.rotation = (rot * 10.0).round() / 10.0;
                 }
             }
+            Drag::MultiRotate { center, start, orig, angle } => {
+                let mut rot = (wp.y - center.y).atan2(wp.x - center.x).to_degrees() - *start;
+                if inp.mods.shift {
+                    rot = (rot / 15.0).round() * 15.0;
+                }
+                rot = (rot + 180.0).rem_euclid(360.0) - 180.0;
+                *angle = (rot * 10.0).round() / 10.0;
+                // Selalu dihitung dari keadaan awal, jadi posisi tidak bergeser sedikit demi sedikit.
+                for node in orig.iter() {
+                    let mut n = node.clone();
+                    spin_node(&mut n, (center.x, center.y), *angle);
+                    if let Some(slot) = self.doc.find_mut(n.id) {
+                        *slot = n;
+                    }
+                }
+            }
             Drag::Marquee { start, base } => {
                 let mut sel = base.clone();
                 for id in self.marquee_pick(*start, wp) {
@@ -971,6 +988,11 @@ impl App {
                         self.pre_drag = Some(self.doc.clone());
                         self.drag = Drag::Rotate { id, center: pos2(cx, cy), start, orig };
                     }
+                } else if let Some(center) = self.multi_rotate_zone(p) {
+                    // Beberapa objek / group: putar bersama terhadap pusat kotak seleksi.
+                    let start = (wp.y - center.y).atan2(wp.x - center.x).to_degrees();
+                    self.pre_drag = Some(self.doc.clone());
+                    self.drag = Drag::MultiRotate { center, start, orig: self.selected_nodes(), angle: 0.0 };
                 } else if let Some(id) = self.hit(p, wp, tol).filter(|_| !inp.mods.command) {
                     // Anggota group dipilih bersama seluruh group-nya.
                     let members = self.with_group(id);
@@ -1095,7 +1117,7 @@ impl App {
                     self.push_undo(pre);
                 }
             }
-            Drag::MultiResize { orig, .. } => {
+            Drag::MultiResize { orig, .. } | Drag::MultiRotate { orig, .. } => {
                 let changed = orig.iter().any(|o| self.doc.find(o.id) != Some(o));
                 if let (true, Some(pre)) = (changed, pre) {
                     self.push_undo(pre);

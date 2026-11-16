@@ -217,9 +217,46 @@ fn stretch_node(n: &mut Node, (x0, y0): (f32, f32), (nx, ny): (f32, f32), (sx, s
     }
 }
 
+/// Putar node sebesar `deg` derajat terhadap titik `pivot` (memutar beberapa objek bersama):
+/// pusat node ikut berpindah mengelilingi pivot, dan rotasinya sendiri bertambah.
+fn spin_node(n: &mut Node, (px, py): (f32, f32), deg: f32) {
+    use crate::doc::rotate;
+    let (cx, cy) = n.center();
+    if n.kind == Kind::Line {
+        // Garis disimpan sebagai dua ujung: ujungnya yang diputar, tanpa nilai rotasi.
+        let turn = |x: f32, y: f32| {
+            let (x, y) = rotate(x, y, cx, cy, n.rotation);
+            rotate(x, y, px, py, deg)
+        };
+        let (a, b) = (turn(n.x, n.y), turn(n.x + n.w, n.y + n.h));
+        (n.x, n.y, n.w, n.h, n.rotation) = (a.0, a.1, b.0 - a.0, b.1 - a.1, 0.0);
+        return;
+    }
+    let (nx, ny) = rotate(cx, cy, px, py, deg);
+    n.translate(nx - cx, ny - cy);
+    let rot = (n.rotation + deg + 180.0).rem_euclid(360.0) - 180.0;
+    n.rotation = (rot * 10.0).round() / 10.0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinning_a_selection_orbits_the_pivot() {
+        let mut a = Node::new(1, Kind::Rect, 100.0, -10.0);
+        (a.w, a.h, a.rotation) = (40.0, 20.0, 30.0);
+        spin_node(&mut a, (0.0, 0.0), 90.0);
+        // Pusat (120, 0) berputar 90° searah jarum jam di layar → (0, 120); ukuran tetap.
+        let (cx, cy) = a.center();
+        assert!(cx.abs() < 1e-3 && (cy - 120.0).abs() < 1e-3, "center at ({cx}, {cy})");
+        assert_eq!((a.w, a.h, a.rotation), (40.0, 20.0, 120.0));
+        let mut line = Node::new(2, Kind::Line, 10.0, 0.0);
+        (line.w, line.h) = (10.0, 0.0);
+        spin_node(&mut line, (0.0, 0.0), 90.0);
+        assert!(line.x.abs() < 1e-3 && (line.y - 10.0).abs() < 1e-3 && line.w.abs() < 1e-3 && (line.h - 10.0).abs() < 1e-3);
+        assert_eq!(line.rotation, 0.0);
+    }
 
     #[test]
     fn stretch_keeps_layout_inside_the_selection_box() {
@@ -269,6 +306,9 @@ enum Drag {
     MultiResize { handle: u8, bounds: (f32, f32, f32, f32), start: Pos2, orig: Vec<Node>, scale: bool },
     TextBox { start: Pos2, cur: Pos2 },
     Rotate { id: u64, center: Pos2, start: f32, orig: f32 },
+    /// Memutar beberapa objek (mis. satu group) bersama terhadap `center`. `orig` = node asli,
+    /// `angle` = sudut putar saat ini (derajat) sejak mulai menarik.
+    MultiRotate { center: Pos2, start: f32, orig: Vec<Node>, angle: f32 },
     Marquee { start: Pos2, base: Vec<u64> },
     Create { id: u64, start: Pos2 },
     /// Menarik pegangan gradasi di canvas: 0/1 = ujung garis, 2+i = stop ke-i.
@@ -1952,6 +1992,29 @@ impl App {
                     let at = pos2(ctx.screen_rect().right() - 150.0, 500.0);
                     let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -900.0), modifiers: Default::default() };
                     b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, wheel.clone()), (212, wheel)]);
+                }
+                // `KANVAS_BENCH_GROUPFX=<derajat>`: group dua isi frame demo, beri bayangan bersama,
+                // lalu putar group-nya dengan menarik dari luar sudut kotak seleksi.
+                if let Ok(deg) = std::env::var("KANVAS_BENCH_GROUPFX") {
+                    let kids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
+                    if kids.len() > 2 {
+                        self.sel = vec![kids[1], kids[2]];
+                        self.group_selection();
+                        self.edit_selected(|n| n.shadow = Some(crate::doc::Shadow { x: 10.0, y: 14.0, blur: 10.0, color: [0, 0, 0, 150] }));
+                        if let Some(b0) = self.sel_box() {
+                            self.zoom_to((b0.0 - 80.0, b0.1 - 80.0, b0.2 + 80.0, b0.3 + 80.0), 8.0);
+                            let o = self.canvas_rect.min;
+                            let mid = self.view.to_screen(o, (b0.0 + b0.2) * 0.5, (b0.1 + b0.3) * 0.5);
+                            let from = self.view.to_screen(o, b0.2, b0.1) + vec2(12.0, -12.0);
+                            let turn = |f: f32| {
+                                let (x, y) = crate::doc::rotate(from.x, from.y, mid.x, mid.y, deg.parse::<f32>().unwrap_or(30.0) * f);
+                                pos2(x, y)
+                            };
+                            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                            let mv = egui::Event::PointerMoved;
+                            b_inject(&mut b.inject, &[(214, mv(from)), (216, button(from, true)), (218, mv(turn(0.5))), (220, mv(turn(1.0))), (222, button(turn(1.0), false))]);
+                        }
+                    }
                 }
                 // `KANVAS_BENCH_BLUR=1`: layer blur di frame demo — satu kotak, satu group (elips +
                 // bintang, buram sebagai satu gambar), teks, alas clipping mask, dan objek ber-blend.

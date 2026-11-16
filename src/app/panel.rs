@@ -368,7 +368,9 @@ impl App {
         let mixed_fill = !all(&|n| n.fill == first.fill && n.gradient == first.gradient);
         let mixed_stroke = !all(&|n| n.stroke == first.stroke && n.stroke_w == first.stroke_w);
         let mixed_look = !all(&|n| n.opacity == first.opacity && n.blend == first.blend && n.radius == first.radius);
-        let mixed_blur = !all(&|n| n.blur == first.blur);
+        let mixed_blur = !all(&|n| n.blur == first.blur && n.shadow == first.shadow);
+        // Frame tidak bisa diputar.
+        let spinnable = all(&|n| n.kind != Kind::Frame);
         let title = if same_kind { format!("{} × {}", first.kind.label(), nodes.len()) } else { "Design".to_owned() };
         let mut n = (*first).clone();
         n.children.clear();
@@ -401,12 +403,20 @@ impl App {
             if let Some(mode) = align_buttons(ui) {
                 align = Some(mode);
             }
+            let half = (ui.available_width() - 8.0) / 2.0;
+            if spinnable {
+                sub(ui, "Rotation");
+                ui.add_sized(
+                    [half, 28.0],
+                    egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
+                )
+                .on_hover_text("Rotates the selection together around its center. Or drag just outside a corner of the selection box (Shift = 15° steps)");
+            }
 
             section(ui, "Appearance");
             if mixed_look {
                 ui.weak(MIXED);
             }
-            let half = (ui.available_width() - 8.0) / 2.0;
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     sub(ui, "Opacity");
@@ -458,13 +468,13 @@ impl App {
                     );
                 }
             }
-            // Drop shadow hanya diatur per objek; untuk beberapa objek sekaligus hanya layer blur.
+            // Anggota satu group dengan bayangan yang sama berbayangan bersama (lihat `shadow_run`).
             effects_section(
                 ui,
                 &mut self.ext.picker,
                 key,
                 &mut n,
-                false,
+                true,
                 if mixed_blur { MIXED } else { "" },
                 if group.is_some() {
                     "Blurs the whole group as one layer."
@@ -493,9 +503,24 @@ impl App {
         self.last_prop = (undo_key, now);
         self.touch();
 
+        if n.rotation != before.rotation {
+            // Putar seleksi bersama terhadap titik tengah pusat-pusat objeknya (titik itu tidak
+            // berubah oleh putaran, jadi menggeser nilainya berulang kali tidak membuat objek hanyut).
+            let centers: Vec<(f32, f32)> = ids.iter().filter_map(|id| self.doc.find(*id)).map(|t| t.center()).collect();
+            let count = centers.len().max(1) as f32;
+            let pivot = (centers.iter().map(|c| c.0).sum::<f32>() / count, centers.iter().map(|c| c.1).sum::<f32>() / count);
+            for id in &ids {
+                if let Some(t) = self.doc.find_mut(*id) {
+                    super::spin_node(t, pivot, n.rotation - before.rotation);
+                }
+            }
+        }
         let paint = n.fill != before.fill || n.gradient != before.gradient;
         for id in ids {
             let Some(t) = self.doc.find_mut(id) else { continue };
+            if n.shadow != before.shadow {
+                t.shadow = n.shadow;
+            }
             if n.opacity != before.opacity {
                 t.opacity = n.opacity;
             }

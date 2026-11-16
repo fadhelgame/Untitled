@@ -218,6 +218,10 @@ enum Fx {
     ShadowOnly,
     /// Seperti `Full` tapi tanpa blend mode: blend dipasang pembungkusnya (grup layer blur).
     NoBlend,
+    /// Objek tanpa bayangannya: bayangan digambar bersama untuk seluruh group.
+    NoShadow,
+    /// Hanya bentuknya (tanpa bayangan dan blend), sebagai sumber siluet bayangan group.
+    Shape,
 }
 
 /// Potongan daftar saudara: node biasa ditulis apa adanya, rangkaian ber-layer-blur dibungkus
@@ -228,6 +232,12 @@ fn run_svg<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, fonts
         let end = crate::doc::blur_run(nodes, i);
         if nodes[i].as_ref().blur > 0.0 {
             blur_group(out, &nodes[i..end], assets, fonts, ctx, true);
+            i = end;
+            continue;
+        }
+        let end = crate::doc::shadow_run(nodes, i);
+        if end > i + 1 {
+            shadow_group(out, &nodes[i..end], assets, fonts, ctx, false);
         } else {
             node_fx(out, nodes[i].as_ref(), assets, fonts, ctx, Fx::Full);
         }
@@ -307,15 +317,17 @@ fn shadow_pad(n: &Node, s: &Shadow) -> f32 {
 fn shadow_filter(out: &mut String, n: &Node, s: &Shadow) -> String {
     let (x0, y0, x1, y1) = n.bounds();
     let pad = shadow_pad(n, s);
+    filter_def(out, &format!("sh{}", n.id), (x0 - pad, y0 - pad, x1 + pad, y1 + pad), s)
+}
+
+/// `<filter>` drop shadow ber-id `id` yang mencakup `area`; hasilnya atribut `filter`-nya.
+fn filter_def(out: &mut String, id: &str, (x0, y0, x1, y1): (f32, f32, f32, f32), s: &Shadow) -> String {
     let [r, g, b, a] = s.color;
     let _ = write!(
         out,
-        r#"<filter id="sh{}" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}" color-interpolation-filters="sRGB">"#,
-        n.id,
-        x0 - pad,
-        y0 - pad,
-        x1 - x0 + pad * 2.0,
-        y1 - y0 + pad * 2.0
+        r#"<filter id="{id}" filterUnits="userSpaceOnUse" x="{x0}" y="{y0}" width="{}" height="{}" color-interpolation-filters="sRGB">"#,
+        x1 - x0,
+        y1 - y0
     );
     // Blur 0 = bayangan tajam: tanpa feGaussianBlur.
     let source = if s.blur >= 0.01 {
@@ -332,7 +344,49 @@ fn shadow_filter(out: &mut String, n: &Node, s: &Shadow) -> String {
         a as f32 / 255.0
     );
     out.push_str("</filter>");
-    format!(r#" filter="url(#sh{})""#, n.id)
+    format!(r#" filter="url(#{id})""#)
+}
+
+/// Area dunia yang dicakup bayangan satu rangkaian (`shadow_run`), termasuk luberannya.
+/// `None`: tidak ada bayangan, atau tidak ada anggota yang terlihat.
+pub fn shadow_region<T: AsRef<Node>>(nodes: &[T]) -> Option<(f32, f32, f32, f32)> {
+    let s = nodes.first()?.as_ref().shadow.filter(|s| s.color[3] > 0)?;
+    let mut area: Option<(f32, f32, f32, f32)> = None;
+    for n in nodes.iter().map(|n| n.as_ref()).filter(|n| n.visible) {
+        let (b, pad) = (n.aabb(), shadow_pad(n, &s));
+        let b = (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad);
+        area = Some(area.map_or(b, |a| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))));
+    }
+    area
+}
+
+/// Anggota group dengan bayangan bersama: siluet gabungannya dibayangi sekali, di bawah semua
+/// anggota. Arah bayangan mengikuti dokumen (tidak ikut rotasi tiap anggota).
+/// `only`: tulis bayangannya saja (tekstur bayangan di canvas).
+fn shadow_group<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context, only: bool) {
+    let first = nodes[0].as_ref();
+    let (Some(s), Some(area)) = (first.shadow, shadow_region(nodes)) else {
+        for n in nodes {
+            node_fx(out, n.as_ref(), assets, fonts, ctx, Fx::NoShadow);
+        }
+        return;
+    };
+    let filter = filter_def(out, &format!("gsf{}", first.id), area, &s);
+    if only {
+        let _ = write!(out, "<g{filter}>");
+        for n in nodes {
+            node_fx(out, n.as_ref(), assets, fonts, ctx, Fx::Shape);
+        }
+        out.push_str("</g>");
+        return;
+    }
+    // Anggota ditulis sekali lalu dipakai dua kali (lihat `node_fx`): salinan berfilter untuk
+    // bayangan, dan aslinya di atasnya.
+    let _ = write!(out, r#"<defs><g id="gs{}">"#, first.id);
+    for n in nodes {
+        node_fx(out, n.as_ref(), assets, fonts, ctx, Fx::NoShadow);
+    }
+    let _ = write!(out, r##"</g></defs><use href="#gs{id}"{filter}/><use href="#gs{id}"/>"##, id = first.id);
 }
 
 /// Untuk tekstur bayangan: objek yang bentuknya pasti kotak penuh cukup diwakili satu `<rect>`
@@ -353,7 +407,7 @@ fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager,
     if !n.visible {
         return;
     }
-    let shadow = n.shadow.filter(|s| s.color[3] > 0);
+    let shadow = n.shadow.filter(|s| s.color[3] > 0 && !matches!(fx, Fx::NoShadow | Fx::Shape));
     if fx == Fx::ShadowOnly && shadow.is_none() {
         return;
     }
@@ -366,24 +420,27 @@ fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager,
         let (cx, cy) = n.center();
         let _ = write!(attrs, r#" transform="rotate({} {cx} {cy})""#, n.rotation);
     }
-    if n.blend != 0 && fx == Fx::Full {
+    if n.blend != 0 && matches!(fx, Fx::Full | Fx::NoShadow) {
         let _ = write!(attrs, r#" style="mix-blend-mode:{}""#, blend::CSS[(n.blend as usize).min(blend::CSS.len() - 1)]);
     }
     let filter = shadow.map(|s| shadow_filter(out, n, &s));
     if !attrs.is_empty() {
         let _ = write!(out, "<g{attrs}>");
     }
+    // Sumber siluet bayangan: kotak penuh cukup diwakili satu `<rect>`.
+    let shape = |out: &mut String, fonts: &mut FontManager| match solid_box(n, assets) {
+        Some(r) => {
+            let (x0, y0, x1, y1) = n.bounds();
+            let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{}" height="{}" rx="{r}"/>"#, x1 - x0, y1 - y0);
+        }
+        None => node_inner(out, n, assets, fonts, ctx),
+    };
     match (&filter, fx) {
+        (None, Fx::Shape) => shape(out, fonts),
         (None, _) => node_inner(out, n, assets, fonts, ctx),
         (Some(filter), Fx::ShadowOnly) => {
             let _ = write!(out, "<g{filter}>");
-            match solid_box(n, assets) {
-                Some(r) => {
-                    let (x0, y0, x1, y1) = n.bounds();
-                    let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{}" height="{}" rx="{r}"/>"#, x1 - x0, y1 - y0);
-                }
-                None => node_inner(out, n, assets, fonts, ctx),
-            }
+            shape(out, fonts);
             out.push_str("</g>");
         }
         // Objek ditulis sekali lalu dipakai dua kali: salinan berfilter untuk bayangan, dan objek
@@ -400,16 +457,16 @@ fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager,
     }
 }
 
-/// SVG yang hanya berisi bayangan satu node, untuk tekstur bayangan di canvas.
-/// Hasil: (svg, area dunia yang dicakup).
-pub fn shadow_svg(n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32))> {
-    let s = n.shadow.filter(|s| s.color[3] > 0 && n.visible)?;
-    let pad = shadow_pad(n, &s);
-    let b = n.aabb();
-    let region = (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad);
+/// SVG yang hanya berisi bayangan satu rangkaian (satu node, atau anggota group yang berbayangan
+/// bersama), untuk tekstur bayangan di canvas. Hasil: (svg, area dunia yang dicakup).
+pub fn shadow_svg<T: AsRef<Node>>(nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32))> {
+    let region = shadow_region(nodes)?;
     let (w, h) = (region.2 - region.0, region.3 - region.1);
     let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{} {} {w} {h}">"#, region.0, region.1);
-    node_fx(&mut out, n, assets, fonts, ctx, Fx::ShadowOnly);
+    match nodes {
+        [n] => node_fx(&mut out, n.as_ref(), assets, fonts, ctx, Fx::ShadowOnly),
+        _ => shadow_group(&mut out, nodes, assets, fonts, ctx, true),
+    }
     out.push_str("</svg>");
     Some((out, region))
 }
@@ -817,6 +874,42 @@ mod tests {
         // Export satu node: kanvasnya dilebarkan supaya luberan blur tidak terpotong.
         let (_, w, _) = to_svg(&doc, Some(2), &mut fonts, &ctx).unwrap();
         assert_eq!(w, 50.0 + 2.0 * 31.0);
+    }
+
+    #[test]
+    fn group_members_cast_one_shared_shadow() {
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        let mut doc = Doc::default();
+        let mut bg = Node::new(doc.alloc_id(), Kind::Rect, 0.0, 0.0);
+        (bg.w, bg.h, bg.fill) = (300.0, 200.0, Some([255, 255, 255, 255]));
+        doc.insert(bg, None);
+        // Kotak abu besar dan kotak hitam kecil di atasnya, satu group, bayangan tajam 20 px ke kanan.
+        let shadow = Some(Shadow { x: 20.0, y: 0.0, blur: 0.0, color: [255, 0, 0, 255] });
+        for (x, y, side, gray) in [(50.0, 50.0, 100.0, 200), (100.0, 80.0, 20.0, 0)] {
+            let mut r = Node::new(doc.alloc_id(), Kind::Rect, x, y);
+            (r.w, r.h, r.fill, r.group, r.shadow) = (side, side, Some([gray, gray, gray, 255]), 7, shadow);
+            doc.insert(r, None);
+        }
+        assert_eq!(crate::doc::shadow_run(&doc.nodes, 0), 1);
+        assert_eq!(crate::doc::shadow_run(&doc.nodes, 1), 3);
+        let (svg, w, h) = to_svg(&doc, None, &mut fonts, &ctx).unwrap();
+        assert_eq!(svg.matches("<feOffset").count(), 1, "the group casts one shadow");
+        let (png, ..) = render_png(&svg, w, h, 1.0).unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        let at = |x: u32, y: u32| img.get_pixel(x, y).0;
+        // Bayangan siluet gabungan muncul di kanan kotak besar.
+        assert_eq!(at(160, 100), [255, 0, 0, 255]);
+        // Bayangan kotak kecil tidak jatuh di atas kotak besar (tepat di kanan kotak kecil).
+        assert_eq!(at(130, 90), [200, 200, 200, 255]);
+        assert_eq!(at(110, 90), [0, 0, 0, 255]);
+        // Tekstur canvas: hanya bayangannya, mencakup seluruh group.
+        let (only, region) = shadow_svg(&doc.nodes[1..3], &doc.assets, &mut fonts, &ctx).unwrap();
+        assert!(region.0 < 50.0 && region.2 > 170.0);
+        assert_eq!(only.matches("<rect").count(), 2);
+        // Anggota yang bayangannya berbeda keluar dari bayangan bersama.
+        doc.find_mut(3).unwrap().shadow = None;
+        assert_eq!(crate::doc::shadow_run(&doc.nodes, 1), 2);
     }
 
     #[test]

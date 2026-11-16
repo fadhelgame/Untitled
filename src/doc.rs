@@ -425,6 +425,20 @@ pub fn blur_run<T: AsRef<Node>>(nodes: &[T], i: usize) -> usize {
     j
 }
 
+/// Rangkaian drop shadow mulai dari `nodes[i]`: indeks akhirnya (eksklusif). Anggota group yang
+/// berurutan dengan bayangan yang sama membentuk satu bayangan bersama (siluet gabungan), jadi
+/// bayangan satu anggota tidak jatuh di atas anggota lain. Anggota ber-layer-blur tidak ikut.
+pub fn shadow_run<T: AsRef<Node>>(nodes: &[T], i: usize) -> usize {
+    let n = nodes[i].as_ref();
+    let mut j = i + 1;
+    if n.group != 0 && n.blur <= 0.0 && n.shadow.is_some_and(|s| s.color[3] > 0) {
+        while nodes.get(j).map(|m| m.as_ref()).is_some_and(|m| m.group == n.group && m.blur <= 0.0 && m.shadow == n.shadow) {
+            j += 1;
+        }
+    }
+    j
+}
+
 impl AsRef<Node> for Node {
     fn as_ref(&self) -> &Node {
         self

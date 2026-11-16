@@ -87,10 +87,11 @@ struct Detail {
     frame: u64,
 }
 
-/// Tekstur bayangan satu node. `node` = keadaan node saat dirender (untuk tahu kapan harus
+/// Tekstur bayangan satu rangkaian (satu node, atau anggota group yang berbayangan bersama);
+/// kuncinya id node pertama. `nodes` = keadaan node saat dirender (untuk tahu kapan harus
 /// dirender ulang), `scale` = piksel tekstur per satuan dokumen, `region` = area dunia yang dicakup.
 struct ShadowTex {
-    node: Node,
+    nodes: Vec<Node>,
     scale: f32,
     region: (f32, f32, f32, f32),
     /// Jumlah font yang bisa dipakai saat dirender: font yang baru selesai diunduh mengubah
@@ -100,7 +101,7 @@ struct ShadowTex {
     frame: u64,
 }
 
-type ShadowDone = (Node, usize, f32, (f32, f32, f32, f32), Result<ColorImage, String>);
+type ShadowDone = (Vec<Node>, usize, f32, (f32, f32, f32, f32), Result<ColorImage, String>);
 
 /// Tekstur satu rangkaian layer blur (satu node, atau anggota group yang buram bersama), sudah
 /// dalam keadaan buram. Arti field-nya sama dengan `ShadowTex`; kuncinya id node pertama.
@@ -299,15 +300,16 @@ impl Ext {
                 }
             }
         }
-        while let Ok((node, fonts, scale, region, result)) = self.sh_rx.try_recv() {
-            self.shadow_busy.remove(&node.id);
+        while let Ok((nodes, fonts, scale, region, result)) = self.sh_rx.try_recv() {
+            let Some(key) = nodes.first().map(|n| n.id) else { continue };
+            self.shadow_busy.remove(&key);
             match result {
                 Ok(image) => {
-                    let tex = ctx.load_texture(format!("shadow-{}", node.id), image, egui::TextureOptions::LINEAR);
-                    self.shadows.insert(node.id, ShadowTex { node, scale, region, fonts, tex, frame: self.frame });
+                    let tex = ctx.load_texture(format!("shadow-{key}"), image, egui::TextureOptions::LINEAR);
+                    self.shadows.insert(key, ShadowTex { nodes, scale, region, fonts, tex, frame: self.frame });
                 }
                 Err(_) => {
-                    self.shadow_failed.insert(node.id);
+                    self.shadow_failed.insert(key);
                 }
             }
         }
@@ -460,6 +462,8 @@ pub struct PaintCx<'a> {
     pub drawn: usize,
     /// Kalau ada: mesh node ditampung di sini, bukan digambar (dipakai clipping mask).
     pub capture: Option<Vec<egui::Mesh>>,
+    /// Node berikutnya tidak menggambar bayangannya sendiri: sudah digambar bersama group-nya.
+    pub skip_shadow: bool,
 }
 
 /// `mask`: siluet putih (hanya alpha) yang diwarnai lewat tint, untuk color overlay.
@@ -983,10 +987,12 @@ fn render_shadow(svg: &str, region: (f32, f32, f32, f32), scale: f32) -> Result<
     Ok(ColorImage::from_rgba_premultiplied([w as usize, h as usize], pixmap.data()))
 }
 
-/// Gambar drop shadow node (di bawah node itu sendiri). Bayangan dirasterkan di thread lain dari
-/// SVG yang sama dengan jalur export, lalu disimpan sebagai tekstur; selama versi baru belum jadi,
-/// tekstur lama tetap dipakai (digeser mengikuti node, jadi menggeser objek tetap mulus).
-fn shadow_layer(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32) {
+/// Gambar drop shadow satu rangkaian (di bawah node-nya): satu node, atau anggota group yang
+/// berbayangan bersama (`shadow_run`). Bayangan dirasterkan di thread lain dari SVG yang sama
+/// dengan jalur export, lalu disimpan sebagai tekstur; selama versi baru belum jadi, tekstur lama
+/// tetap dipakai (digeser mengikuti node, jadi menggeser objek tetap mulus).
+fn shadow_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[T], alpha: f32) {
+    let n = run[0].as_ref();
     let Some(shadow) = n.shadow.filter(|s| s.color[3] > 0) else { return };
     if pc.capture.is_some() {
         return;
@@ -997,22 +1003,24 @@ fn shadow_layer(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
     let fresh = pc.ext.shadows.get_mut(&n.id).is_some_and(|c| {
         c.frame = frame;
         let want = shadow_scale(shadow.blur, screen, (c.region.2 - c.region.0).max(c.region.3 - c.region.1));
-        c.node == *n && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
+        let same = c.nodes.len() == run.len() && c.nodes.iter().zip(run).all(|(a, b)| a == b.as_ref());
+        same && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
     });
     if !fresh && !pc.ext.shadow_busy.contains(&n.id) && !pc.ext.shadow_failed.contains(&n.id) {
-        if let Some((svg, region)) = crate::export::shadow_svg(n, pc.assets, pc.fonts, pc.ctx) {
+        if let Some((svg, region)) = crate::export::shadow_svg(run, pc.assets, pc.fonts, pc.ctx) {
             let scale = shadow_scale(shadow.blur, screen, (region.2 - region.0).max(region.3 - region.1));
             pc.ext.shadow_busy.insert(n.id);
-            let (tx, ctx, node) = (pc.ext.sh_tx.clone(), pc.ctx.clone(), n.clone());
+            let nodes: Vec<Node> = run.iter().map(|n| n.as_ref().clone()).collect();
+            let (tx, ctx) = (pc.ext.sh_tx.clone(), pc.ctx.clone());
             std::thread::spawn(move || {
                 let image = render_shadow(&svg, region, scale);
-                let _ = tx.send((node, fonts, scale, region, image));
+                let _ = tx.send((nodes, fonts, scale, region, image));
                 ctx.request_repaint();
             });
         }
     }
     if let Some(c) = pc.ext.shadows.get(&n.id) {
-        let (dx, dy) = (n.x - c.node.x, n.y - c.node.y);
+        let (dx, dy) = (n.x - c.nodes[0].x, n.y - c.nodes[0].y);
         let r = Rect::from_min_max(
             pc.view.to_screen(pc.o, c.region.0 + dx, c.region.1 + dy),
             pc.view.to_screen(pc.o, c.region.2 + dx, c.region.3 + dy),
@@ -1136,8 +1144,23 @@ fn paint_run<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, nodes: &
         let end = crate::doc::blur_run(nodes, i);
         let run = &nodes[i..end];
         if !(run[0].as_ref().blur > 0.0 && blur_layer(pc, painter, run, alpha)) {
-            for n in run {
-                paint_node(pc, painter, n.as_ref(), alpha);
+            let mut k = 0;
+            while k < run.len() {
+                // Anggota group yang berbayangan bersama: satu bayangan di bawah semuanya.
+                let stop = crate::doc::shadow_run(run, k);
+                let shared = stop > k + 1;
+                if shared {
+                    let seen = crate::export::shadow_region(&run[k..stop])
+                        .is_some_and(|b| b.2 >= pc.vis.0 && b.0 <= pc.vis.2 && b.3 >= pc.vis.1 && b.1 <= pc.vis.3);
+                    if seen {
+                        shadow_layer(pc, painter, &run[k..stop], alpha);
+                    }
+                }
+                for n in &run[k..stop] {
+                    pc.skip_shadow = shared;
+                    paint_node(pc, painter, n.as_ref(), alpha);
+                }
+                k = stop;
             }
         }
         for n in run {
@@ -1211,6 +1234,7 @@ pub fn paint_list<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, nod
 }
 
 pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32) {
+    let skip_shadow = std::mem::take(&mut pc.skip_shadow);
     if !n.visible {
         return;
     }
@@ -1224,7 +1248,9 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
         return;
     }
     // Opacity node sudah termasuk di tekstur bayangan; yang dikalikan di sini hanya milik induknya.
-    shadow_layer(pc, painter, n, parent_alpha);
+    if !skip_shadow {
+        shadow_layer(pc, painter, std::slice::from_ref(n), parent_alpha);
+    }
     let z = pc.view.zoom;
     let r = Rect::from_min_max(pc.view.to_screen(pc.o, x0, y0), pc.view.to_screen(pc.o, x1, y1));
     let pivot = r.center();

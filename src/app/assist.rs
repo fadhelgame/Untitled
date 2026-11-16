@@ -159,22 +159,50 @@ impl App {
             (d > 6.0 && d <= 30.0).then_some(n.id)
         })
     }
+
+    /// Seperti `rotate_zone` untuk beberapa objek terpilih (mis. satu group): kursor tepat di luar
+    /// sudut kotak seleksi. Hasil: pusat kotak (poros putar). Frame tidak bisa diputar.
+    pub(super) fn multi_rotate_zone(&self, p: Pos2) -> Option<Pos2> {
+        if self.sel_locked() || self.crop.is_some() {
+            return None;
+        }
+        let (x0, y0, x1, y1) = self.sel_box()?;
+        if self.roots().iter().any(|id| self.doc.find(*id).is_some_and(|n| n.kind == Kind::Frame)) {
+            return None;
+        }
+        let o = self.canvas_rect.min;
+        let wp = self.view.to_world(o, p);
+        if wp.x >= x0 && wp.x <= x1 && wp.y >= y0 && wp.y <= y1 {
+            return None;
+        }
+        [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].into_iter().find_map(|(x, y)| {
+            let d = (self.view.to_screen(o, x, y) - p).length();
+            (d > 6.0 && d <= 30.0).then_some(egui::pos2((x0 + x1) * 0.5, (y0 + y1) * 0.5))
+        })
+    }
 }
 
 impl App {
     /// Kursor putar: busur dengan dua kepala panah, menghadap keluar dari pusat objek.
     pub(super) fn paint_rotate_cursor(&self, painter: &egui::Painter, pos: Option<Pos2>, hovered: bool) {
         let Some(p) = pos else { return };
-        let (id, rotating) = match &self.drag {
-            Drag::Rotate { id, .. } => (*id, true),
-            Drag::None if hovered => match self.rotate_zone(p) {
-                Some(id) => (id, false),
+        let center_of = |id: u64| self.doc.find(id).map(|n| (n.center(), n.rotation));
+        // Poros putar (dunia), dan sudut yang ditampilkan selama memutar.
+        let ((cx, cy), angle) = match &self.drag {
+            Drag::Rotate { id, .. } => match center_of(*id) {
+                Some((c, rot)) => (c, Some(rot)),
                 None => return,
+            },
+            Drag::MultiRotate { center, angle, .. } => ((center.x, center.y), Some(*angle)),
+            Drag::None if hovered => match self.rotate_zone(p).and_then(center_of) {
+                Some((c, _)) => (c, None),
+                None => match self.multi_rotate_zone(p) {
+                    Some(c) => ((c.x, c.y), None),
+                    None => return,
+                },
             },
             _ => return,
         };
-        let Some(n) = self.doc.find(id) else { return };
-        let (cx, cy) = n.center();
         let dir = (p - self.view.to_screen(self.canvas_rect.min, cx, cy)).angle();
         let radius = 11.0;
         let center = p - Vec2::angled(dir) * radius;
@@ -192,9 +220,9 @@ impl App {
                 painter.line_segment(*h, Stroke::new(width, color));
             }
         }
-        if rotating {
+        if let Some(angle) = angle {
             // Sudut saat ini di dekat kursor.
-            let galley = painter.layout_no_wrap(format!("{:.0}°", n.rotation), FontId::proportional(11.0), Color32::WHITE);
+            let galley = painter.layout_no_wrap(format!("{angle:.0}°"), FontId::proportional(11.0), Color32::WHITE);
             let bg = Rect::from_min_size(p + vec2(16.0, 16.0), galley.size() + vec2(10.0, 4.0));
             painter.rect_filled(bg, CornerRadius::same(3), ACCENT);
             painter.galley(bg.min + vec2(5.0, 2.0), galley, Color32::WHITE);
