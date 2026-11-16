@@ -543,6 +543,24 @@ fn svg_detail(pc: &mut PaintCx, n: &Node, r: Rect, clip: Rect, whole: bool) -> O
     out
 }
 
+/// Mode crop: gambar utuh digambar redup di atas dokumen, lalu bagian di dalam kotak crop
+/// digambar penuh di atasnya, supaya terlihat apa yang terpotong.
+pub fn paint_crop_ghost(pc: &mut PaintCx, painter: &egui::Painter, n: &Node) {
+    let Some(tex) = n.image.and_then(|id| image_texture(pc, id, n.fill.is_some())) else { return };
+    let (o, view) = (pc.o, pc.view);
+    let rect = |(x0, y0, x1, y1): (f32, f32, f32, f32)| Rect::from_min_max(view.to_screen(o, x0, y0), view.to_screen(o, x1, y1));
+    let (full, r) = (rect(n.image_rect()), rect(n.bounds()));
+    let uv = n.crop.map_or(UV_FULL, |[u0, v0, u1, v1]| Rect::from_min_max(pos2(u0, v0), pos2(u1, v1)));
+    let tint = n.fill.map_or(Color32::WHITE, col);
+    let mut mesh = egui::Mesh::with_texture(tex);
+    mesh.add_rect_with_uv(full, UV_FULL, tint.gamma_multiply(0.35));
+    mesh.add_rect_with_uv(r, uv, tint);
+    if n.rotation != 0.0 {
+        mesh.rotate(egui::emath::Rot2::from_angle(n.rotation.to_radians()), r.center());
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
 enum Source {
     None,
     Solid(Color32),
@@ -1202,13 +1220,28 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 Source::Solid(c) => sink.add(Shape::rect_filled(r, rad, c)),
                 Source::Texture(t, tint) => {
                     let whole = n.rotation != 0.0 || rad != CornerRadius::ZERO;
-                    let detail = if n.kind == Kind::Image { svg_detail(pc, n, r, painter.clip_rect(), whole) } else { None };
+                    // Gambar yang di-crop: kotak node hanya menampilkan sebagian dari gambar utuh (`full`).
+                    let (full, uv) = match n.crop.filter(|_| n.kind == Kind::Image) {
+                        Some([u0, v0, u1, v1]) => {
+                            let (ix0, iy0, ix1, iy1) = n.image_rect();
+                            let full = Rect::from_min_max(pc.view.to_screen(pc.o, ix0, iy0), pc.view.to_screen(pc.o, ix1, iy1));
+                            (full, Rect::from_min_max(pos2(u0, v0), pos2(u1, v1)))
+                        }
+                        None => (r, UV_FULL),
+                    };
+                    let detail =
+                        if n.kind == Kind::Image { svg_detail(pc, n, full, r.intersect(painter.clip_rect()), whole) } else { None };
                     match detail {
                         Some((sharp, part)) => {
-                            let rad = if whole { rad } else { CornerRadius::ZERO };
-                            sink.add(egui::epaint::RectShape::filled(part, rad, tint).with_texture(sharp, UV_FULL));
+                            // Potongan tajam mencakup `part` dari gambar utuh; yang digambar hanya irisannya dengan kotak node.
+                            let q = part.intersect(r);
+                            if q.is_positive() {
+                                let at = |p: Pos2| ((p - part.min) / part.size()).to_pos2();
+                                let rad = if whole { rad } else { CornerRadius::ZERO };
+                                sink.add(egui::epaint::RectShape::filled(q, rad, tint).with_texture(sharp, Rect::from_min_max(at(q.min), at(q.max))));
+                            }
                         }
-                        None => sink.add(egui::epaint::RectShape::filled(r, rad, tint).with_texture(t, UV_FULL)),
+                        None => sink.add(egui::epaint::RectShape::filled(r, rad, tint).with_texture(t, uv)),
                     }
                 }
             }

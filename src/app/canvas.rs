@@ -57,6 +57,10 @@ impl App {
                 self.finish_text_edit();
             }
         }
+        // Mode crop berakhir (diterapkan) begitu seleksi atau tool berganti.
+        if self.crop_id().is_some_and(|id| self.tool != Tool::Select || self.sel != [id] || self.doc.find(id).is_none()) {
+            self.finish_crop(true);
+        }
 
         if hovered {
             if let Some(p) = inp.pos {
@@ -81,6 +85,9 @@ impl App {
                     }
                 } else if self.ext.path_edit.is_some() {
                     self.path_edit_double(p);
+                } else if self.crop.is_some() {
+                    // Klik dua kali lagi: selesai meng-crop.
+                    self.finish_crop(true);
                 } else if self.pointer_tool() && self.editing.is_none() {
                     let wp = self.view.to_world(o, p);
                     if let Some(id) = self.doc.hit(wp.x, wp.y, 4.0 / self.view.zoom) {
@@ -98,6 +105,8 @@ impl App {
                                 self.sel = vec![id];
                                 self.start_path_edit(id);
                             }
+                            // Klik dua kali pada gambar: mode crop (anggota group dipilih sendiri dulu).
+                            Some((Kind::Image, grouped)) if !grouped || self.sel == [id] => self.start_crop(id),
                             // Klik dua kali pada anggota group: pilih objek itu saja.
                             Some((_, true)) => self.sel = vec![id],
                             _ => {}
@@ -154,6 +163,10 @@ impl App {
                 }
             }
         });
+        // Mode crop: gambar utuh tampil redup di balik kotak crop.
+        if let Some(n) = self.crop.as_ref().and_then(|s| self.doc.find(s.id)) {
+            render::paint_crop_ghost(&mut pc, &painter, n);
+        }
         self.drawn = pc.drawn;
         let measures = std::mem::take(&mut pc.measures);
         for (id, w, h) in measures {
@@ -178,7 +191,7 @@ impl App {
 
         // --- overlay: hover, seleksi, pegangan, marquee ---
         let idle = matches!(self.drag, Drag::None);
-        if idle && hovered && self.pointer_tool() && self.editing.is_none() {
+        if idle && hovered && self.pointer_tool() && self.editing.is_none() && self.crop.is_none() {
             if let Some(p) = inp.pos {
                 let wp = self.view.to_world(o, p);
                 if let Some(n) = self.hit(p, wp, 4.0 / z).filter(|id| !self.sel.contains(id)).and_then(|id| self.doc.find(id)) {
@@ -193,7 +206,9 @@ impl App {
         }
         if self.sel.len() == 1 && self.editing.is_none() && self.ext.path_edit.is_none() {
             if let Some(n) = self.doc.find(self.sel[0]) {
-                if self.pointer_tool() {
+                if self.crop.is_some() {
+                    self.paint_crop(&painter);
+                } else if self.pointer_tool() {
                     for (_, x, y) in handles(n, self.tool == Tool::Scale) {
                         let hr = Rect::from_center_size(self.view.to_screen(o, x, y), vec2(7.0, 7.0));
                         painter.rect_filled(hr, CornerRadius::same(1), Color32::WHITE);
@@ -284,6 +299,8 @@ impl App {
                 },
                 _ => CursorIcon::Crosshair,
             };
+            let panning = space || matches!(self.drag, Drag::Pan);
+            let icon = self.crop_cursor(inp.pos).filter(|_| !panning).unwrap_or(icon);
             ctx.set_cursor_icon(icon);
         }
         if self.tool == Tool::Pen && hovered && idle && !space && !pen_precise {
@@ -568,6 +585,8 @@ impl App {
                 if !self.edit_box().is_some_and(|r| r.contains(p)) {
                     self.finish_text_edit();
                 }
+            } else if inp.pressed && self.crop.is_some() {
+                self.crop_press(p, wp);
             } else if inp.pressed && self.tool == Tool::Pen {
                 self.pen_press(p, wp, inp.mods);
             } else if inp.pressed && self.ext.path_edit.is_none() {
@@ -592,6 +611,7 @@ impl App {
             Drag::Pan => self.view.pan += inp.delta,
             Drag::TextBox { cur, .. } => *cur = wp,
             Drag::Gradient { id, part, .. } => self.grad_drag(*id, *part, p, inp.mods.shift),
+            Drag::Crop { part, start, geom } => self.crop_drag(*part, *start, *geom, wp, inp.mods.shift),
             Drag::Move { start, applied, moved, dup } => {
                 let t = wp - *start;
                 if *moved || t.length() * z > 3.0 {

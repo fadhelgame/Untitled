@@ -12,6 +12,7 @@ mod assist;
 pub(crate) mod blend;
 mod builder;
 mod canvas;
+mod crop;
 mod home;
 mod icons;
 mod library;
@@ -267,6 +268,8 @@ enum Drag {
     Create { id: u64, start: Pos2 },
     /// Menarik pegangan gradasi di canvas: 0/1 = ujung garis, 2+i = stop ke-i.
     Gradient { id: u64, part: usize, orig: crate::doc::Gradient },
+    /// Mode crop gambar: menarik pegangan crop, pegangan gambar, atau gambarnya. `geom` = keadaan awal.
+    Crop { part: crop::Part, start: Pos2, geom: crop::Geom },
 }
 
 struct Inp {
@@ -348,6 +351,8 @@ pub struct App {
     pages: pages::Pages,
     /// Jendela Library: gambar milik pengguna yang tersedia di semua dokumen.
     library: library::Library,
+    /// Mode crop gambar yang sedang aktif.
+    crop: Option<crop::Session>,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -430,6 +435,7 @@ impl App {
             poly: Default::default(),
             pages: Default::default(),
             library: library::Library::new(library_dir),
+            crop: None,
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -650,7 +656,7 @@ impl App {
     }
 
     fn handle_at(&self, p: Pos2) -> Option<(u64, u8)> {
-        if self.sel.len() != 1 || !self.pointer_tool() || self.sel_locked() {
+        if self.sel.len() != 1 || !self.pointer_tool() || self.sel_locked() || self.crop.is_some() {
             return None;
         }
         let n = self.doc.find(self.sel[0])?;
@@ -1144,7 +1150,10 @@ impl App {
         } else if group {
             self.group_selection();
         }
-        if redo {
+        if (redo || undo) && self.crop.is_some() {
+            // Mode crop: undo membatalkan crop yang sedang dikerjakan.
+            self.finish_crop(false);
+        } else if redo {
             self.redo_cmd();
         } else if undo {
             self.undo_cmd();
@@ -1205,6 +1214,10 @@ impl App {
                 // Mode edit titik path
                 Key::Enter | Key::Escape if self.ext.path_edit.is_some() => self.ext.path_edit = None,
                 Key::Backspace | Key::Delete if self.ext.path_edit.is_some() => self.path_edit_delete(),
+                // Mode crop: Enter menerapkan, Esc membatalkan
+                Key::Enter if self.crop.is_some() => self.finish_crop(true),
+                Key::Escape if self.crop.is_some() => self.finish_crop(false),
+                Key::Backspace | Key::Delete if self.crop.is_some() => {}
                 // Tool
                 Key::V if plain => self.tool = Tool::Select,
                 Key::K if plain => self.tool = Tool::Scale,
@@ -1251,6 +1264,9 @@ impl App {
                         self.ext.edit_pending = Some(render::EditPending::All);
                     } else if self.doc.find(id).is_some_and(|n| n.kind == Kind::Path) {
                         self.start_path_edit(id);
+                    } else {
+                        // Gambar: Enter masuk mode crop.
+                        self.start_crop(id);
                     }
                 }
                 Key::Delete | Key::Backspace => self.delete_selection(),
@@ -1259,6 +1275,11 @@ impl App {
                     self.tool = Tool::Select;
                 }
                 // Mode edit titik: panah menggeser titik terpilih
+                // Mode crop: panah menggeser gambar di balik kotak crop
+                Key::ArrowLeft if !c && !a && self.crop_nudge(-step, 0.0) => {}
+                Key::ArrowRight if !c && !a && self.crop_nudge(step, 0.0) => {}
+                Key::ArrowUp if !c && !a && self.crop_nudge(0.0, -step) => {}
+                Key::ArrowDown if !c && !a && self.crop_nudge(0.0, step) => {}
                 Key::ArrowLeft if !c && !a && self.path_edit_nudge(-step, 0.0) => {}
                 Key::ArrowRight if !c && !a && self.path_edit_nudge(step, 0.0) => {}
                 Key::ArrowUp if !c && !a && self.path_edit_nudge(0.0, -step) => {}
@@ -1815,6 +1836,26 @@ impl App {
                     self.icons.open = true;
                     self.icons.query = q;
                     self.icons.search(ctx);
+                }
+                // `KANVAS_BENCH_CROP=<derajat>`: klik dua kali gambar demo (mode crop), tarik pegangan
+                // crop kiri-atas ke dalam, lalu geser gambarnya. Gambarnya diputar sebesar nilai itu.
+                if let Ok(rot) = std::env::var("KANVAS_BENCH_CROP") {
+                    let id = self.doc.nodes.iter().flat_map(|n| n.children.iter()).find(|c| c.name == "Image").map(|c| c.id);
+                    if let Some(n) = id.and_then(|id| self.doc.find_mut(id)) {
+                        n.rotation = rot.parse().unwrap_or(0.0);
+                        let (b0, c, o) = (n.aabb(), n.center(), self.canvas_rect.min);
+                        let h0 = handles(n, false)[0];
+                        self.zoom_to((b0.0 - 60.0, b0.1 - 60.0, b0.2 + 60.0, b0.3 + 60.0), 8.0);
+                        let mid = self.view.to_screen(o, c.0, c.1);
+                        let from = self.view.to_screen(o, h0.1, h0.2);
+                        let to = from + (mid - from) * 0.5;
+                        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                        let mv = egui::Event::PointerMoved;
+                        b_inject(&mut b.inject, &[(200, mv(mid)), (202, button(mid, true)), (203, button(mid, false)), (205, button(mid, true)), (206, button(mid, false))]);
+                        b_inject(&mut b.inject, &[(214, mv(from)), (216, button(from, true)), (218, mv(from + (to - from) * 0.5)), (220, mv(to)), (222, button(to, false))]);
+                        let (p0, p1) = (mid + vec2(20.0, 20.0), mid + vec2(-25.0, 5.0));
+                        b_inject(&mut b.inject, &[(230, mv(p0)), (232, button(p0, true)), (234, mv(p1)), (236, button(p1, false)), (240, mv(from))]);
+                    }
                 }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {

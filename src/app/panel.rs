@@ -92,6 +92,7 @@ impl App {
         let before = n.clone();
         let mut align: Option<u8> = None;
         let mut remove_bg = false;
+        let mut crop_image = false;
         let mut style_action: Option<super::styles::StyleAction> = None;
         let has_parent = self.doc.parent_of(id).is_some();
 
@@ -194,6 +195,15 @@ impl App {
                 if n.fill.is_some() {
                     ui.weak("Recolors the image; transparency is kept.");
                 }
+                section(ui, "Crop");
+                let cropping = self.crop_id() == Some(id);
+                let label = if cropping { "Cropping…" } else if n.crop.is_some() { "Edit crop" } else { "Crop image" };
+                let btn = ui
+                    .add_enabled(!cropping, egui::Button::new(label).min_size(vec2(ui.available_width(), 28.0)))
+                    .on_hover_text("Or double-click the image on the canvas.");
+                if btn.clicked() {
+                    crop_image = true;
+                }
                 section(ui, "Background");
                 if self.rembg_running(id) {
                     ui.horizontal(|ui| {
@@ -268,6 +278,10 @@ impl App {
         }
         if remove_bg {
             self.rembg_start(id, &ctx);
+            return;
+        }
+        if crop_image {
+            self.start_crop(id);
             return;
         }
         if let Some(action) = style_action {
@@ -1105,6 +1119,7 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(CANVAS_BG))
             .show(ctx, |ui| self.canvas(ui));
         self.toolbar(ctx);
+        self.crop_bar(ctx);
         self.icons_window(ctx);
         self.photos_window(ctx);
         self.library_window(ctx);

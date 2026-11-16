@@ -137,6 +137,9 @@ impl App {
         if self.sel.len() != 1 || !self.pointer_tool() || self.editing.is_some() || self.ext.path_edit.is_some() || self.sel_locked() {
             return None;
         }
+        if self.crop.is_some() {
+            return None;
+        }
         let n = self.doc.find(self.sel[0])?;
         if matches!(n.kind, Kind::Frame | Kind::Line) {
             return None;

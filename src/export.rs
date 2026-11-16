@@ -494,7 +494,9 @@ fn node_inner(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManag
         }
         Kind::Image => {
             let Some(asset) = n.image.and_then(|id| assets.get(&id)) else { return };
-            let clip = if r > 0.0 {
+            // Gambar yang di-crop: gambar utuh ditaruh di kotaknya sendiri lalu dipotong ke kotak node.
+            let (ix0, iy0, ix1, iy1) = n.image_rect();
+            let clip = if r > 0.0 || n.crop.is_some() {
                 let _ = write!(
                     out,
                     r#"<clipPath id="c{}"><rect x="{x0}" y="{y0}" width="{w}" height="{h}" rx="{r}"/></clipPath>"#,
@@ -519,7 +521,9 @@ fn node_inner(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManag
             };
             let _ = write!(
                 out,
-                r#"<image x="{x0}" y="{y0}" width="{w}" height="{h}" preserveAspectRatio="none"{clip}{overlay} href="data:{};base64,{}"/>"#,
+                r#"<image x="{ix0}" y="{iy0}" width="{}" height="{}" preserveAspectRatio="none"{clip}{overlay} href="data:{};base64,{}"/>"#,
+                ix1 - ix0,
+                iy1 - iy0,
                 mime(&asset.bytes),
                 b64::encode(&asset.bytes)
             );

@@ -274,6 +274,10 @@ pub struct Node {
     /// Kunci ke `Doc::assets`.
     #[serde(default)]
     pub image: Option<u64>,
+    /// Crop gambar: bagian gambar yang tampil di kotak node, sebagai (u0, v0, u1, v1) dalam 0..1
+    /// terhadap gambar utuh. Kosong = seluruh gambar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<[f32; 4]>,
     /// Derajat, searah jarum jam, terhadap pusat kotak pembatas.
     #[serde(default)]
     pub rotation: f32,
@@ -596,6 +600,7 @@ impl Node {
             closed: false,
             holes: Vec::new(),
             image: None,
+            crop: None,
             rotation: 0.0,
             blend: 0,
             opacity: 1.0,
@@ -620,6 +625,20 @@ impl Node {
         let (x0, x1) = if self.w < 0.0 { (self.x + self.w, self.x) } else { (self.x, self.x + self.w) };
         let (y0, y1) = if self.h < 0.0 { (self.y + self.h, self.y) } else { (self.y, self.y + self.h) };
         (x0, y0, x1, y1)
+    }
+
+    /// Kotak gambar utuh (sebelum crop) di ruang node tanpa rotasi; sama dengan `bounds` kalau
+    /// tidak di-crop.
+    pub fn image_rect(&self) -> (f32, f32, f32, f32) {
+        let (x0, y0, x1, y1) = self.bounds();
+        match self.crop {
+            Some([u0, v0, u1, v1]) if u1 - u0 > 1e-4 && v1 - v0 > 1e-4 => {
+                let (w, h) = ((x1 - x0) / (u1 - u0), (y1 - y0) / (v1 - v0));
+                let (ix, iy) = (x0 - u0 * w, y0 - v0 * h);
+                (ix, iy, ix + w, iy + h)
+            }
+            _ => (x0, y0, x1, y1),
+        }
     }
 
     pub fn center(&self) -> (f32, f32) {
