@@ -700,7 +700,57 @@ impl Node {
         out
     }
 
+    /// Titik kontur setelah sudut tajam dibulatkan sebesar `radius` (satuan dunia), seperti live
+    /// corners: titik aslinya tidak berubah, pembulatan hanya diterapkan saat digambar / diekspor.
+    /// Yang dibulatkan: titik tanpa pegangan di antara dua ruas lurus. Tiap sudut paling jauh
+    /// memakan setengah ruas kalau ujung ruas satunya juga dibulatkan (seluruh ruas kalau tidak).
+    pub fn rounded_points(&self, points: &[PathPoint], closed: bool) -> Vec<PathPoint> {
+        let n = points.len();
+        let (w, h) = (self.w, self.h);
+        if self.kind != Kind::Path || self.radius <= 0.0 || n < 3 || w.abs() < 1e-3 || h.abs() < 1e-3 {
+            return points.to_vec();
+        }
+        let zero = [0.0f32; 2];
+        let corner = |i: usize| {
+            (closed || (i > 0 && i + 1 < n)) && points[i].hin == zero && points[i].hout == zero && points[(i + n - 1) % n].hout == zero && points[(i + 1) % n].hin == zero
+        };
+        let mut out = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let p = points[i];
+            if !corner(i) {
+                out.push(p);
+                continue;
+            }
+            let (ia, ib) = ((i + n - 1) % n, (i + 1) % n);
+            let (a, b) = (points[ia], points[ib]);
+            let (v1, v2) = (((a.x - p.x) * w, (a.y - p.y) * h), ((b.x - p.x) * w, (b.y - p.y) * h));
+            let (l1, l2) = (v1.0.hypot(v1.1), v2.0.hypot(v2.1));
+            if l1 < 1e-4 || l2 < 1e-4 {
+                out.push(p);
+                continue;
+            }
+            let (d1, d2) = ((v1.0 / l1, v1.1 / l1), (v2.0 / l2, v2.1 / l2));
+            let cos = (d1.0 * d2.0 + d1.1 * d2.1).clamp(-1.0, 1.0);
+            // Hampir lurus atau berbalik arah: tidak ada sudut yang bisa dibulatkan.
+            if 1.0 + cos < 1e-4 || 1.0 - cos < 1e-4 {
+                out.push(p);
+                continue;
+            }
+            let tan_half = ((1.0 - cos) / (1.0 + cos)).sqrt();
+            let limit = |len: f32, j: usize| if corner(j) { len * 0.5 } else { len };
+            // Jarak titik singgung dari sudut, lalu jari-jari yang benar-benar muat.
+            let t = (self.radius / tan_half).min(limit(l1, ia)).min(limit(l2, ib));
+            let r = t * tan_half;
+            // Busur didekati satu bezier kubik.
+            let k = 4.0 / 3.0 * ((std::f32::consts::PI - cos.acos()) / 4.0).tan() * r;
+            out.push(PathPoint { x: p.x + d1.0 * t / w, y: p.y + d1.1 * t / h, hin: zero, hout: [-d1.0 * k / w, -d1.1 * k / h] });
+            out.push(PathPoint { x: p.x + d2.0 * t / w, y: p.y + d2.1 * t / h, hin: [-d2.0 * k / w, -d2.1 * k / h], hout: zero });
+        }
+        out
+    }
+
     fn flatten(&self, points: &[PathPoint], closed: bool, segs: usize) -> Vec<(f32, f32)> {
+        let points = &self.rounded_points(points, closed)[..];
         let n = points.len();
         let mut out = Vec::new();
         if n == 0 {
@@ -1811,6 +1861,30 @@ mod tests {
         for data in [&b""[..], b"a", b"ab", b"abc", &[0u8, 255, 16, 128, 7]] {
             assert_eq!(b64::decode(&b64::encode(data)).unwrap(), data);
         }
+    }
+
+    #[test]
+    fn path_radius_rounds_sharp_corners() {
+        let p = |x: f32, y: f32| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2] };
+        let mut n = Node::new(1, Kind::Path, 0.0, 0.0);
+        (n.w, n.h, n.closed) = (100.0, 60.0, true);
+        n.points = vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)];
+        n.radius = 10.0;
+        let r = n.rounded_points(&n.points, true);
+        assert_eq!(r.len(), 8);
+        // Sudut kiri-atas: titik singgung 10 satuan dari sudut di kedua sisi.
+        assert!((r[0].x * 100.0).abs() < 1e-3 && (r[0].y * 60.0 - 10.0).abs() < 1e-3, "{:?}", r[0]);
+        assert!((r[1].x * 100.0 - 10.0).abs() < 1e-3 && (r[1].y * 60.0).abs() < 1e-3, "{:?}", r[1]);
+        // Titik hasil perataan di pojok kiri-atas berada di lingkaran sudut (pusat 10,10).
+        let pts = n.path_points(16);
+        assert!(pts.iter().all(|(x, y)| *x >= 10.0 || *y >= 10.0 || ((x - 10.0).hypot(y - 10.0) - 10.0).abs() < 0.05));
+        // Jari-jari terlalu besar dibatasi setengah sisi terpendek.
+        n.radius = 500.0;
+        let r = n.rounded_points(&n.points, true);
+        assert!((r[0].y * 60.0 - 30.0).abs() < 1e-3 && (r[1].x * 100.0 - 30.0).abs() < 1e-3);
+        // Titik berpegangan (kurva) dan tetangganya tidak disentuh.
+        n.points[0].hout = [0.1, 0.0];
+        assert_eq!(n.rounded_points(&n.points, true).len(), 6);
     }
 
     #[test]

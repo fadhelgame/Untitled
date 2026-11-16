@@ -103,6 +103,8 @@ pub fn set_geo(n: &mut Node, g: &Geo) {
     n.points = g.cs.first().map(raw).unwrap_or_default();
     n.holes = g.cs.iter().skip(1).map(raw).collect();
     n.closed = g.closed;
+    // Kotak pembatas dihitung dari titik asli, bukan dari sudut yang sudah dibulatkan.
+    let radius = std::mem::take(&mut n.radius);
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for (x, y) in n.contours(16).into_iter().flatten() {
         x0 = x0.min(x);
@@ -110,6 +112,7 @@ pub fn set_geo(n: &mut Node, g: &Geo) {
         x1 = x1.max(x);
         y1 = y1.max(y);
     }
+    n.radius = radius;
     if x0 > x1 {
         return;
     }

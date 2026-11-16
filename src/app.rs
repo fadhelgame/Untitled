@@ -1982,6 +1982,16 @@ impl App {
                         }
                     }
                 }
+                // `KANVAS_BENCH_ROUND=<radius>`: bulatkan sudut semua vector di frame demo dan pilih yang pertama.
+                if let Ok(r) = std::env::var("KANVAS_BENCH_ROUND") {
+                    let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter()).filter(|c| c.kind == Kind::Path).map(|c| c.id).collect();
+                    for id in &ids {
+                        if let Some(n) = self.doc.find_mut(*id) {
+                            n.radius = r.parse().unwrap_or(12.0);
+                        }
+                    }
+                    self.sel = ids.into_iter().take(1).collect();
+                }
                 // `KANVAS_BENCH_TAGS=x,y`: buka frame demo di panel layer, group dua isinya, beri warna
                 // penanda ke beberapa layer, lalu klik kanan di (x,y) supaya menu warnanya ikut tampil.
                 if let Ok(spec) = std::env::var("KANVAS_BENCH_TAGS") {

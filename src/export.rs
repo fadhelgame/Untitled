@@ -481,9 +481,10 @@ fn node_inner(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManag
                     d.push('Z');
                 }
             };
-            sub(&n.points, n.closed);
+            // Sudut yang dibulatkan (`radius`) ikut diekspor sebagai kurva.
+            sub(&n.rounded_points(&n.points, n.closed), n.closed);
             for h in &n.holes {
-                sub(h, true);
+                sub(&n.rounded_points(h, true), true);
             }
             let fill = if n.closed { fill(out, n) } else { r#"fill="none""#.to_owned() };
             let _ = write!(

@@ -146,10 +146,13 @@ impl App {
                         n.opacity = pct / 100.0;
                     }
                 });
-                if matches!(n.kind, Kind::Rect | Kind::Image) {
+                if matches!(n.kind, Kind::Rect | Kind::Image | Kind::Path) {
                     ui.vertical(|ui| {
                         sub(ui, "Corner radius");
-                        ui.add_sized([half, 28.0], egui::DragValue::new(&mut n.radius).speed(0.5).range(0.0..=2000.0).max_decimals(1));
+                        let dv = ui.add_sized([half, 28.0], egui::DragValue::new(&mut n.radius).speed(0.5).range(0.0..=2000.0).max_decimals(1));
+                        if n.kind == Kind::Path {
+                            dv.on_hover_text("Rounds the sharp corners of this vector. The anchor points stay editable.");
+                        }
                     });
                 }
             });
@@ -352,7 +355,7 @@ impl App {
         let all_text = all(&|n| n.kind == Kind::Text);
         let any_text = !all(&|n| n.kind != Kind::Text);
         let fillable = all(&|n| !matches!(n.kind, Kind::Line | Kind::Image));
-        let rounded = all(&|n| matches!(n.kind, Kind::Rect | Kind::Image));
+        let rounded = all(&|n| matches!(n.kind, Kind::Rect | Kind::Image | Kind::Path));
         let same_kind = all(&|n| n.kind == first.kind);
         let mixed_type = !all(&|n| {
             (&n.font, n.weight, n.italic, n.font_size, n.line_height, n.letter_spacing, n.align)
@@ -498,7 +501,7 @@ impl App {
             if n.blur != before.blur {
                 t.blur = n.blur;
             }
-            if n.radius != before.radius && matches!(t.kind, Kind::Rect | Kind::Image) {
+            if n.radius != before.radius && matches!(t.kind, Kind::Rect | Kind::Image | Kind::Path) {
                 t.radius = n.radius;
             }
             if paint {
