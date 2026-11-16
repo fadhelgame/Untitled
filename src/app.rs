@@ -1869,6 +1869,17 @@ impl App {
                         b_inject(&mut b.inject, &[(230, mv(p0)), (232, button(p0, true)), (234, mv(p1)), (236, button(p1, false)), (240, mv(from))]);
                     }
                 }
+                // `KANVAS_BENCH_OVERLAY=1`: perbesar gambar demo; color overlay dipasang di frame 240,
+                // setelah tekstur biasanya sudah tampil (seperti menambah Fill dari panel).
+                // Nilainya boleh id node (untuk dokumen yang dibuka lewat argumen) sebagai ganti gambar demo.
+                if let Ok(v) = std::env::var("KANVAS_BENCH_OVERLAY") {
+                    let demo = self.doc.nodes.iter().flat_map(|n| n.children.iter()).find(|c| c.name == "Image").map(|c| c.id);
+                    let id = v.parse::<u64>().ok().filter(|id| self.doc.find(*id).is_some()).or(demo);
+                    if let Some(b0) = id.and_then(|id| self.doc.find(id)).map(|n| n.aabb()) {
+                        self.sel = id.into_iter().collect();
+                        self.zoom_to((b0.0 - 60.0, b0.1 - 60.0, b0.2 + 60.0, b0.3 + 60.0), 8.0);
+                    }
+                }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
                     let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
@@ -2053,6 +2064,9 @@ impl App {
                 let _ = target;
             }
             _ => {
+                if b.frame == 240 && std::env::var("KANVAS_BENCH_OVERLAY").is_ok() {
+                    self.edit_selected(|n| n.fill = Some([0, 102, 227, 255]));
+                }
                 let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;

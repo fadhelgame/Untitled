@@ -156,6 +156,11 @@ pub struct Ext {
     grads: HashMap<u64, (TextureHandle, u64)>,
     tex: HashMap<TexKey, (TextureHandle, u64)>,
     decoding: HashSet<TexKey>,
+    /// Decode yang gagal: (frame saat gagal, berapa kali sudah dicoba). Dicoba lagi beberapa kali
+    /// dengan jeda, supaya satu kegagalan tidak membuat gambar kosong selamanya.
+    decode_failed: HashMap<TexKey, (u64, u8)>,
+    /// Pesan untuk status bar (mis. gambar yang tidak bisa dibaca).
+    pub notice: Option<String>,
     img_tx: mpsc::Sender<Decoded>,
     img_rx: mpsc::Receiver<Decoded>,
     blend_gl: blend::Shared,
@@ -233,6 +238,8 @@ impl Default for Ext {
             grads: HashMap::new(),
             tex: HashMap::new(),
             decoding: HashSet::new(),
+            decode_failed: HashMap::new(),
+            notice: None,
             img_tx,
             img_rx,
             blend_gl: blend::Shared::default(),
@@ -259,6 +266,12 @@ impl Ext {
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.frame += 1;
         while let Ok((id, result)) = self.img_rx.try_recv() {
+            self.decoding.remove(&id);
+            if let Err(e) = &result {
+                let tries = self.decode_failed.get(&id).map_or(0, |f| f.1) + 1;
+                self.decode_failed.insert(id, (self.frame, tries));
+                self.notice = Some(format!("Couldn't read an image: {e}"));
+            }
             if let Ok(image) = result {
                 let options = egui::TextureOptions {
                     mipmap_mode: Some(egui::TextureFilter::Linear),
@@ -266,9 +279,8 @@ impl Ext {
                 };
                 let handle = ctx.load_texture(format!("image-{}-{}", id.0, id.1), image, options);
                 self.tex.insert(id, (handle, self.frame));
-                self.decoding.remove(&id);
+                self.decode_failed.remove(&id);
             }
-            // Gagal decode: tetap di `decoding` supaya tidak dicoba terus-menerus.
         }
         while let Ok((req, result)) = self.det_rx.try_recv() {
             self.detail_busy.remove(&req.node);
@@ -454,15 +466,24 @@ fn image_texture(pc: &mut PaintCx, id: u64, mask: bool) -> Option<TextureId> {
         e.1 = frame;
         return Some(e.0.id());
     }
-    // Decode di thread lain supaya canvas tidak tersendat; sementara itu tampil abu-abu.
-    if pc.ext.decoding.insert(key) {
+    // Yang pernah gagal dicoba lagi paling banyak tiga kali, dengan jeda.
+    let waiting = pc.ext.decode_failed.get(&key).is_some_and(|(at, tries)| *tries >= 3 || at + 120 > frame);
+    // Decode di thread lain supaya canvas tidak tersendat. `decoding` hanya ditandai kalau thread
+    // benar-benar berjalan, dan thread selalu melapor (juga kalau decoder-nya panik); kalau tidak,
+    // kuncinya tertahan selamanya dan gambarnya tidak pernah muncul.
+    if !waiting && !pc.ext.decoding.contains(&key) {
         if let Some(asset) = pc.assets.get(&id).cloned() {
+            pc.ext.decoding.insert(key);
             let (tx, ctx) = (pc.ext.img_tx.clone(), pc.ctx.clone());
             std::thread::spawn(move || {
-                let mut image = decode_image(&asset.bytes);
-                if let (true, Ok(image)) = (mask, &mut image) {
-                    silhouette(image);
-                }
+                let image = std::panic::catch_unwind(|| {
+                    let mut image = decode_image(&asset.bytes);
+                    if let (true, Ok(image)) = (mask, &mut image) {
+                        silhouette(image);
+                    }
+                    image
+                })
+                .unwrap_or_else(|_| Err("the decoder crashed".into()));
                 let _ = tx.send((key, image));
                 ctx.request_repaint();
             });
@@ -571,10 +592,14 @@ fn source(pc: &mut PaintCx, n: &Node, alpha: f32) -> Source {
     let tint = Color32::WHITE.gamma_multiply(alpha);
     if n.kind == Kind::Image {
         // Fill pada gambar = color overlay: warnanya mengganti RGB, alpha gambar dipertahankan.
-        let tint = n.fill.map_or(tint, |c| col(c).gamma_multiply(alpha));
-        return match n.image.and_then(|id| image_texture(pc, id, n.fill.is_some())) {
-            Some(t) => Source::Texture(t, tint),
-            None => Source::Solid(Color32::from_gray(70).gamma_multiply(alpha)),
+        let overlay = n.fill.map(|c| col(c).gamma_multiply(alpha));
+        return match n.image.and_then(|id| image_texture(pc, id, overlay.is_some())) {
+            Some(t) => Source::Texture(t, overlay.unwrap_or(tint)),
+            // Siluet untuk color overlay belum siap: tampilkan gambar aslinya dulu, bukan kotak abu-abu.
+            None => match n.image.filter(|_| overlay.is_some()).and_then(|id| pc.ext.tex.get(&(id, false))) {
+                Some(e) => Source::Texture(e.0.id(), tint),
+                None => Source::Solid(Color32::from_gray(70).gamma_multiply(alpha)),
+            },
         };
     }
     match (n.fill, &n.gradient) {

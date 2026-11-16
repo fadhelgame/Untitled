@@ -1071,6 +1071,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.fonts.poll(ctx);
         self.ext.poll(ctx);
+        if let Some(notice) = self.ext.notice.take() {
+            self.status = notice;
+        }
         self.rembg_poll();
         self.icons.poll(ctx);
         self.photos_poll(ctx);
