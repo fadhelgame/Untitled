@@ -1076,7 +1076,9 @@ impl eframe::App for App {
         self.photos_poll(ctx);
         self.library.poll(ctx);
         self.remote_poll(ctx);
-        self.frame_ms = frame.info().cpu_usage.unwrap_or(0.0) * 1000.0;
+        // `cpu_usage` adalah frame sebelumnya, jadi kurangi dengan waktu tunggu frame sebelumnya.
+        self.frame_ms = (frame.info().cpu_usage.unwrap_or(0.0) * 1000.0 - self.pace_ms).max(0.0);
+        self.pace_ms = pacer::wait();
         self.close_flow(ctx);
         if self.home {
             self.home_screen(ctx);
