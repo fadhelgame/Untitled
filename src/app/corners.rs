@@ -35,6 +35,23 @@ impl Corner {
 
 /// Semua sudut tajam (titik tanpa pegangan di antara dua ruas lurus) dari sebuah vector.
 pub(super) fn corners(n: &Node) -> Vec<Corner> {
+    // Kotak dan gambar: empat pojok dengan satu jari-jari bersama (`Node::radius`).
+    if matches!(n.kind, Kind::Rect | Kind::Image) {
+        let (x0, y0, x1, y1) = n.bounds();
+        let (cx, cy) = n.center();
+        let side = (x1 - x0).min(y1 - y0);
+        let max = side * 0.5;
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        return [(x0, y0, 1.0, 1.0), (x1, y0, -1.0, 1.0), (x1, y1, -1.0, -1.0), (x0, y1, 1.0, -1.0)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (x, y, dx, dy))| {
+                let (px, py) = crate::doc::rotate(x, y, cx, cy, n.rotation);
+                let (bx, by) = crate::doc::rotate(dx * half, dy * half, 0.0, 0.0, n.rotation);
+                Corner { at: (0, i), p: pos2(px, py), bis: vec2(bx, by), sin_half: half, max_all: max, max_one: max, r: n.radius.clamp(0.0, max.max(0.0)), side }
+            })
+            .collect();
+    }
     let zero = [0.0f32; 2];
     let g = geo(n);
     let mut out = Vec::new();
@@ -83,13 +100,13 @@ pub(super) fn corners(n: &Node) -> Vec<Corner> {
 }
 
 impl App {
-    /// Vector yang widget sudutnya tampil: satu vector terpilih dengan Select/Scale tool.
+    /// Objek yang widget sudutnya tampil: satu vector, kotak, atau gambar terpilih dengan Select/Scale tool.
     fn corner_target(&self) -> Option<&Node> {
         let [id] = self.sel[..] else { return None };
         if !self.pointer_tool() || self.editing.is_some() || self.ext.path_edit.is_some() || self.crop.is_some() || self.locked(id) {
             return None;
         }
-        self.doc.find(id).filter(|n| n.kind == Kind::Path && n.visible)
+        self.doc.find(id).filter(|n| matches!(n.kind, Kind::Path | Kind::Rect | Kind::Image) && n.visible)
     }
 
     /// Sudut yang widget-nya cukup lega untuk ditampilkan, dengan posisi layarnya.
@@ -126,6 +143,12 @@ impl App {
         let r = (r0 + ((wp - c.p).dot(c.bis) - s0) * c.sin_half).clamp(0.0, max.max(0.0));
         let r = (r * 10.0).round() / 10.0;
         let Some(n) = self.doc.find_mut(id) else { return };
+        if n.kind != Kind::Path {
+            // Kotak dan gambar hanya punya satu jari-jari untuk keempat pojoknya.
+            n.radius = r;
+            self.status = format!("Corner radius {r:.1}.");
+            return;
+        }
         if single {
             let pts = if at.0 == 0 { Some(&mut n.points) } else { n.holes.get_mut(at.0 - 1) };
             if let Some(q) = pts.and_then(|v| v.get_mut(at.1)) {

@@ -2004,7 +2004,7 @@ impl App {
                 // `KANVAS_BENCH_CORNER=<piksel>`: pilih vector pertama di frame demo, lalu tarik widget
                 // sudut pertamanya ke dalam sejauh itu. Akhiran `,hold`: tombol tidak dilepas.
                 if let Ok(spec) = std::env::var("KANVAS_BENCH_CORNER") {
-                    let id = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter()).find(|c| c.kind == Kind::Path).map(|c| c.id);
+                    let id = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter()).find(|c| if spec.contains("rect") { c.name == "Rotated" } else { c.kind == Kind::Path }).map(|c| c.id);
                     if let Some(b0) = id.and_then(|id| self.doc.find(id)).map(|n| n.aabb()) {
                         self.sel = id.into_iter().collect();
                         self.zoom_to((b0.0 - 60.0, b0.1 - 60.0, b0.2 + 60.0, b0.3 + 60.0), 8.0);
