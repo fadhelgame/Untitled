@@ -1299,6 +1299,8 @@ impl App {
         }
         // Salin / potong / tempel datang sebagai event, bukan tombol.
         let mut clip: Vec<(u8, String)> = Vec::new();
+        // Ctrl+Shift+V juga datang sebagai event Paste: Shift yang membedakan Paste in Place.
+        let in_place = ctx.input(|i| i.modifiers.command && i.modifiers.shift);
         ctx.input(|i| {
             for e in &i.events {
                 match e {
@@ -1318,7 +1320,7 @@ impl App {
                 }
                 _ => {
                     let at = self.canvas_pointer(ctx);
-                    self.paste_text(&text, false, at);
+                    self.paste_text(&text, in_place, at);
                 }
             }
         }

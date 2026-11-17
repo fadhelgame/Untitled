@@ -1416,7 +1416,7 @@ impl App {
         self.ext.paste_seen |= pasted;
         let at = self.canvas_pointer(ctx);
         if cmd_down && !self.ext.paste_seen {
-            // Ctrl+Shift+V tidak dianggap paste oleh egui (tidak ada event Paste): Paste in Place.
+            // Ctrl+Shift+V yang tidak menghasilkan event Paste (tergantung versi egui): Paste in Place.
             if free && shift_down {
                 self.paste_clipboard(ctx, true);
             } else if free {
