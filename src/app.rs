@@ -887,8 +887,13 @@ impl App {
         self.push_undo(pre);
     }
 
+    /// Salinan node terpilih dalam urutan tumpukan dokumen (bawah ke atas), bukan urutan klik:
+    /// salin, duplikat dan tempel menyisipkan satu per satu ke atas, jadi urutan ini yang
+    /// menjaga objek atas tetap di atas.
     fn selected_nodes(&self) -> Vec<Node> {
-        self.roots().into_iter().filter_map(|id| self.doc.find(id).cloned()).collect()
+        let mut ids = self.roots();
+        self.doc.sort_by_stack(&mut ids);
+        ids.into_iter().filter_map(|id| self.doc.find(id).cloned()).collect()
     }
 
     /// Isi clipboard untuk seleksi saat ini: node-nodenya plus pojok frame asalnya.

@@ -1353,6 +1353,11 @@ impl Doc {
         None
     }
 
+    /// Urutkan id menurut urutan tumpukan dokumen, dari paling bawah ke paling atas.
+    pub fn sort_by_stack(&self, ids: &mut [u64]) {
+        ids.sort_by_cached_key(|id| self.locate(*id).map_or((usize::MAX, None), |(ti, ci)| (ti, ci)));
+    }
+
     pub fn find(&self, id: u64) -> Option<&Node> {
         let (ti, ci) = self.locate(id)?;
         match ci {
@@ -1667,6 +1672,26 @@ mod tests {
         n.text = s.into();
         n.fill = Some([0, 0, 0, 255]);
         n
+    }
+
+    #[test]
+    fn sort_by_stack_follows_layer_order_not_click_order() {
+        let mut doc = Doc::default();
+        let frame = doc.alloc_id();
+        doc.insert(Node::new(frame, Kind::Frame, 0.0, 0.0), None);
+        let ids: Vec<u64> = (0..3)
+            .map(|_| {
+                let id = doc.alloc_id();
+                doc.insert(Node::new(id, Kind::Rect, 0.0, 0.0), Some(frame));
+                id
+            })
+            .collect();
+        let top = doc.alloc_id();
+        doc.insert(Node::new(top, Kind::Rect, 0.0, 0.0), None);
+        // Diklik dari atas ke bawah: hasilnya tetap bawah ke atas.
+        let mut picked = vec![top, ids[2], ids[0], ids[1]];
+        doc.sort_by_stack(&mut picked);
+        assert_eq!(picked, vec![ids[0], ids[1], ids[2], top]);
     }
 
     #[test]
