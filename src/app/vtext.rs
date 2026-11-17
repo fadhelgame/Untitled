@@ -230,6 +230,7 @@ pub fn mesh(
     clip: Option<Rect>,
     pixels_per_point: f32,
 ) -> Option<Mesh> {
+    let _span = super::perf::span(4);
     let mut mesh = Mesh::default();
     let feather = 1.0 / pixels_per_point.max(0.1);
     for row in &galley.rows {

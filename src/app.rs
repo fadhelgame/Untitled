@@ -21,6 +21,7 @@ mod pacer;
 mod pages;
 mod panel;
 mod pen;
+pub(crate) mod perf;
 mod photos;
 mod picker;
 mod polygon;
@@ -349,6 +350,8 @@ struct Bench {
     /// Jarak waktu antar frame (ms) selama fase zoom/pan: menunjukkan refresh rate yang benar-benar dicapai.
     intervals: Vec<f32>,
     last: Option<std::time::Instant>,
+    /// `KANVAS_PERF`: time the canvas instead (see `perf`).
+    perf: perf::State,
 }
 
 pub struct App {
@@ -484,7 +487,7 @@ impl App {
             wand: Default::default(),
             font_focus: false,
             ext: Default::default(),
-            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new(), ids: Vec::new(), intervals: Vec::new(), last: None }),
+            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new(), ids: Vec::new(), intervals: Vec::new(), last: None, perf: Default::default() }),
             home: false,
             files: home::Files::new(&cc.egui_ctx),
             rembg: None,
@@ -1090,6 +1093,26 @@ impl App {
         self.dirty = false;
         self.fit_pending = true;
         self.pages.reset();
+        self.warm_fonts();
+    }
+
+    /// Ask for every font the document uses as soon as it is opened. Fonts are otherwise loaded
+    /// when their text is first drawn, and each arrival rebuilds the font atlas: zooming into a
+    /// document for the first time stuttered once per font.
+    fn warm_fonts(&mut self) {
+        fn walk(n: &Node, fonts: &mut FontManager) {
+            if n.kind == Kind::Text {
+                for (_, _, st) in n.segments(n.text.chars().count()) {
+                    fonts.resolve(&st.font, st.weight, st.italic);
+                }
+            }
+            for c in &n.children {
+                walk(c, fonts);
+            }
+        }
+        for n in self.doc.nodes.iter().chain(self.doc.pages.iter().flat_map(|p| p.nodes.iter())) {
+            walk(n, &mut self.fonts);
+        }
     }
 
     fn new_doc(&mut self) {
@@ -2005,6 +2028,11 @@ impl App {
         let Some(mut b) = self.bench.take() else { return };
         b.frame += 1;
         ctx.request_repaint();
+        if std::env::var_os("KANVAS_PERF").is_some() {
+            self.run_perf(ctx, &mut b);
+            self.bench = Some(b);
+            return;
+        }
         let now = std::time::Instant::now();
         if let (Some(last), 11..=189) = (b.last, b.frame) {
             b.intervals.push((now - last).as_secs_f32() * 1000.0);

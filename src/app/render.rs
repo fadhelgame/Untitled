@@ -258,6 +258,11 @@ impl Default for Ext {
 }
 
 impl Ext {
+    /// Images, shadows and blurs still being prepared on other threads.
+    pub fn busy(&self) -> usize {
+        self.decoding.len() + self.detail_busy.len() + self.shadow_busy.len() + self.blur_busy.len()
+    }
+
     /// Mesh vector untuk teks yang di layar lebih besar dari batas atlas glyph (`px` = tinggi
     /// huruf terbesar di layar). `None`: pakai jalur bitmap biasa.
     pub fn vector_text(&mut self, ctx: &egui::Context, fonts: &FontManager, galley: &egui::Galley, origin: Pos2, k: f32, px: f32, clip: Rect) -> Option<egui::Mesh> {
@@ -860,6 +865,7 @@ impl TextCache {
         let probe = ctx.fonts(|f| f.layout_job(egui::text::LayoutJob::simple_singleline(" ".into(), FontId::proportional(10.0), Color32::BLACK)));
         if !self.probe.as_ref().is_some_and(|old| Arc::ptr_eq(old, &probe)) {
             self.map.clear();
+            super::perf::count(1);
         }
         self.probe = Some(probe);
         self.map.retain(|_, e| e.2 + Self::KEEP >= pass);
@@ -883,12 +889,14 @@ impl TextCache {
 /// Di sini tiap baris ditata ulang: semua glyph berbagi satu baseline yang berada di tengah
 /// kotak baris, dan kotak baris (untuk seleksi/kursor) mengikuti tinggi huruf sebenarnya.
 pub fn layout_text(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManager, f: f32, alpha: f32, aligned: bool) -> TextLayout {
+    let _span = super::perf::span(3);
     let job = text_job(n, text, fonts, f, alpha, aligned);
     fonts.layouts.begin(ctx);
     let key = TextCache::key(&job, f);
     if let Some(layout) = fonts.layouts.get(key, &job, f) {
         return layout;
     }
+    super::perf::count(0);
     let layout = build_layout(ctx, n, text, fonts, job, f, alpha, aligned);
     let pass = fonts.layouts.pass;
     fonts.layouts.map.insert(key, (f, layout.clone(), pass));

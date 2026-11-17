@@ -1168,8 +1168,12 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.fonts.poll(ctx);
-        self.ext.poll(ctx);
+        let _update = perf::span(0);
+        {
+            let _poll = perf::span(1);
+            self.fonts.poll(ctx);
+            self.ext.poll(ctx);
+        }
         if let Some(notice) = self.ext.notice.take() {
             self.status = notice;
         }
@@ -1230,7 +1234,10 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(CANVAS_BG))
-            .show(ctx, |ui| self.canvas(ui));
+            .show(ctx, |ui| {
+                let _canvas = perf::span(2);
+                self.canvas(ui)
+            });
         self.toolbar(ctx);
         self.crop_bar(ctx);
         self.icons_window(ctx);

@@ -66,11 +66,9 @@ pub struct FontManager {
     pub layouts: crate::app::render::TextCache,
     /// Jumlah font yang bisa dipakai di frame ini (bagian dari kunci `reference`).
     usable: usize,
-    /// Bagian atlas font yang terisi glyph acuan sejak atlas terakhir dikosongkan.
-    ref_weight: f32,
-    /// Ada layout acuan baru di frame ini / isi atlas di awal frame lalu.
-    ref_missed: bool,
-    last_fill: f32,
+    /// Fonts with an atlas of their own, used only for the reference layouts: their large glyphs
+    /// never take room in the atlas that is drawn from.
+    ref_fonts: Option<egui::epaint::text::Fonts>,
 }
 
 pub fn key(family: &str, weight: u16, italic: bool) -> String {
@@ -267,8 +265,8 @@ fn fetch_font(dir: &Path, family: &str, variant: Option<(u16, bool)>) -> Result<
     Ok(bytes)
 }
 
-/// Bagian atlas font yang boleh terisi glyph acuan sebelum atlasnya dikosongkan.
-const REF_WEIGHT_MAX: f32 = 0.15;
+/// Side of the atlas the reference layouts rasterize into. Its pixels are never drawn.
+const REF_ATLAS: usize = 1024;
 
 /// Nama family egui untuk judul UI (semibold).
 pub const UI_STRONG: &str = "ui-strong";
@@ -349,9 +347,7 @@ impl FontManager {
             reference: HashMap::new(),
             layouts: Default::default(),
             usable: 0,
-            ref_weight: 0.0,
-            ref_missed: false,
-            last_fill: 0.0,
+            ref_fonts: None,
         };
         m.load_catalog(ctx);
         m
@@ -408,37 +404,22 @@ impl FontManager {
             ctx.set_fonts(self.defs.clone());
         }
         self.usable = self.usable_count();
-        // Atlas font baru saja dikosongkan (oleh egui karena penuh, atau lewat `set_fonts`):
-        // glyph acuan ikut hilang.
-        let fill = ctx.fonts(|f| f.font_atlas_fill_ratio());
-        if changed || fill + 0.02 < self.last_fill {
-            self.ref_weight = 0.0;
+        if changed {
+            self.ref_fonts = None;
         }
-        self.last_fill = fill;
-        // Glyph acuan hanya dipakai sekali (posisinya sudah tersimpan di `reference`), tetapi tetap
-        // memakan tempat di atlas. Begitu layout acuan sudah tenang, kosongkan atlas supaya
-        // tempatnya dipakai glyph yang benar-benar digambar.
-        if self.ref_weight > REF_WEIGHT_MAX && !self.ref_missed && !changed {
-            self.ref_weight = 0.0;
-            // `set_fonts` mengabaikan definisi yang sama persis dengan yang sedang dipakai, jadi satu
-            // family penanda ditambah atau dicabut bergantian supaya atlasnya benar-benar dibuat ulang.
-            let marker = FontFamily::Name("atlas-reset".into());
-            if self.defs.families.remove(&marker).is_none() {
-                let chain = self.defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-                self.defs.families.insert(marker, chain);
-            }
-            ctx.set_fonts(self.defs.clone());
+        if let Some(f) = &self.ref_fonts {
+            f.begin_pass(ctx.pixels_per_point(), REF_ATLAS);
         }
-        self.ref_missed = false;
     }
 
     /// Layout acuan untuk teks canvas: yang dipakai hanya posisi glyph-nya, jadi hasilnya
     /// disimpan di sini, di luar cache egui.
     ///
-    /// egui ikut merasterkan glyph berukuran acuan (besar) ke atlas font setiap kali layout ini
-    /// dihitung, dan membuang cache-nya sendiri bersama atlas tiap atlas penuh. Tanpa simpanan ini
-    /// glyph acuan langsung mengisi lagi separuh atlas 2048px, atlas cepat penuh lagi, dan tiap
-    /// pengosongan (unggah ulang seluruh atlas + layout ulang) terasa sebagai sendatan saat zoom.
+    /// The layout runs on a second set of fonts (`ref_fonts`). egui rasterizes every glyph it lays
+    /// out, and at the reference size those glyphs are large: in the atlas the canvas draws from
+    /// they took up so much room that the atlas had to be emptied again and again while zooming
+    /// brought new text into view, and every time all visible text was laid out and rasterized
+    /// again — a stutter of 20–40 ms.
     pub fn reference_layout(&mut self, ctx: &egui::Context, job: egui::text::LayoutJob) -> Arc<egui::Galley> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -450,13 +431,8 @@ impl FontManager {
         if self.reference.len() >= 8192 {
             self.reference.clear();
         }
-        let (galley, added) = ctx.fonts(|f| {
-            let before = f.font_atlas_fill_ratio();
-            let galley = f.layout_job(job);
-            (galley, f.font_atlas_fill_ratio() - before)
-        });
-        self.ref_weight += added.max(0.0);
-        self.ref_missed = true;
+        let ppp = ctx.pixels_per_point();
+        let galley = self.ref_fonts.get_or_insert_with(|| egui::epaint::text::Fonts::new(ppp, REF_ATLAS, self.defs.clone())).layout_job(job);
         self.reference.insert(key, galley.clone());
         galley
     }
@@ -510,6 +486,11 @@ impl FontManager {
 
     /// Jumlah font yang sudah bisa dipakai untuk layout di frame ini (font yang baru selesai
     /// dimuat baru berlaku satu frame kemudian). Berubah = tata letak teks bisa berubah.
+    /// Fonts that were asked for and have not arrived yet.
+    pub fn pending(&self) -> usize {
+        self.state.values().filter(|s| matches!(s, State::Loading)).count()
+    }
+
     pub fn usable_count(&self) -> usize {
         self.state.values().filter(|s| matches!(s, State::Ready { frame } if self.frame > *frame)).count()
     }
