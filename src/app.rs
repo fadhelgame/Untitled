@@ -40,6 +40,8 @@ const MIN_ZOOM: f32 = 0.01;
 const MAX_ZOOM: f32 = 64.0;
 const UNDO_LIMIT: usize = 200;
 const CLIP_TAG: &str = "kanvas_clip";
+/// Pojok kiri-atas frame asal objek yang disalin, untuk Paste in Place ke frame lain.
+const CLIP_ORIGIN: &str = "kanvas_origin";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -889,38 +891,107 @@ impl App {
         self.roots().into_iter().filter_map(|id| self.doc.find(id).cloned()).collect()
     }
 
-    fn copy(&self, ctx: &egui::Context) {
+    /// Isi clipboard untuk seleksi saat ini: node-nodenya plus pojok frame asalnya.
+    fn clip_json(&self) -> Option<String> {
         let nodes = self.selected_nodes();
         if nodes.is_empty() {
-            return;
+            return None;
         }
-        if let Ok(json) = serde_json::to_string(&serde_json::json!({ CLIP_TAG: nodes })) {
+        // Semua objek dari satu frame yang sama: catat pojok frame itu.
+        let mut parents: Vec<Option<u64>> = self.roots().into_iter().map(|id| self.doc.parent_of(id)).collect();
+        parents.dedup();
+        let origin = match parents[..] {
+            [Some(p)] => self.doc.find(p).map(|f| {
+                let b = f.bounds();
+                [b.0, b.1]
+            }),
+            _ => None,
+        };
+        serde_json::to_string(&serde_json::json!({ CLIP_TAG: nodes, CLIP_ORIGIN: origin })).ok()
+    }
+
+    fn copy(&self, ctx: &egui::Context) {
+        if let Some(json) = self.clip_json() {
             ctx.copy_text(json);
         }
     }
 
-    fn paste_text(&mut self, text: &str) {
-        let parsed = serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|mut v| v.get_mut(CLIP_TAG).map(serde_json::Value::take))
+    fn cut(&mut self, ctx: &egui::Context) {
+        self.copy(ctx);
+        self.delete_selection();
+    }
+
+    /// Posisi pointer kalau sedang di atas canvas kosong (bukan di atas panel, menu, atau jendela).
+    fn canvas_pointer(&self, ctx: &egui::Context) -> Option<Pos2> {
+        let p = ctx.input(|i| i.pointer.latest_pos())?;
+        let bare = ctx.layer_id_at(p).is_some_and(|l| l.order == egui::Order::Background);
+        (bare && self.canvas_rect.contains(p)).then_some(p)
+    }
+
+    /// Frame tujuan Paste in Place: frame di bawah pointer, kalau tidak ada frame dari seleksi.
+    fn paste_frame(&self, at: Option<Pos2>) -> Option<u64> {
+        let hovered = at.and_then(|p| {
+            let w = self.view.to_world(self.canvas_rect.min, p);
+            self.doc.frame_at(w.x, w.y, 0)
+        });
+        hovered.or_else(|| {
+            let id = *self.sel.first()?;
+            match self.doc.find(id)?.kind {
+                Kind::Frame => Some(id),
+                _ => self.doc.parent_of(id),
+            }
+        })
+    }
+
+    /// Tempel isi clipboard. `at` = posisi pointer di canvas (layar); tanpa itu, tengah layar.
+    /// Biasa: objek dipusatkan di `at`. `in_place`: posisi yang sama seperti aslinya, relatif
+    /// terhadap frame tujuan (frame di bawah pointer atau frame terpilih).
+    fn paste_text(&mut self, text: &str, in_place: bool, at: Option<Pos2>) {
+        let mut value = serde_json::from_str::<serde_json::Value>(text).ok();
+        let origin = value.as_ref().and_then(|v| v.get(CLIP_ORIGIN)).and_then(|o| serde_json::from_value::<[f32; 2]>(o.clone()).ok());
+        let parsed = value
+            .as_mut()
+            .and_then(|v| v.get_mut(CLIP_TAG).map(serde_json::Value::take))
             .and_then(|v| serde_json::from_value::<Vec<Node>>(v).ok());
+        let c = self.view.to_world(self.canvas_rect.min, at.unwrap_or(self.canvas_rect.center()));
         match parsed {
-            Some(nodes) => self.add_nodes(nodes, 24.0),
+            Some(nodes) if nodes.is_empty() => {}
+            Some(nodes) if in_place => {
+                let target = self.paste_frame(at);
+                let corner = target.and_then(|id| self.doc.find(id)).map(|f| f.bounds());
+                match (origin, corner) {
+                    (Some(o), Some(b)) => {
+                        self.status = "Pasted in place, at the same position in this frame.".into();
+                        self.add_nodes(nodes, vec2(b.0 - o[0], b.1 - o[1]), target);
+                    }
+                    _ => {
+                        self.status = "Pasted in place.".into();
+                        self.add_nodes(nodes, Vec2::ZERO, None);
+                    }
+                }
+            }
+            Some(nodes) => {
+                // Pusat kotak pembatas semua objek jatuh di posisi pointer.
+                let b = nodes.iter().map(|n| n.aabb()).fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |a, q| (a.0.min(q.0), a.1.min(q.1), a.2.max(q.2), a.3.max(q.3)));
+                let d = vec2((c.x - (b.0 + b.2) * 0.5).round(), (c.y - (b.1 + b.3) * 0.5).round());
+                self.add_nodes(nodes, d, None);
+            }
             None => {
-                // Teks biasa dari clipboard: jadikan node teks di tengah layar.
-                let c = self.view.to_world(self.canvas_rect.min, self.canvas_rect.center());
+                // Teks biasa dari clipboard: jadikan node teks di posisi pointer.
                 let mut n = Node::new(0, Kind::Text, c.x.round(), c.y.round());
                 n.text = text.chars().take(5000).collect();
                 n.name = "Text".into();
                 n.fill = Some(if self.doc.frame_at(c.x, c.y, 0).is_some() { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
                 n.w = 100.0;
                 n.h = 20.0;
-                self.add_nodes(vec![n], 0.0);
+                self.add_nodes(vec![n], Vec2::ZERO, None);
             }
         }
     }
 
-    fn add_nodes(&mut self, mut nodes: Vec<Node>, offset: f32) {
+    /// Sisipkan salinan node, digeser `offset`. `parent` memaksa frame induknya; tanpa itu
+    /// induknya frame yang memuat titik tengah node.
+    fn add_nodes(&mut self, mut nodes: Vec<Node>, offset: Vec2, parent: Option<u64>) {
         if nodes.is_empty() {
             return;
         }
@@ -929,9 +1000,9 @@ impl App {
         self.sel.clear();
         for mut n in nodes {
             self.doc.reassign_ids(&mut n);
-            n.translate(offset, offset);
+            n.translate(offset.x, offset.y);
             let (cx, cy) = n.center();
-            let parent = if n.kind == Kind::Frame { None } else { self.doc.frame_at(cx, cy, 0) };
+            let parent = if n.kind == Kind::Frame { None } else { parent.or_else(|| self.doc.frame_at(cx, cy, 0)) };
             self.sel.push(n.id);
             self.doc.insert(n, parent);
         }
@@ -1219,7 +1290,7 @@ impl App {
         }
         if dup {
             let nodes = self.selected_nodes();
-            self.add_nodes(nodes, 24.0);
+            self.add_nodes(nodes, vec2(24.0, 24.0), None);
         }
         if all && self.ext.path_edit.is_some() {
             self.path_edit_select_all();
@@ -1245,7 +1316,10 @@ impl App {
                     self.copy(ctx);
                     self.delete_selection();
                 }
-                _ => self.paste_text(&text),
+                _ => {
+                    let at = self.canvas_pointer(ctx);
+                    self.paste_text(&text, false, at);
+                }
             }
         }
 
@@ -1411,10 +1485,28 @@ impl App {
                     self.redo_cmd();
                 }
                 ui.separator();
+                let has_sel = !self.sel.is_empty();
+                if ui.add_enabled(has_sel, egui::Button::new("Cut").shortcut_text("Ctrl+X")).clicked() {
+                    ui.close_menu();
+                    self.cut(ui.ctx());
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+                    ui.close_menu();
+                    self.copy(ui.ctx());
+                }
+                if ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                    ui.close_menu();
+                    self.paste_clipboard(ui.ctx(), false);
+                }
+                if ui.add(egui::Button::new("Paste in Place").shortcut_text("Ctrl+Shift+V")).clicked() {
+                    ui.close_menu();
+                    self.paste_clipboard(ui.ctx(), true);
+                }
+                ui.separator();
                 if ui.add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {
                     ui.close_menu();
                     let nodes = self.selected_nodes();
-                    self.add_nodes(nodes, 24.0);
+                    self.add_nodes(nodes, vec2(24.0, 24.0), None);
                 }
                 if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
                     ui.close_menu();
@@ -2267,6 +2359,48 @@ impl App {
                         232 | 244 => {
                             let now: Vec<String> = b.ids.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.text.clone()).collect();
                             eprintln!("TEXTUNDO frame {}: {now:?}", b.frame);
+                        }
+                        _ => {}
+                    }
+                }
+                // `KANVAS_BENCH_PASTE=1`: frame kedua di samping frame demo; salin satu isi frame demo,
+                // arahkan pointer ke frame kedua, lalu Paste dan Paste in Place. Hasilnya ke stderr.
+                if std::env::var("KANVAS_BENCH_PASTE").is_ok() {
+                    match b.frame {
+                        200 => {
+                            let demo = self.doc.nodes.iter().find(|n| n.name == "Feature demo").map(|n| (n.id, n.bounds(), n.children.first().map(|c| c.id)));
+                            if let Some((demo, q, Some(child))) = demo {
+                                let id = self.doc.alloc_id();
+                                let mut f = Node::new(id, Kind::Frame, q.2 + 300.0, q.1 + 150.0);
+                                (f.w, f.h, f.name) = (q.2 - q.0, q.3 - q.1, "Second".into());
+                                f.fill = Some([255, 255, 255, 255]);
+                                self.doc.insert(f, None);
+                                self.fit_all();
+                                b.ids = vec![demo, id, child];
+                                let at = self.view.to_screen(self.canvas_rect.min, q.2 + 300.0 + (q.2 - q.0) * 0.7, q.1 + 150.0 + (q.3 - q.1) * 0.6);
+                                b.inject.push((203, egui::Event::PointerMoved(at)));
+                            }
+                        }
+                        208 if b.ids.len() == 3 => {
+                            let (demo, second, child) = (b.ids[0], b.ids[1], b.ids[2]);
+                            let corner = |app: &Self, id: u64| app.doc.find(id).map(|n| (n.bounds().0, n.bounds().1)).unwrap_or_default();
+                            self.sel = vec![child];
+                            let json = self.clip_json().unwrap_or_default();
+                            let at = self.canvas_pointer(ctx);
+                            let world = at.map(|p| self.view.to_world(self.canvas_rect.min, p));
+                            let (src, f1, f2) = (corner(self, child), corner(self, demo), corner(self, second));
+                            self.paste_text(&json, false, at);
+                            let got = self.sel.first().and_then(|id| self.doc.find(*id)).map(|n| (n.aabb(), self.doc.parent_of(n.id) == Some(second)));
+                            eprintln!("PASTE pointer world {world:?}; pasted aabb + in second frame: {got:?}");
+                            self.sel = vec![child];
+                            self.paste_text(&json, true, at);
+                            let got = self.sel.first().map(|id| (corner(self, *id), self.doc.parent_of(*id) == Some(second)));
+                            eprintln!("PASTE in place: source offset {:?}; pasted {:?}", (src.0 - f1.0, src.1 - f1.1), got.map(|(p, ok)| ((p.0 - f2.0, p.1 - f2.1), ok)));
+                            // Pointer di luar frame mana pun, tanpa seleksi frame lain: posisi yang sama persis.
+                            self.sel = vec![child];
+                            self.paste_text(&json, true, None);
+                            let got = self.sel.first().map(|id| (corner(self, *id), self.doc.parent_of(*id) == Some(demo)));
+                            eprintln!("PASTE in place, no pointer: source {src:?}; pasted + in demo frame: {got:?}");
                         }
                         _ => {}
                     }

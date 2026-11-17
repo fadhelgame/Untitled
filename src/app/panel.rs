@@ -65,6 +65,8 @@ impl App {
                     "Alt+H V        align centers",
                     "1 … 9, 0       opacity 10% … 100%",
                     "Shift+X        swap fill/stroke",
+                    "Ctrl+V         paste at the pointer",
+                    "Ctrl+Shift+V   paste in place",
                     "Ctrl+Shift+H   show/hide",
                     "Ctrl+Alt+G     clipping mask",
                     "Enter          edit text",

@@ -1368,27 +1368,38 @@ impl App {
         }
     }
 
-    fn paste_image(&mut self) {
+    /// Tempel dari clipboard sistem (menu Edit dan Ctrl+Shift+V): objek Kanvas atau teks, kalau
+    /// tidak ada teks maka gambar.
+    pub(super) fn paste_clipboard(&mut self, ctx: &egui::Context, in_place: bool) {
+        let at = self.canvas_pointer(ctx);
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) if !text.is_empty() => self.paste_text(&text.replace("\r\n", "\n"), in_place, at),
+            _ => self.paste_image(at),
+        }
+    }
+
+    fn paste_image(&mut self, at: Option<Pos2>) {
         let image = arboard::Clipboard::new().and_then(|mut c| c.get_image());
         let Ok(img) = image else { return };
         let (w, h) = (img.width as u32, img.height as u32);
         let Some(rgba) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else { return };
         let mut png = Vec::new();
         if rgba.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).is_ok() {
-            self.add_image(png, "Pasted image", None);
+            self.add_image(png, "Pasted image", at);
         }
     }
 
     /// Ctrl+V dengan gambar di clipboard. egui hanya mengirim event Paste untuk teks,
     /// jadi tempel gambar dideteksi dari tombol V yang tidak menghasilkan teks.
     pub(super) fn clipboard_keys(&mut self, ctx: &egui::Context) {
-        let (plain_down, cmd_down, up, pasted) = ctx.input(|i| {
-            let (mut plain, mut cmd, mut up, mut pasted) = (false, false, false, false);
+        let (plain_down, cmd_down, shift_down, up, pasted) = ctx.input(|i| {
+            let (mut plain, mut cmd, mut shift, mut up, mut pasted) = (false, false, false, false, false);
             for e in &i.events {
                 match e {
                     egui::Event::Key { key: Key::V, pressed: true, modifiers, .. } => {
                         if modifiers.command {
                             cmd = true;
+                            shift |= modifiers.shift;
                         } else {
                             plain = true;
                         }
@@ -1398,14 +1409,18 @@ impl App {
                     _ => {}
                 }
             }
-            (plain, cmd, up, pasted)
+            (plain, cmd, shift, up, pasted)
         });
         let free = !ctx.wants_keyboard_input() && self.editing.is_none();
         self.ext.v_plain |= plain_down;
         self.ext.paste_seen |= pasted;
+        let at = self.canvas_pointer(ctx);
         if cmd_down && !self.ext.paste_seen {
-            if free {
-                self.paste_image();
+            // Ctrl+Shift+V tidak dianggap paste oleh egui (tidak ada event Paste): Paste in Place.
+            if free && shift_down {
+                self.paste_clipboard(ctx, true);
+            } else if free {
+                self.paste_image(at);
             }
             self.ext.paste_seen = true;
         }
@@ -1414,7 +1429,7 @@ impl App {
             let seen = std::mem::take(&mut self.ext.paste_seen);
             // Ctrl+V ditelan egui saat ditekan (tidak ada event tekan), jadi dikenali saat dilepas.
             if !plain && !seen && free {
-                self.paste_image();
+                self.paste_image(at);
             }
         }
     }

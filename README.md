@@ -207,6 +207,8 @@ Every screenshot here is the real app.
 | `T` | Text | `Alt+A` `D` `W` `S` | Align left / right / top / bottom |
 | `I` | Eyedropper | `Alt+H` `V` | Align centers |
 | | | `Shift+X` | Swap fill and stroke |
+| | | `Ctrl+V` | Paste at the pointer |
+| | | `Ctrl+Shift+V` | Paste in place (same position, in the frame under the pointer) |
 | | | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 
 On macOS, use `Cmd` wherever this table says `Ctrl`. While resizing, hold `Shift` to keep the ratio and `Alt` to resize from the center. Drag just outside a corner to rotate.
