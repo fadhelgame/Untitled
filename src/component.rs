@@ -51,7 +51,7 @@ node_fields! {
     follow: [
         fill, gradient, stroke, stroke_w, radius, font, weight, italic, font_size, line_height, letter_spacing, align,
         underline, strike, list, valign, path_offset, path_side,
-        image, crop, flip_h, flip_v, blend, opacity, visible, locked, tag, dash, gap, stroke_align, cap, join, shadow, blur, inner_shadow, bg_blur,
+        image, crop, adjust, flip_h, flip_v, blend, opacity, visible, locked, tag, dash, gap, stroke_align, cap, join, shadow, blur, inner_shadow, bg_blur,
         fill_style, stroke_style, type_style,
     ],
     by_hand: [text, spans],

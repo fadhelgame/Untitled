@@ -255,6 +255,23 @@ fn parse_shadow(v: &Value, d: crate::doc::Shadow) -> Result<Option<crate::doc::S
     Ok(Some(crate::doc::Shadow { x: f("x", d.x), y: f("y", d.y), blur: f("blur", d.blur).max(0.0), color }))
 }
 
+/// The image adjustments in `v`: an object with any of `adjust::FIELDS`, each -100..100. What
+/// is left out stays as it is in `was`; null (for the whole, or for one value) is 0.
+fn parse_adjust(v: &Value, was: crate::adjust::Adjust) -> Result<Option<crate::adjust::Adjust>, String> {
+    use crate::adjust::{Adjust, FIELDS};
+    if v.is_null() {
+        return Ok(None);
+    }
+    let names = || FIELDS.map(|f| f.0).join(", ");
+    let map = v.as_object().ok_or_else(|| format!("`adjust` must be an object with any of: {}", names()))?;
+    let mut values = was.values();
+    for (key, x) in map {
+        let at = FIELDS.iter().position(|f| f.0 == key).ok_or_else(|| format!("unknown adjustment \"{key}\"; use: {}", names()))?;
+        values[at] = if x.is_null() { 0.0 } else { num(&format!("adjust.{key}"), x)? };
+    }
+    Ok(Adjust::from_values(values).normalized())
+}
+
 fn kind_name(k: Kind) -> &'static str {
     match k {
         Kind::Frame => "frame",
@@ -427,6 +444,10 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     }
     if n.bg_blur != 0.0 {
         put("background_blur", r2(n.bg_blur));
+    }
+    if let Some(a) = n.adjustment() {
+        let values: serde_json::Map<String, Value> = crate::adjust::FIELDS.iter().zip(a.values()).map(|((name, _), v)| (name.to_string(), r2(v))).collect();
+        put("adjust", Value::Object(values));
     }
     if n.rotation != 0.0 {
         put("rotation", r2(n.rotation));
@@ -1074,6 +1095,12 @@ impl App {
                 "inner_shadow" => n.inner_shadow = parse_shadow(v, crate::doc::Shadow { blur: 8.0, ..Default::default() })?,
                 "blur" => n.blur = if v.is_null() { 0.0 } else { num(k, v)?.clamp(0.0, 500.0) },
                 "background_blur" => n.bg_blur = if v.is_null() { 0.0 } else { num(k, v)?.clamp(0.0, 500.0) },
+                "adjust" => {
+                    if n.kind != Kind::Image && !v.is_null() {
+                        return Err(format!("`adjust` is a property of images, not of a {}", n.kind.label().to_lowercase()));
+                    }
+                    n.adjust = parse_adjust(v, n.adjust.unwrap_or_default())?;
+                }
                 "rotation" => n.rotation = num(k, v)?,
                 "flip_h" | "flip_v" => {
                     let on = flag(k, v)?;
@@ -1866,6 +1893,25 @@ mod tests {
         assert_eq!((c["x"].as_f64(), c["y"].as_f64()), (Some(20.0), Some(30.0)));
         assert_eq!(c["fill"], json!("#ff0000"));
         assert_eq!(describe(&f, (0.0, 0.0), false)["child_count"], json!(1));
+    }
+
+    #[test]
+    fn image_adjustments_are_read_and_described() {
+        use crate::adjust::Adjust;
+        let mut n = Node::new(1, Kind::Image, 0.0, 0.0);
+        assert_eq!(describe(&n, (0.0, 0.0), true)["adjust"], Value::Null);
+        n.adjust = parse_adjust(&json!({ "exposure": 20, "saturation": -250 }), Adjust::default()).unwrap();
+        assert_eq!(n.adjust, Some(Adjust { exposure: 20.0, saturation: -100.0, ..Default::default() }));
+        let v = describe(&n, (0.0, 0.0), true);
+        assert_eq!(v["adjust"], json!({ "exposure": 20.0, "contrast": 0.0, "saturation": -100.0, "temperature": 0.0, "tint": 0.0, "highlights": 0.0, "shadows": 0.0 }));
+        // What is left out stays; a null value is 0; all at 0 is no adjustment; null takes it away.
+        let more = parse_adjust(&json!({ "tint": 5, "exposure": null }), n.adjust.unwrap()).unwrap();
+        assert_eq!(more, Some(Adjust { saturation: -100.0, tint: 5.0, ..Default::default() }));
+        assert_eq!(parse_adjust(&json!({ "saturation": 0 }), Adjust { saturation: 40.0, ..Default::default() }).unwrap(), None);
+        assert_eq!(parse_adjust(&Value::Null, n.adjust.unwrap()).unwrap(), None);
+        assert!(parse_adjust(&json!({ "hue": 5 }), Adjust::default()).unwrap_err().contains("unknown adjustment"));
+        assert!(parse_adjust(&json!({ "tint": "a lot" }), Adjust::default()).is_err());
+        assert!(parse_adjust(&json!(12), Adjust::default()).is_err());
     }
 
     #[test]

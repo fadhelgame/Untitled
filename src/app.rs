@@ -8,6 +8,7 @@ use eframe::egui::{
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+mod adjust_bench;
 mod assist;
 mod autolayout;
 pub(crate) mod blend;
@@ -2651,6 +2652,13 @@ impl App {
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_PRINT") {
                     b.ids = self.bench_print(ctx, &mode, &mut b.inject);
                 }
+                // `KANVAS_BENCH_ADJUST=1`: one picture with every image adjustment, beside the
+                // export of that frame (see `bench_adjust`). `=view:x0,y0,x1,y1`: that part.
+                // `=panel`: an adjusted image is selected, the panel shows its Adjust section.
+                // `=drag`: the sliders of a 12 megapixel photo are moved, and timed.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_ADJUST") {
+                    b.ids = self.bench_adjust(ctx, &mode, &mut b.inject);
+                }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
                     let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
@@ -3310,6 +3318,34 @@ impl App {
                         eprintln!("EFFECTS frame {}: {:.2} ms", b.frame, self.frame_ms);
                     }
                 }
+                let adjust = std::env::var("KANVAS_BENCH_ADJUST").ok().filter(|_| b.ids.len() == 1);
+                if let Some(mode) = &adjust {
+                    let mut fonts = Vec::new();
+                    if let Some(stage) = self.doc.find(b.ids[0]) {
+                        stage.walk(&mut |n| {
+                            if n.kind == Kind::Text {
+                                fonts.push((n.font.clone(), n.weight, n.italic));
+                            }
+                        });
+                    }
+                    fonts.dedup();
+                    for (font, weight, italic) in &fonts {
+                        self.fonts.resolve(font, *weight, *italic);
+                    }
+                    let loaded = fonts.iter().all(|(font, weight, italic)| self.fonts.settled(font, *weight, *italic));
+                    if b.aux == 0 && b.frame >= 230 && ((loaded && self.ext.busy() == 0) || b.frame > 900) {
+                        b.aux = b.frame;
+                        if mode != "drag" {
+                            self.bench_adjust_finish(ctx, b.ids[0], &b.out);
+                        }
+                    }
+                    if mode == "drag" && b.aux != 0 {
+                        self.bench_adjust_frame(ctx, b.ids[0], b.frame - b.aux);
+                    }
+                    if mode == "ui" {
+                        self.bench_adjust_ui(ctx, b.frame, &mut b.inject);
+                    }
+                }
                 if std::env::var_os("KANVAS_BENCH_CAPS").is_some() && (250..=255).contains(&b.frame) {
                     eprintln!("CAPS frame {}: {:.2} ms", b.frame, self.frame_ms);
                 }
@@ -3349,6 +3385,7 @@ impl App {
                 let settled = settled && (textpath.is_none() || (b.aux != 0 && b.frame > b.aux + 80));
                 let settled = settled && (!print || (b.aux != 0 && b.frame > b.aux + 80));
                 let settled = settled && (!effects || (b.aux != 0 && b.frame > b.aux + 80 && self.ext.busy() == 0));
+                let settled = settled && (adjust.is_none() || (b.aux != 0 && b.frame > b.aux + if adjust.as_deref() == Some("drag") { 290 } else { 80 } && self.ext.busy() == 0 && (adjust.as_deref() != Some("ui") || b.frame > 660)));
                 let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && settled && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;

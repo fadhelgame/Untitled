@@ -160,6 +160,77 @@ fn mime(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// An image as the `href` of an `<image>`: the file itself, or, with adjustments, its pixels
+/// with those applied (the same `Curves` the canvas runs) and encoded again.
+fn image_href(id: u64, asset: &Asset, adjust: Option<crate::adjust::Adjust>) -> std::sync::Arc<str> {
+    let plain = || format!("data:{};base64,{}", mime(&asset.bytes), b64::encode(&asset.bytes)).into();
+    let Some(adjust) = adjust else { return plain() };
+    // Encoding a photo takes a while, and the same adjusted image is asked for again and again
+    // (once per use in an export, and by every shadow and blur texture of the canvas), so the
+    // last ones are kept.
+    type Kept = Vec<((u64, [u32; 7]), std::sync::Arc<str>)>;
+    static KEPT: std::sync::Mutex<Kept> = std::sync::Mutex::new(Vec::new());
+    const KEEP_BYTES: usize = 192 << 20;
+    let key = (id, adjust.key());
+    {
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = kept.iter().position(|e| e.0 == key) {
+            let hit = kept.remove(i);
+            kept.push(hit.clone());
+            return hit.1;
+        }
+    }
+    let Some(href) = adjusted_href(&asset.bytes, adjust) else { return plain() };
+    let href: std::sync::Arc<str> = href.into();
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    kept.push((key, href.clone()));
+    while kept.len() > 1 && kept.iter().map(|e| e.1.len()).sum::<usize>() > KEEP_BYTES {
+        kept.remove(0);
+    }
+    href
+}
+
+/// The pixels of an image file with `adjust` applied, as a data URI: at the full size of the
+/// file, a JPEG again if it was one (it has no transparency to keep) and a PNG otherwise.
+/// An SVG becomes the bitmap the canvas shows. `None`: the file cannot be read.
+fn adjusted_href(bytes: &[u8], adjust: crate::adjust::Adjust) -> Option<String> {
+    use image::ImageEncoder;
+    let curves = adjust.curves();
+    let mut out = Vec::new();
+    let kind = if mime(bytes) == "image/jpeg" {
+        let mut rgb = image::load_from_memory(bytes).ok()?.into_rgb8();
+        // (Three bytes per pixel here: the tables are run pixel by pixel.)
+        for p in rgb.pixels_mut() {
+            let [r, g, b, _] = curves.pixel([p[0], p[1], p[2], 255]);
+            p.0 = [r, g, b];
+        }
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95);
+        encoder.write_image(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8).ok()?;
+        "image/jpeg"
+    } else {
+        let (w, h, mut rgba) = if is_svg(bytes) {
+            let mut p = crate::app::render::decode_pixels(bytes).ok()?;
+            curves.run(&mut p.rgba, true);
+            // Out of the premultiplied form, which a PNG does not have.
+            for px in p.rgba.chunks_exact_mut(4).filter(|px| px[3] != 0 && px[3] != 255) {
+                let a = px[3] as u32;
+                (px[0], px[1], px[2]) = (((px[0] as u32 * 255 + a / 2) / a).min(255) as u8, ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8, ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8);
+            }
+            (p.size[0] as u32, p.size[1] as u32, std::mem::take(&mut p.rgba))
+        } else {
+            let mut rgba = image::load_from_memory(bytes).ok()?.into_rgba8();
+            adjust.apply_rgba(&mut rgba);
+            (rgba.width(), rgba.height(), rgba.into_raw())
+        };
+        // Colour hidden under full transparency is not worth its bytes.
+        rgba.chunks_exact_mut(4).filter(|px| px[3] == 0).for_each(|px| px.fill(0));
+        let encoder = image::codecs::png::PngEncoder::new_with_quality(&mut out, image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Adaptive);
+        encoder.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8).ok()?;
+        "image/png"
+    };
+    Some(format!("data:{kind};base64,{}", b64::encode(&out)))
+}
+
 struct Outline<'a> {
     d: &'a mut String,
     x: f32,
@@ -721,7 +792,7 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
             );
         }
         Kind::Image => {
-            let Some(asset) = n.image.and_then(|id| assets.get(&id)) else { return };
+            let Some((asset_id, asset)) = n.image.and_then(|id| Some((id, assets.get(&id)?))) else { return };
             // Gambar yang di-crop: gambar utuh ditaruh di kotaknya sendiri lalu dipotong ke kotak node.
             let (ix0, iy0, ix1, iy1) = n.image_rect();
             let clip = if r > 0.0 || n.crop.is_some() {
@@ -749,11 +820,11 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
             };
             let _ = write!(
                 out,
-                r#"<image x="{ix0}" y="{iy0}" width="{}" height="{}" preserveAspectRatio="none"{clip}{overlay} href="data:{};base64,{}"/>"#,
+                r#"<image x="{ix0}" y="{iy0}" width="{}" height="{}" preserveAspectRatio="none"{clip}{overlay} href="{}"/>"#,
                 ix1 - ix0,
                 iy1 - iy0,
-                mime(&asset.bytes),
-                b64::encode(&asset.bytes)
+                // (Under a colour overlay only the alpha shows, which adjustments leave alone.)
+                image_href(asset_id, asset, n.adjustment().filter(|_| n.fill.is_none()))
             );
             inner_fx(out, n, fonts, ctx, Inner::Flipped);
             stroke_rect(out, n, r);

@@ -6,6 +6,7 @@ use super::picker::Picker;
 use super::vtext;
 use super::{col, View};
 use crate::textpath;
+use crate::adjust::{Adjust, Curves};
 use crate::doc::{Asset, Doc, Gradient, Kind, Node};
 use crate::fonts::FontManager;
 use eframe::egui::{
@@ -95,6 +96,56 @@ struct Decoded {
     image: Result<ColorImage, String>,
 }
 
+/// Key of the texture of an adjusted image: the asset and `Adjust::key`.
+type AdjKey = (u64, [u32; 7]);
+
+/// The decoded pixels of an asset, kept for a while after its adjustments were changed: a
+/// slider that is being dragged gets its picture from `preview` on the spot, without decoding
+/// the file again.
+#[derive(Clone)]
+struct AdjSrc {
+    /// As large as the texture of the image gets (`MAX_IMAGE_SIDE`).
+    full: Arc<Pixels>,
+    /// `SMALL_SIDE`, for an image that is small on screen.
+    small: Arc<Pixels>,
+    /// `PREVIEW_SIDE`, for the picture while a slider moves.
+    preview: Arc<Pixels>,
+    used: u64,
+}
+
+/// The texture of an image with its adjustments applied, made on another thread.
+struct AdjTex {
+    tex: TextureHandle,
+    /// At full size, not the small version (as `Ext::tex_full`).
+    full: bool,
+    frame: u64,
+}
+
+/// One texture per asset that follows a slider while it moves: its pixels are replaced in
+/// place on every step, so a drag makes no new textures.
+struct AdjLive {
+    adjust: Adjust,
+    tex: TextureHandle,
+    /// The frame `adjust` was last changed on: the full-size texture is made once it rests.
+    since: u64,
+    frame: u64,
+}
+
+struct AdjDone {
+    key: AdjKey,
+    full: bool,
+    /// The pixels, when the thread had to decode them.
+    src: Option<AdjSrc>,
+    image: Result<ColorImage, String>,
+}
+
+/// Longest side of the picture an image shows while one of its adjustments is being dragged.
+const PREVIEW_SIDE: usize = 1024;
+/// Frames an adjustment has to rest before its full-size texture is made.
+const ADJUST_SETTLE: u64 = 8;
+/// Assets whose decoded pixels are kept (see `AdjSrc`).
+const ADJUST_SOURCES: usize = 4;
+
 /// Sisi terpanjang potongan SVG yang dirasterkan ulang untuk zoom besar.
 const DETAIL_MAX: f32 = 4096.0;
 
@@ -102,6 +153,8 @@ const DETAIL_MAX: f32 = 4096.0;
 /// `uv` = bagian gambar yang dicakup (0..1), `wpx`/`hpx` = ukuran piksel gambar utuh pada skala itu.
 struct Detail {
     key: TexKey,
+    /// The adjustments it was made with (`Adjust::key`).
+    adjust: Option<[u32; 7]>,
     uv: Rect,
     wpx: f32,
     hpx: f32,
@@ -166,6 +219,7 @@ struct InnerDone {
 struct DetailReq {
     node: u64,
     key: TexKey,
+    adjust: Option<Adjust>,
     uv: Rect,
     wpx: f32,
     hpx: f32,
@@ -248,6 +302,21 @@ pub struct Ext {
     pub notice: Option<String>,
     img_tx: mpsc::Sender<Decoded>,
     img_rx: mpsc::Receiver<Decoded>,
+    /// Textures of images with adjustments, per asset and adjustment (see `adjusted_texture`).
+    adj: HashMap<AdjKey, AdjTex>,
+    /// Which of them each image node last asked for: one it moved on from, and that no other
+    /// node uses, is dropped at once.
+    adj_node: HashMap<u64, (AdjKey, u64)>,
+    adj_src: HashMap<u64, AdjSrc>,
+    adj_live: HashMap<u64, AdjLive>,
+    /// Per asset, the adjusted texture that was dropped last: shown until the one for the
+    /// new values is there, so the image does not blink back to its plain self.
+    adj_last: HashMap<u64, (TextureHandle, u64)>,
+    /// Assets an adjusted texture is being made for, and those it could not be made for.
+    adj_busy: HashSet<u64>,
+    adj_failed: HashSet<u64>,
+    adj_tx: mpsc::Sender<AdjDone>,
+    adj_rx: mpsc::Receiver<AdjDone>,
     blend_gl: blend::Shared,
     glyphs: vtext::Cache,
     /// Aset mana yang berupa SVG.
@@ -301,7 +370,17 @@ impl Default for Ext {
         let (sh_tx, sh_rx) = mpsc::channel();
         let (in_tx, in_rx) = mpsc::channel();
         let (bl_tx, bl_rx) = mpsc::channel();
+        let (adj_tx, adj_rx) = mpsc::channel();
         Ext {
+            adj: HashMap::new(),
+            adj_node: HashMap::new(),
+            adj_src: HashMap::new(),
+            adj_live: HashMap::new(),
+            adj_last: HashMap::new(),
+            adj_busy: HashSet::new(),
+            adj_failed: HashSet::new(),
+            adj_tx,
+            adj_rx,
             inners: HashMap::new(),
             inner_busy: HashSet::new(),
             inner_failed: HashSet::new(),
@@ -382,7 +461,7 @@ impl Ext {
 
     /// Images, shadows and blurs still being prepared on other threads.
     pub fn busy(&self) -> usize {
-        self.decoding.len() + self.detail_busy.len() + self.shadow_busy.len() + self.blur_busy.len() + self.inner_busy.len()
+        self.decoding.len() + self.detail_busy.len() + self.shadow_busy.len() + self.blur_busy.len() + self.inner_busy.len() + self.adj_busy.len()
     }
 
     /// Mesh vector untuk teks yang di layar lebih besar dari batas atlas glyph (`px` = tinggi
@@ -415,11 +494,7 @@ impl Ext {
                 self.notice = Some(format!("Couldn't read an image: {e}"));
             }
             if let Ok(image) = result {
-                let options = egui::TextureOptions {
-                    mipmap_mode: Some(egui::TextureFilter::Linear),
-                    ..egui::TextureOptions::LINEAR
-                };
-                let handle = ctx.load_texture(format!("image-{}-{}", id.0, id.1), image, options);
+                let handle = ctx.load_texture(format!("image-{}-{}", id.0, id.1), image, image_options());
                 if let Some(old) = self.tex.insert(id, (handle, self.frame)) {
                     self.retired.push((old.0, self.frame));
                 }
@@ -429,12 +504,43 @@ impl Ext {
                 self.decode_failed.remove(&id);
             }
         }
+        while pixels < UPLOAD_PIXELS {
+            let Ok(AdjDone { key, full, src, image }) = self.adj_rx.try_recv() else { break };
+            self.adj_busy.remove(&key.0);
+            arrived = true;
+            if let Some(src) = src {
+                if self.adj_src.len() >= ADJUST_SOURCES {
+                    if let Some(oldest) = self.adj_src.iter().min_by_key(|(_, s)| s.used).map(|(id, _)| *id) {
+                        self.adj_src.remove(&oldest);
+                    }
+                }
+                self.adj_src.insert(key.0, AdjSrc { used: self.frame, ..src });
+            }
+            match image {
+                // Made for a value the slider has left since: no node shows it.
+                Ok(_) if !self.adj_node.values().any(|(k, _)| *k == key) => {}
+                Ok(image) => {
+                    pixels += image.size[0] * image.size[1];
+                    // A small version that arrives after the full one changes nothing.
+                    if full || !self.adj.get(&key).is_some_and(|e| e.full) {
+                        let tex = ctx.load_texture(format!("image-adjusted-{}", key.0), image, image_options());
+                        if let Some(old) = self.adj.insert(key, AdjTex { tex, full, frame: self.frame }) {
+                            self.retired.push((old.tex, self.frame));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.adj_failed.insert(key.0);
+                    self.notice = Some(format!("Couldn't read an image: {e}"));
+                }
+            }
+        }
         while let Ok((req, result)) = self.det_rx.try_recv() {
             self.detail_busy.remove(&req.node);
             match result {
                 Ok(image) => {
                     let tex = ctx.load_texture(format!("svg-detail-{}", req.node), image, egui::TextureOptions::LINEAR);
-                    let detail = Detail { key: req.key, uv: req.uv, wpx: req.wpx, hpx: req.hpx, tex, frame: self.frame };
+                    let detail = Detail { key: req.key, adjust: req.adjust.map(|a| a.key()), uv: req.uv, wpx: req.wpx, hpx: req.hpx, tex, frame: self.frame };
                     self.details.insert(req.node, detail);
                 }
                 Err(_) => {
@@ -507,7 +613,26 @@ impl Ext {
             self.tex_full.retain(|k| tex.contains_key(k));
         }
         self.grads.retain(|_, e| e.1 + 600 > frame);
+        self.adj.retain(|_, e| e.frame + 300 > frame);
+        self.adj_node.retain(|_, e| e.1 + 300 > frame);
+        self.adj_live.retain(|_, e| e.frame + 300 > frame);
+        self.adj_last.retain(|_, e| e.1 + 300 > frame);
+        self.adj_src.retain(|_, e| e.used + 600 > frame);
     }
+
+    /// Adjusted image textures: (finished ones, ones that follow a slider or stand in for one
+    /// that is being made, assets whose decoded pixels are kept, megabytes of texture in the
+    /// first two).
+    pub fn adjusted(&self) -> (usize, usize, usize, f32) {
+        let bytes = |t: &TextureHandle| t.size()[0] * t.size()[1] * 4;
+        let spare = self.adj_live.values().map(|e| bytes(&e.tex)).chain(self.adj_last.values().map(|e| bytes(&e.0)));
+        let total: usize = self.adj.values().map(|e| bytes(&e.tex)).chain(spare).sum();
+        (self.adj.len(), self.adj_live.len() + self.adj_last.len(), self.adj_src.len(), total as f32 / (1024.0 * 1024.0))
+    }
+}
+
+fn image_options() -> egui::TextureOptions {
+    egui::TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..egui::TextureOptions::LINEAR }
 }
 
 // ---------------------------------------------------------------- gambar & SVG
@@ -534,7 +659,64 @@ fn svg_tree(bytes: &[u8]) -> Result<resvg::usvg::Tree, String> {
     resvg::usvg::Tree::from_data(bytes, &opt).map_err(|e| e.to_string())
 }
 
+/// The pixels of an image as its texture gets them, before they become one.
+pub struct Pixels {
+    pub size: [usize; 2],
+    pub rgba: Vec<u8>,
+    /// The colours are multiplied by the alpha (a rasterized SVG); otherwise the alpha is straight.
+    pub premultiplied: bool,
+}
+
+impl Pixels {
+    fn image(&self) -> ColorImage {
+        match self.premultiplied {
+            true => ColorImage::from_rgba_premultiplied(self.size, &self.rgba),
+            false => ColorImage::from_rgba_unmultiplied(self.size, &self.rgba),
+        }
+    }
+
+    /// The image with adjustments applied.
+    pub fn adjusted(&self, curves: &Curves) -> ColorImage {
+        let mut out = Pixels { size: self.size, rgba: self.rgba.clone(), premultiplied: self.premultiplied };
+        curves.run(&mut out.rgba, out.premultiplied);
+        out.image()
+    }
+
+    /// A copy whose longest side is `side` (the same pixels when it is that small already).
+    fn shrunk(self: &Arc<Self>, side: usize) -> Arc<Pixels> {
+        let [w, h] = self.size;
+        if w.max(h) <= side {
+            return self.clone();
+        }
+        let k = side as f32 / w.max(h) as f32;
+        let (nw, nh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+        // Averaged with the colours weighed by their alpha, so nothing bleeds in from pixels
+        // that are not seen.
+        let mut rgba = self.rgba.clone();
+        let weigh = !self.premultiplied && rgba.chunks_exact(4).any(|p| p[3] != 255);
+        if weigh {
+            for p in rgba.chunks_exact_mut(4) {
+                let a = p[3] as u32;
+                (p[0], p[1], p[2]) = (((p[0] as u32 * a + 127) / 255) as u8, ((p[1] as u32 * a + 127) / 255) as u8, ((p[2] as u32 * a + 127) / 255) as u8);
+            }
+        }
+        let Some(src) = image::RgbaImage::from_raw(w as u32, h as u32, rgba) else { return self.clone() };
+        let mut rgba = image::imageops::thumbnail(&src, nw, nh).into_raw();
+        if weigh {
+            for p in rgba.chunks_exact_mut(4).filter(|p| p[3] != 0) {
+                let a = p[3] as u32;
+                (p[0], p[1], p[2]) = (((p[0] as u32 * 255 + a / 2) / a).min(255) as u8, ((p[1] as u32 * 255 + a / 2) / a).min(255) as u8, ((p[2] as u32 * 255 + a / 2) / a).min(255) as u8);
+            }
+        }
+        Arc::new(Pixels { size: [nw as usize, nh as usize], rgba, premultiplied: self.premultiplied })
+    }
+}
+
 pub fn decode_image(bytes: &[u8]) -> Result<ColorImage, String> {
+    decode_pixels(bytes).map(|p| p.image())
+}
+
+pub fn decode_pixels(bytes: &[u8]) -> Result<Pixels, String> {
     if is_svg(bytes) {
         // SVG dirasterkan cukup besar supaya tetap tajam saat di-zoom.
         let tree = svg_tree(bytes)?;
@@ -544,14 +726,14 @@ pub fn decode_image(bytes: &[u8]) -> Result<ColorImage, String> {
         let (w, h) = ((size.width() * scale).ceil().max(1.0) as u32, (size.height() * scale).ceil().max(1.0) as u32);
         let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h).ok_or("couldn't create the bitmap")?;
         resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
-        return Ok(ColorImage::from_rgba_premultiplied([w as usize, h as usize], pixmap.data()));
+        return Ok(Pixels { size: [w as usize, h as usize], rgba: pixmap.take(), premultiplied: true });
     }
     let mut img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
     if img.width().max(img.height()) > MAX_IMAGE_SIDE {
         img = img.resize(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE, image::imageops::FilterType::Triangle);
     }
-    let rgba = img.to_rgba8();
-    Ok(ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
+    let rgba = img.into_rgba8();
+    Ok(Pixels { size: [rgba.width() as usize, rgba.height() as usize], rgba: rgba.into_raw(), premultiplied: false })
 }
 
 /// Rasterkan sebagian SVG: `uv` = bagian yang diambil (0..1), `wpx`×`hpx` = ukuran piksel
@@ -805,6 +987,132 @@ fn image_texture(pc: &mut PaintCx, id: u64, mask: bool, need: f32) -> Option<Tex
     None
 }
 
+/// Texture of the image of `n`: with its adjustments applied, if it has any (see
+/// `adjusted_texture`). `mask`: the silhouette for a colour overlay, which adjustments do not
+/// change (they leave the alpha alone).
+fn node_texture(pc: &mut PaintCx, n: &Node, mask: bool, need: f32) -> Option<TextureId> {
+    let id = n.image?;
+    match n.adjustment().filter(|_| !mask && !pc.ext.adj_failed.contains(&id)) {
+        Some(adjust) => adjusted_texture(pc, n.id, id, adjust, need),
+        None => image_texture(pc, id, mask, need),
+    }
+}
+
+/// Texture of the image `id` with `adjust` applied, for the node `node`.
+///
+/// The adjusted pixels are a texture of their own, made on another thread from the decoded
+/// image and kept per asset and adjustment (so copies of an image share it), in the same two
+/// sizes as plain images. While a slider moves that would be too slow and would leave a
+/// texture behind on every step, so then the picture comes from a smaller copy of the image
+/// (`PREVIEW_SIDE`), adjusted on the spot into one texture that is reused for every step
+/// (`AdjLive`). Once the value rests the proper texture is made and takes over.
+fn adjusted_texture(pc: &mut PaintCx, node: u64, id: u64, adjust: Adjust, need: f32) -> Option<TextureId> {
+    let frame = pc.ext.frame;
+    let key: AdjKey = (id, adjust.key());
+    let grow = need > SMALL_SIDE as f32 * 1.2;
+    // The texture this node used until now is of no use once no other node shows it.
+    if let Some((old, _)) = pc.ext.adj_node.insert(node, (key, frame)).filter(|(old, _)| *old != key) {
+        if !pc.ext.adj_node.values().any(|(k, _)| *k == old) {
+            if let Some(e) = pc.ext.adj.remove(&old) {
+                pc.ext.adj_last.insert(old.0, (e.tex, frame));
+            }
+        }
+    }
+    if let Some(e) = pc.ext.adj.get_mut(&key) {
+        e.frame = frame;
+        let (tex, full) = (e.tex.id(), e.full);
+        if grow && !full {
+            adjust_start(pc, key, adjust, true);
+        }
+        return Some(tex);
+    }
+    let preview = pc.ext.adj_src.get_mut(&id).map(|s| {
+        s.used = frame;
+        s.preview.clone()
+    });
+    let mut out = None;
+    let mut start = preview.is_none();
+    if let Some(preview) = preview {
+        let _span = super::perf::span(5);
+        match pc.ext.adj_live.get_mut(&id) {
+            Some(live) if live.adjust == adjust => {
+                live.frame = frame;
+                out = Some(live.tex.id());
+                start = frame >= live.since + ADJUST_SETTLE;
+            }
+            // Showing another adjustment of the same image on this frame already.
+            Some(live) if live.frame == frame => start = true,
+            Some(live) => {
+                live.tex.set(preview.adjusted(&adjust.curves()), image_options());
+                (live.adjust, live.since, live.frame) = (adjust, frame, frame);
+                out = Some(live.tex.id());
+            }
+            None => {
+                let tex = pc.ctx.load_texture(format!("image-adjusting-{id}"), preview.adjusted(&adjust.curves()), image_options());
+                out = Some(tex.id());
+                pc.ext.adj_live.insert(id, AdjLive { adjust, tex, since: frame, frame });
+            }
+        }
+    }
+    if start {
+        adjust_start(pc, key, adjust, grow);
+    } else {
+        // The frames have to go on for the value to be seen resting.
+        pc.ctx.request_repaint();
+    }
+    // Nothing of its own to show yet: the adjustment it showed last (a slider that starts to
+    // move before the pixels are there), or the plain image if that happens to be loaded.
+    out.or_else(|| {
+        let last = pc.ext.adj_last.get_mut(&id)?;
+        last.1 = frame;
+        Some(last.0.id())
+    })
+    .or_else(|| {
+        let last = pc.ext.adj.iter_mut().filter(|(k, _)| k.0 == id).max_by_key(|(_, e)| e.frame)?.1;
+        last.frame = frame;
+        Some(last.tex.id())
+    })
+    .or_else(|| {
+        let plain = pc.ext.tex.get_mut(&(id, false))?;
+        plain.1 = frame;
+        Some(plain.0.id())
+    })
+}
+
+/// Start making the texture of an adjusted image on another thread: one at a time per asset.
+/// `full`: at full size, otherwise the small version.
+fn adjust_start(pc: &mut PaintCx, key: AdjKey, adjust: Adjust, full: bool) {
+    let id = key.0;
+    if pc.ext.adj_busy.contains(&id) || pc.ext.adj_failed.contains(&id) || pc.ext.adj_busy.len() >= decode_limit() {
+        return;
+    }
+    let Some(asset) = pc.assets.get(&id).cloned() else { return };
+    let known = pc.ext.adj_src.get(&id).cloned();
+    pc.ext.adj_busy.insert(id);
+    let (tx, ctx) = (pc.ext.adj_tx.clone(), pc.ctx.clone());
+    std::thread::spawn(move || {
+        let made = std::panic::catch_unwind(|| {
+            let (src, fresh) = match known {
+                Some(src) => (src, false),
+                None => {
+                    let pixels = Arc::new(decode_pixels(&asset.bytes)?);
+                    (AdjSrc { small: pixels.shrunk(SMALL_SIDE), preview: pixels.shrunk(PREVIEW_SIDE), full: pixels, used: 0 }, true)
+                }
+            };
+            let large = src.full.size[0].max(src.full.size[1]) > SMALL_SIDE;
+            let image = if full { &src.full } else { &src.small }.adjusted(&adjust.curves());
+            Ok((image, full || !large, fresh.then_some(src)))
+        })
+        .unwrap_or_else(|_| Err("the decoder crashed".to_owned()));
+        let done = match made {
+            Ok((image, full, src)) => AdjDone { key, full, src, image: Ok(image) },
+            Err(e) => AdjDone { key, full, src: None, image: Err(e) },
+        };
+        let _ = tx.send(done);
+        ctx.request_repaint();
+    });
+}
+
 /// Start decoding an image on another thread. `full`: the full-size texture is wanted too;
 /// `have_small`: the small one is there already.
 fn decode(pc: &mut PaintCx, key: TexKey, full: bool, have_small: bool) {
@@ -892,7 +1200,13 @@ fn silhouette(image: &mut ColorImage) {
 /// `whole`: harus mencakup seluruh gambar (dirotasi / bersudut bulat). Hasil: (tekstur, kotak layar).
 fn svg_detail(pc: &mut PaintCx, n: &Node, r: Rect, clip: Rect, whole: bool) -> Option<(TextureId, Rect)> {
     let key: TexKey = (n.image?, n.fill.is_some());
-    let base = pc.ext.tex.get(&key)?.0.size();
+    // (A colour overlay shows the silhouette only: adjustments change nothing there.)
+    let adjust = n.adjustment().filter(|_| !key.1 && !pc.ext.adj_failed.contains(&key.0));
+    let adjust_key = adjust.map(|a| a.key());
+    let base = match adjust_key {
+        Some(a) => pc.ext.adj.get(&(key.0, a))?.tex.size(),
+        None => pc.ext.tex.get(&key)?.0.size(),
+    };
     let is_svg_asset = match pc.ext.svg.get(&key.0) {
         Some(v) => *v,
         None => {
@@ -929,7 +1243,7 @@ fn svg_detail(pc: &mut PaintCx, n: &Node, r: Rect, clip: Rect, whole: bool) -> O
     let frame = pc.ext.frame;
     let mut out = None;
     let mut fresh = false;
-    if let Some(d) = pc.ext.details.get_mut(&n.id).filter(|d| d.key == key) {
+    if let Some(d) = pc.ext.details.get_mut(&n.id).filter(|d| d.key == key && d.adjust == adjust_key) {
         if d.uv.expand(1e-4).contains_rect(need) {
             d.frame = frame;
             let at = |uv: Pos2| r.min + uv.to_vec2() * r.size();
@@ -943,11 +1257,17 @@ fn svg_detail(pc: &mut PaintCx, n: &Node, r: Rect, clip: Rect, whole: bool) -> O
         if let Some(asset) = pc.assets.get(&key.0).cloned() {
             pc.ext.detail_busy.insert(n.id);
             let (tx, ctx) = (pc.ext.det_tx.clone(), pc.ctx.clone());
-            let req = DetailReq { node: n.id, key, uv: want, wpx, hpx };
+            let req = DetailReq { node: n.id, key, adjust, uv: want, wpx, hpx };
             std::thread::spawn(move || {
                 let mut image = render_svg_region(&asset.bytes, req.uv, req.wpx, req.hpx);
                 if let (true, Ok(image)) = (req.key.1, &mut image) {
                     silhouette(image);
+                }
+                if let (Some(adjust), Ok(image)) = (req.adjust, &mut image) {
+                    // (The pixmap of an SVG is premultiplied on the encoded values.)
+                    let mut rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+                    adjust.curves().run(&mut rgba, true);
+                    *image = ColorImage::from_rgba_premultiplied(image.size, &rgba);
                 }
                 let _ = tx.send((req, image));
                 ctx.request_repaint();
@@ -960,7 +1280,7 @@ fn svg_detail(pc: &mut PaintCx, n: &Node, r: Rect, clip: Rect, whole: bool) -> O
 /// Mode crop: gambar utuh digambar redup di atas dokumen, lalu bagian di dalam kotak crop
 /// digambar penuh di atasnya, supaya terlihat apa yang terpotong.
 pub fn paint_crop_ghost(pc: &mut PaintCx, painter: &egui::Painter, n: &Node) {
-    let Some(tex) = n.image.and_then(|id| image_texture(pc, id, n.fill.is_some(), f32::INFINITY)) else { return };
+    let Some(tex) = node_texture(pc, n, n.fill.is_some(), f32::INFINITY) else { return };
     let (o, view) = (pc.o, pc.view);
     let rect = |(x0, y0, x1, y1): (f32, f32, f32, f32)| Rect::from_min_max(view.to_screen(o, x0, y0), view.to_screen(o, x1, y1));
     let (full, r) = (rect(n.image_rect()), rect(n.bounds()));
@@ -988,7 +1308,7 @@ fn source(pc: &mut PaintCx, n: &Node, alpha: f32) -> Source {
         // Fill pada gambar = color overlay: warnanya mengganti RGB, alpha gambar dipertahankan.
         let overlay = n.fill.map(|c| col(c).gamma_multiply(alpha));
         let need = image_need(pc, n);
-        return match n.image.and_then(|id| image_texture(pc, id, overlay.is_some(), need)) {
+        return match node_texture(pc, n, overlay.is_some(), need) {
             Some(t) => Source::Texture(t, overlay.unwrap_or(tint)),
             // Siluet untuk color overlay belum siap: tampilkan gambar aslinya dulu, bukan kotak abu-abu.
             None => match n.image.filter(|_| overlay.is_some()).and_then(|id| pc.ext.tex.get(&(id, false))) {

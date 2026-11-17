@@ -3,6 +3,7 @@
 use super::autolayout::{layout_section, sizing_row};
 use super::picker::paint_row;
 use super::*;
+use crate::adjust::Adjust;
 use crate::layout::Sizing;
 
 const FORMATS: [&str; 4] = ["PNG", "JPG", "SVG", "PDF"];
@@ -133,6 +134,8 @@ impl App {
         let mut flip: Option<bool> = None;
         let mut remove_bg = false;
         let mut crop_image = false;
+        // A slider of the Adjust section is held down.
+        let mut adjusting = false;
         let mut detach_path = false;
         let mut style_action: Option<super::styles::StyleAction> = None;
         let mut comp_act: Option<super::components::Act> = None;
@@ -307,6 +310,7 @@ impl App {
                 if btn.clicked() {
                     crop_image = true;
                 }
+                adjusting = adjust_section(ui, &mut n.adjust, "");
                 section(ui, "Background");
                 if self.rembg_running(id) {
                     ui.horizontal(|ui| {
@@ -453,11 +457,15 @@ impl App {
                 n.size_v = Sizing::Fixed;
             }
         }
+        let now = ctx.input(|i| i.time);
+        if adjusting && self.last_prop.0 == id {
+            // One drag of a slider is one undo step, however long it rests on the way.
+            self.last_prop.1 = now;
+        }
         if n == before {
             return;
         }
         // Perubahan beruntun pada objek yang sama digabung jadi satu langkah undo.
-        let now = ctx.input(|i| i.time);
         if self.last_prop.0 != id || now - self.last_prop.1 > 0.8 {
             let pre = self.doc.clone();
             self.push_undo(pre);
@@ -554,6 +562,8 @@ impl App {
         let mixed_look = !all(&|n| n.opacity == first.opacity && n.blend == first.blend && n.radius == first.radius);
         let mixed_blur = !all(&|n| n.blur == first.blur && n.shadow == first.shadow && n.inner_shadow == first.inner_shadow && n.bg_blur == first.bg_blur);
         let (inner_all, glass_all) = (all(&|n| has_inside(n)), all(&|n| glassy(n)));
+        let images = all(&|n| n.kind == Kind::Image);
+        let mixed_adjust = !all(&|n| n.adjustment() == first.adjustment());
         // Frames with auto layout of their own (not that of a main component).
         let auto_all = all(&|n| n.is_auto() && n.instance_of.is_none() && n.source.is_none());
         let mixed_layout = !all(&|n| n.layout == first.layout);
@@ -580,6 +590,7 @@ impl App {
         let mut constrain: super::constraints::Pair = (None, None);
         let mut auto_act: Option<super::autolayout::Act> = None;
         let mut sized: (Option<Sizing>, Option<Sizing>) = (None, None);
+        let mut adjusting = false;
         let in_auto = ids.iter().all(|id| self.doc.parent_of(*id).and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto()));
         // The sizes that every selected layer can have.
         let choices = [true, false].map(|horizontal| {
@@ -691,6 +702,9 @@ impl App {
                     );
                 }
             }
+            if images {
+                adjusting = adjust_section(ui, &mut n.adjust, if mixed_adjust { MIXED } else { "" });
+            }
             // Anggota satu group dengan bayangan yang sama berbayangan bersama (lihat `shadow_run`).
             effects_section(
                 ui,
@@ -735,12 +749,15 @@ impl App {
             Some(super::autolayout::Act::Remove) => return self.remove_auto_layout(),
             None => {}
         }
+        let now = ctx.input(|i| i.time);
+        let undo_key = key | 1 << 63;
+        if adjusting && self.last_prop.0 == undo_key {
+            self.last_prop.1 = now;
+        }
         if n == before && sized == (None, None) {
             return;
         }
         // Perubahan beruntun pada seleksi yang sama digabung jadi satu langkah undo.
-        let now = ctx.input(|i| i.time);
-        let undo_key = key | 1 << 63;
         if self.last_prop.0 != undo_key || now - self.last_prop.1 > 0.8 {
             let pre = self.doc.clone();
             self.push_undo(pre);
@@ -792,6 +809,16 @@ impl App {
             }
             if n.shadow != before.shadow {
                 t.shadow = n.shadow;
+            }
+            if n.adjust != before.adjust && t.kind == Kind::Image {
+                // Only the sliders that were moved; the others stay as each image has them.
+                let (new, old, mut mine) = (n.adjust.unwrap_or_default().values(), before.adjust.unwrap_or_default().values(), t.adjust.unwrap_or_default().values());
+                for i in 0..mine.len() {
+                    if new[i] != old[i] || n.adjust.is_none() {
+                        mine[i] = new[i];
+                    }
+                }
+                t.adjust = Adjust::from_values(mine).normalized();
             }
             if n.opacity != before.opacity {
                 t.opacity = n.opacity;
@@ -1625,6 +1652,54 @@ fn effects_section(ui: &mut egui::Ui, picker: &mut super::picker::Picker, id: u6
             });
         });
     }
+}
+
+/// The "Adjust" section of an image: a slider per value, from -100 to 100. Double-click a
+/// slider to put it back to 0. Result: a slider is held down.
+fn adjust_section(ui: &mut egui::Ui, adjust: &mut Option<Adjust>, note: &str) -> bool {
+    let was = adjust.unwrap_or_default();
+    let mut values = was.values();
+    let mut held = false;
+    section(ui, "Adjust");
+    if !note.is_empty() {
+        ui.weak(note);
+    }
+    let double = ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        for (v, (_, label)) in values.iter_mut().zip(crate::adjust::FIELDS) {
+            ui.horizontal(|ui| {
+                let text = egui::RichText::new(label).size(12.0);
+                let text = if *v == 0.0 { text.weak() } else { text };
+                let name = ui.allocate_ui_with_layout(vec2(84.0, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_width(84.0);
+                    ui.add(egui::Label::new(text).selectable(false).sense(Sense::click()))
+                });
+                let name = name.inner;
+                ui.spacing_mut().slider_width = (ui.available_width() - 54.0).max(40.0);
+                let slider = ui.add(egui::Slider::new(v, -100.0..=100.0).step_by(1.0).max_decimals(0).trailing_fill(false));
+                held |= slider.dragged() || slider.is_pointer_button_down_on();
+                // Back to 0: a double click on the slider or on its name.
+                if (double && slider.hovered() && !slider.dragged()) || name.on_hover_text("Double-click to reset").double_clicked() {
+                    *v = 0.0;
+                }
+            });
+        }
+    });
+    let mut now = Adjust::from_values(values);
+    ui.horizontal(|ui| {
+        let half = (ui.available_width() - 8.0) / 2.0;
+        if ui.add_sized([half, 26.0], egui::Button::new("B&W")).on_hover_text("Black and white: saturation to -100").clicked() {
+            now.saturation = -100.0;
+        }
+        if ui.add_enabled_ui(!now.is_identity(), |ui| ui.add_sized([half, 26.0], egui::Button::new("Reset"))).inner.on_hover_text("All adjustments back to 0. The image file itself is never changed.").clicked() {
+            now = Adjust::default();
+        }
+    });
+    if now != was {
+        *adjust = now.normalized();
+    }
+    held
 }
 
 /// Can `n` have an inner shadow (does it have an inside)?

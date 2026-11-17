@@ -313,6 +313,10 @@ pub struct Node {
     /// terhadap gambar utuh. Kosong = seluruh gambar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crop: Option<[f32; 4]>,
+    /// Image adjustments (exposure, contrast, …), applied when the image is drawn and exported;
+    /// the asset keeps its pixels. See `adjust.rs`. Read it through `Node::adjustment`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjust: Option<crate::adjust::Adjust>,
     /// Derajat, searah jarum jam, terhadap pusat kotak pembatas.
     #[serde(default)]
     pub rotation: f32,
@@ -455,6 +459,11 @@ impl Node {
             2 => -self.stroke_w * 0.5,
             _ => 0.0,
         }
+    }
+
+    /// The image adjustments that are applied, if any: those of an image that change something.
+    pub fn adjustment(&self) -> Option<crate::adjust::Adjust> {
+        self.adjust.filter(|a| self.kind == Kind::Image && !a.is_identity())
     }
 
     /// The inner shadow that is drawn, if any: a shape that has an inside.
@@ -774,6 +783,7 @@ impl Node {
             holes: Vec::new(),
             image: None,
             crop: None,
+            adjust: None,
             rotation: 0.0,
             flip_h: false,
             flip_v: false,
