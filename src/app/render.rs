@@ -194,6 +194,13 @@ pub struct Ext {
     pub export_fmt: usize,
     pub v_plain: bool,
     pub paste_seen: bool,
+    /// Top-level frames as finished meshes (see `frame_cached`), per frame id.
+    frames: HashMap<u64, FrameMesh>,
+    /// Goes up whenever a texture prepared on another thread arrives: what was drawn before may
+    /// have used a placeholder.
+    epoch: u64,
+    /// Screen position of the world origin on the previous frame.
+    pub last_origin: Pos2,
 }
 
 impl Default for Ext {
@@ -253,6 +260,9 @@ impl Default for Ext {
             export_fmt: 0,
             v_plain: false,
             paste_seen: false,
+            frames: HashMap::new(),
+            epoch: 0,
+            last_origin: Pos2::ZERO,
         }
     }
 }
@@ -275,7 +285,13 @@ impl Ext {
     /// Awal tiap frame: terima gambar yang selesai di-decode, buang tekstur yang lama tak terpakai.
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.frame += 1;
-        while let Ok((id, result)) = self.img_rx.try_recv() {
+        let waiting = self.busy();
+        // Uploading a large image to the GPU takes several milliseconds, so only so many pixels
+        // are taken per frame; the rest wait for the next one.
+        let mut pixels = 0;
+        while pixels < UPLOAD_PIXELS {
+            let Ok((id, result)) = self.img_rx.try_recv() else { break };
+            pixels += result.as_ref().map_or(0, |image| image.size[0] * image.size[1]);
             self.decoding.remove(&id);
             if let Err(e) = &result {
                 let tries = self.decode_failed.get(&id).map_or(0, |f| f.1) + 1;
@@ -331,7 +347,14 @@ impl Ext {
                 }
             }
         }
+        if self.busy() != waiting {
+            self.epoch += 1;
+        }
+        if pixels >= UPLOAD_PIXELS {
+            ctx.request_repaint();
+        }
         let frame = self.frame;
+        self.frames.retain(|_, f| f.used + 300 > frame);
         self.blurs.retain(|_, b| b.frame + 300 > frame);
         self.details.retain(|_, d| d.frame + 300 > frame);
         self.shadows.retain(|_, s| s.frame + 300 > frame);
@@ -469,6 +492,16 @@ pub struct PaintCx<'a> {
     pub capture: Option<Vec<egui::Mesh>>,
     /// Node berikutnya tidak menggambar bayangannya sendiri: sudah digambar bersama group-nya.
     pub skip_shadow: bool,
+    /// The top-level layers of the document; a frame among them can be kept as meshes (`frame_cached`).
+    pub tops: &'a [Arc<Node>],
+    /// The view did not move since the previous frame.
+    pub still: bool,
+    /// How deep inside frames the node being painted is.
+    pub depth: u32,
+    /// A frame is being painted into meshes to keep; `no_keep` is set when what it holds cannot
+    /// be kept (it depends on the part of the screen that is visible).
+    pub recording: bool,
+    pub no_keep: bool,
 }
 
 /// `mask`: siluet putih (hanya alpha) yang diwarnai lewat tint, untuk color overlay.
@@ -484,7 +517,11 @@ fn image_texture(pc: &mut PaintCx, id: u64, mask: bool) -> Option<TextureId> {
     // Decode di thread lain supaya canvas tidak tersendat. `decoding` hanya ditandai kalau thread
     // benar-benar berjalan, dan thread selalu melapor (juga kalau decoder-nya panik); kalau tidak,
     // kuncinya tertahan selamanya dan gambarnya tidak pernah muncul.
-    if !waiting && !pc.ext.decoding.contains(&key) {
+    // Only a few images are decoded at a time: each one holds its full bitmap in memory while
+    // it is worked on, and a document can have a hundred of them. The rest start as these finish
+    // (every finished image repaints, and the image is asked for again on each frame).
+    let room = pc.ext.decoding.len() < decode_limit();
+    if !waiting && room && !pc.ext.decoding.contains(&key) {
         if let Some(asset) = pc.assets.get(&id).cloned() {
             pc.ext.decoding.insert(key);
             let (tx, ctx) = (pc.ext.img_tx.clone(), pc.ctx.clone());
@@ -503,6 +540,14 @@ fn image_texture(pc: &mut PaintCx, id: u64, mask: bool) -> Option<TextureId> {
         }
     }
     None
+}
+
+/// Pixels of decoded images handed to the GPU per frame: one large image, or several small ones.
+const UPLOAD_PIXELS: usize = 1_000_000;
+
+fn decode_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(1)).clamp(2, 8))
 }
 
 fn silhouette(image: &mut ColorImage) {
@@ -527,6 +572,11 @@ fn svg_detail(pc: &mut PaintCx, n: &Node, r: Rect, clip: Rect, whole: bool) -> O
         }
     };
     if !is_svg_asset || r.width() < 1.0 || r.height() < 1.0 {
+        return None;
+    }
+    if pc.recording {
+        // The sharp part follows what is on screen.
+        pc.no_keep = true;
         return None;
     }
     let ppp = pc.ctx.pixels_per_point();
@@ -842,11 +892,17 @@ pub struct TextCache {
     /// is gone.
     probe: Option<Arc<egui::Galley>>,
     pass: u64,
+    /// Goes up every time the font atlas turns out to have been rebuilt.
+    generation: u64,
 }
 
 impl TextCache {
     /// Entries unused for this many frames are dropped.
     const KEEP: u64 = 240;
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
 
     fn key(job: &egui::text::LayoutJob, f: f32) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -856,7 +912,7 @@ impl TextCache {
     }
 
     /// Once per frame: empty the cache if the font atlas was rebuilt, drop what is no longer used.
-    fn begin(&mut self, ctx: &egui::Context) {
+    pub fn begin(&mut self, ctx: &egui::Context) {
         let pass = ctx.cumulative_pass_nr();
         if pass == self.pass && self.probe.is_some() {
             return;
@@ -865,6 +921,7 @@ impl TextCache {
         let probe = ctx.fonts(|f| f.layout_job(egui::text::LayoutJob::simple_singleline(" ".into(), FontId::proportional(10.0), Color32::BLACK)));
         if !self.probe.as_ref().is_some_and(|old| Arc::ptr_eq(old, &probe)) {
             self.map.clear();
+            self.generation += 1;
             super::perf::count(1);
         }
         self.probe = Some(probe);
@@ -1211,6 +1268,146 @@ fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[
     true
 }
 
+// ---------------------------------------------------------------- frame cache
+
+/// A top-level frame with everything in it, as finished meshes.
+///
+/// Most of the time of a frame went into egui turning shapes into triangles again (rounded
+/// rectangles, strokes, paths, text) although nothing about them had changed. A frame that is
+/// the same `Arc` as on the frame before is tessellated once and then drawn from these meshes,
+/// which are only shifted when the view is panned.
+struct FrameMesh {
+    /// Keeps the node alive, so the same address means the same content.
+    node: Arc<Node>,
+    /// 0 = seen once, 1 = meshes ready, 2 = cannot be kept.
+    state: u8,
+    key: FrameKey,
+    /// Screen position of the world origin the meshes are placed for.
+    origin: Pos2,
+    prims: Vec<(Rect, Arc<egui::Mesh>)>,
+    drawn: usize,
+    made: u64,
+    used: u64,
+}
+
+/// Everything besides the node itself that the meshes depend on: zoom, pixels per point, opacity
+/// of the parent, the font atlas (generation and size), textures that arrived.
+type FrameKey = (u32, u32, u32, u64, [usize; 2], u64);
+
+/// Draw the top-level frame `n` from its kept meshes, making them first if needed.
+/// Result false = the frame has to be painted the usual way.
+fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // `KANVAS_NO_FRAME_CACHE`: paint everything the usual way (to compare the two).
+    if *OFF.get_or_init(|| std::env::var_os("KANVAS_NO_FRAME_CACHE").is_some()) {
+        return false;
+    }
+    if pc.moving || pc.editing.is_some() || n.children.is_empty() || n.rotation != 0.0 || n.blend != 0 {
+        return false;
+    }
+    // Zoomed far into a frame, most of it is off screen: painting only what is visible is less
+    // work than carrying the meshes of all of it.
+    let (screen, z) = (painter.clip_rect(), pc.view.zoom);
+    if n.w * z > screen.width() * 3.0 || n.h * z > screen.height() * 3.0 {
+        return false;
+    }
+    let frame = pc.ext.frame;
+    let known = pc.ext.frames.get(&n.id).is_some_and(|e| std::ptr::eq(Arc::as_ptr(&e.node), n));
+    if !known {
+        // New or just changed. A frame that changes every frame (something in it is being
+        // dragged) would only add work here, so its meshes are made the second time it is seen.
+        if let Some(node) = pc.tops.iter().find(|a| std::ptr::eq(Arc::as_ptr(a), n)) {
+            let entry = FrameMesh { node: node.clone(), state: 0, key: Default::default(), origin: Pos2::ZERO, prims: Vec::new(), drawn: 0, made: frame, used: frame };
+            pc.ext.frames.insert(n.id, entry);
+        }
+        return false;
+    }
+    let ppp = pc.ctx.pixels_per_point();
+    let atlas = pc.ctx.fonts(|f| f.font_image_size());
+    let key: FrameKey = (pc.view.zoom.to_bits(), ppp.to_bits(), alpha.to_bits(), pc.fonts.layouts.generation(), atlas, pc.ext.epoch);
+    let origin = pc.view.to_screen(pc.o, 0.0, 0.0);
+    let busy = pc.ext.busy() > 0;
+    let Some(e) = pc.ext.frames.get_mut(&n.id) else { return false };
+    e.used = frame;
+    if e.state == 2 || busy {
+        return false;
+    }
+    let snap = |d: egui::Vec2| vec2((d.x * ppp).round() / ppp, (d.y * ppp).round() / ppp);
+    let shift = origin - e.origin;
+    // The meshes are moved by whole pixels only, so text stays as sharp as it was made. Once the
+    // view rests, what is left of the move is settled by making them again.
+    let off = pc.still && (shift - snap(shift)).length() > 0.01;
+    // Textures are dropped when nothing asks for them for a while; making the meshes again asks.
+    let old = frame > e.made + 200 + n.id % 64;
+    if e.state == 0 || e.key != key || off || old {
+        match record_frame(pc, n, alpha) {
+            Some((prims, drawn)) => {
+                let Some(e) = pc.ext.frames.get_mut(&n.id) else { return false };
+                (e.state, e.key, e.origin, e.prims, e.drawn, e.made) = (1, key, origin, prims, drawn, frame);
+            }
+            None => {
+                if let Some(e) = pc.ext.frames.get_mut(&n.id) {
+                    e.state = 2;
+                    e.prims = Vec::new();
+                }
+                return false;
+            }
+        }
+    }
+    let Some(e) = pc.ext.frames.get_mut(&n.id) else { return false };
+    let shift = snap(origin - e.origin);
+    if shift != egui::Vec2::ZERO {
+        for (clip, mesh) in &mut e.prims {
+            Arc::make_mut(mesh).translate(shift);
+            *clip = clip.translate(shift);
+        }
+        e.origin += shift;
+    }
+    let screen = painter.clip_rect();
+    for (clip, mesh) in &e.prims {
+        let clip = clip.intersect(screen);
+        if clip.is_positive() {
+            painter.with_clip_rect(clip).add(Shape::mesh(mesh.clone()));
+        }
+    }
+    pc.drawn += e.drawn;
+    true
+}
+
+/// Paint `n` off to the side, without culling, and tessellate the result.
+/// `None` = it holds something that cannot be kept as meshes (a blend or mask drawn by the GPU,
+/// an SVG that is rendered for the visible part).
+fn record_frame(pc: &mut PaintCx, n: &Node, alpha: f32) -> Option<(Vec<(Rect, Arc<egui::Mesh>)>, usize)> {
+    let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("kanvas-frame-meshes"));
+    let side = egui::Painter::new(pc.ctx.clone(), layer, Rect::EVERYTHING);
+    let (vis, drawn) = (pc.vis, pc.drawn);
+    pc.vis = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
+    (pc.recording, pc.no_keep, pc.skip_shadow) = (true, false, true);
+    paint_node(pc, &side, n, alpha);
+    pc.recording = false;
+    pc.vis = vis;
+    let count = pc.drawn - drawn;
+    pc.drawn = drawn;
+    let list = pc.ctx.graphics_mut(|g| g.get_mut(layer).map(std::mem::take)).unwrap_or_default();
+    if pc.no_keep {
+        return None;
+    }
+    let shapes: Vec<egui::epaint::ClippedShape> = list.all_entries().cloned().collect();
+    let mut prims = Vec::new();
+    for p in pc.ctx.tessellate(shapes, pc.ctx.pixels_per_point()) {
+        match p.primitive {
+            egui::epaint::Primitive::Mesh(m) => {
+                // A mesh that lies inside its clip rectangle anyway is drawn with the clip of the
+                // canvas, so egui can join it with its neighbours into one draw call.
+                let clip = if p.clip_rect.contains_rect(m.calc_bounds()) { Rect::EVERYTHING } else { p.clip_rect };
+                prims.push((clip, Arc::new(m)));
+            }
+            egui::epaint::Primitive::Callback(_) => return None,
+        }
+    }
+    Some((prims, count))
+}
+
 /// Potongan daftar saudara: rangkaian ber-layer-blur digambar sebagai satu tekstur buram, sisanya
 /// lewat `paint_node`. `after` dipanggil setelah tiap node digambar.
 fn paint_run<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, nodes: &[T], alpha: f32, after: &mut dyn FnMut(&Node)) {
@@ -1326,6 +1523,9 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
     if !skip_shadow {
         shadow_layer(pc, painter, std::slice::from_ref(n), parent_alpha);
     }
+    if n.kind == Kind::Frame && pc.depth == 0 && !pc.recording && pc.capture.is_none() && frame_cached(pc, painter, n, parent_alpha) {
+        return;
+    }
     let z = pc.view.zoom;
     let r = Rect::from_min_max(pc.view.to_screen(pc.o, x0, y0), pc.view.to_screen(pc.o, x1, y1));
     let pivot = r.center();
@@ -1384,7 +1584,9 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 let clip = r.intersect(painter.clip_rect());
                 if clip.is_positive() {
                     let p = painter.with_clip_rect(clip);
+                    pc.depth += 1;
                     paint_list(pc, &p, &n.children, alpha, &mut |_| {});
+                    pc.depth -= 1;
                 }
             }
             if let Some(s) = stroke {

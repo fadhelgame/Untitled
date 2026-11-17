@@ -128,6 +128,10 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(170));
         }
         let (tl, br) = (self.view.to_world(o, rect.min), self.view.to_world(o, rect.max));
+        self.fonts.layouts.begin(&ctx);
+        let origin = self.view.to_screen(o, 0.0, 0.0);
+        let still = origin == self.ext.last_origin;
+        self.ext.last_origin = origin;
         let mut pc = PaintCx {
             ctx: &ctx,
             fonts: &mut self.fonts,
@@ -142,6 +146,11 @@ impl App {
             drawn: 0,
             capture: None,
             skip_shadow: false,
+            tops: &self.doc.nodes,
+            still,
+            depth: 0,
+            recording: false,
+            no_keep: false,
         };
         self.labels.clear();
         let (labels, sel, view) = (&mut self.labels, &self.sel, self.view);

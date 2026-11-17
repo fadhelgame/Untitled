@@ -2,7 +2,7 @@
 //!
 //! The document is the one given on the command line, or the stress-test document. The run goes
 //! through a fixed list of phases — loading (until every image is decoded), a canvas that stands
-//! still, panning, zooming, and dragging one object with the mouse — and writes the time spent
+//! still, panning, zooming, dragging one object with the mouse, and standing still again — and writes the time spent
 //! per frame in each of them to `<out>.txt`.
 
 use super::{App, Bench};
@@ -13,7 +13,7 @@ use std::time::Instant;
 const LEN: u32 = 120;
 /// Longest wait for images, in frames.
 const LOAD_MAX: u32 = 6000;
-const PHASES: [&str; 5] = ["load", "still", "pan", "zoom", "drag"];
+const PHASES: [&str; 6] = ["load", "still", "pan", "zoom", "drag", "after"];
 
 /// Parts of a frame that are timed on their own (see `span`).
 pub(crate) const PARTS: [&str; 6] = ["update", "poll", "canvas", "text", "vtext", "upload"];
@@ -62,6 +62,7 @@ pub(super) struct State {
     samples: Vec<f32>,
     base: Option<super::View>,
     report: String,
+    shots: u32,
 }
 
 fn line(name: &str, samples: &[f32], extra: &str) -> String {
@@ -82,15 +83,27 @@ impl App {
         if frame == 1 && self.doc.count() == 0 {
             self.stress_test();
         }
-        if frame < 4 {
-            // The canvas size is known after the first frames.
+        if frame < 3 {
+            // The canvas size is known after the first frame.
             self.fit_all();
             b.perf.mark = frame;
             b.perf.started = Some(Instant::now());
+            take_spent();
             return;
+        }
+        // A picture of the still canvas and of the canvas after panning, to compare runs by eye.
+        let shot = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }));
+        if let Some(img) = shot {
+            let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+            b.perf.shots += 1;
+            let name = format!("{}-{}.png", b.out.file_stem().map_or("perf".into(), |s| s.to_string_lossy()), b.perf.shots);
+            let _ = crate::export::save_rgba(&b.out.with_file_name(name), img.size[0] as u32, img.size[1] as u32, &rgba);
         }
         let p = &mut b.perf;
         let at = frame - p.mark;
+        if at == LEN - 20 && matches!(PHASES[p.phase], "still" | "pan" | "drag" | "after") && std::env::var_os("KANVAS_PERF_SHOT").is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        }
         // `frame_ms` is the cost of the frame before this one.
         if at >= 2 {
             p.samples.push(self.frame_ms);
@@ -112,7 +125,7 @@ impl App {
                 p.quiet = if self.ext.busy() + self.fonts.pending() == 0 { p.quiet + 1 } else { 0 };
                 p.quiet >= 30 || at > LOAD_MAX
             }
-            "still" => at > LEN,
+            "still" | "after" => at > LEN,
             "pan" => {
                 let base = *p.base.get_or_insert(self.view);
                 let t = at as f32 / LEN as f32 * std::f32::consts::TAU;
