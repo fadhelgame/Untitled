@@ -2476,6 +2476,17 @@ impl App {
                         let ids: Vec<u64> = std::iter::once(demo).chain(export::pdf_pages(&self.doc).into_iter().filter(|id| *id != demo).take(3)).collect();
                         let pages: Vec<(String, f32, f32)> = ids.iter().filter_map(|id| export::to_svg(&self.doc, Some(*id), &mut self.fonts, ctx)).collect();
                         let _ = export::save_pdf(&pages, &b.out.with_file_name("bench-export.pdf"));
+                        // Batch export: halaman yang sama sebagai file terpisah, dengan satu nama kembar.
+                        let mut items: Vec<(String, String, f32, f32)> = ids
+                            .iter()
+                            .zip(&pages)
+                            .map(|(id, (svg, w, h))| (self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default(), svg.clone(), *w, *h))
+                            .collect();
+                        items.extend(items.first().cloned());
+                        let dir = b.out.with_file_name("bench-batch");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let (n, err) = export::save_batch(&items, &dir, 0, 0.5);
+                        eprintln!("bench batch export: {n} of {} files, error: {err:?}", items.len());
                     }
                     let mut s = b.samples.clone();
                     s.sort_by(|a, b| a.total_cmp(b));

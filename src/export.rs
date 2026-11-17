@@ -664,6 +664,38 @@ pub fn save_raster(svg: &str, w: f32, h: f32, scale: f32, jpg: bool, path: &Path
 /// Simpan beberapa SVG sebagai satu PDF, satu halaman per SVG: (svg, lebar, tinggi).
 /// Isinya tetap vektor (teks sudah berupa outline), dan 1 satuan dokumen = 1 pt, sehingga frame
 /// dari preset kertas (A4 = 595×842) keluar dengan ukuran kertas yang tepat.
+/// Batch export: satu file per item `(nama, svg, w, h)` ke folder `dir`. `fmt`: 0 PNG, 1 JPG,
+/// 2 SVG. Nama kembar diberi akhiran angka (tanpa membedakan huruf besar/kecil, seperti sistem
+/// berkas Windows). Mengembalikan jumlah file yang berhasil dan error pertama, kalau ada.
+pub fn save_batch(items: &[(String, String, f32, f32)], dir: &Path, fmt: usize, scale: f32) -> (usize, Option<String>) {
+    let ext = ["png", "jpg", "svg"][fmt.min(2)];
+    let suffix = if fmt < 2 && scale != 1.0 { format!("@{scale}x") } else { String::new() };
+    let mut used = std::collections::HashSet::new();
+    let (mut done, mut first_err) = (0, None);
+    for (name, svg, w, h) in items {
+        let safe: String = name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
+        let safe = if safe.trim().is_empty() { "untitled" } else { safe.trim() };
+        let mut stem = safe.to_owned();
+        let mut n = 2;
+        while !used.insert(stem.to_lowercase()) {
+            stem = format!("{safe}-{n}");
+            n += 1;
+        }
+        let path = dir.join(format!("{stem}{suffix}.{ext}"));
+        let result = match fmt {
+            2 => std::fs::write(&path, svg).map_err(|e| e.to_string()),
+            _ => save_raster(svg, *w, *h, scale, fmt == 1, &path),
+        };
+        match result {
+            Ok(()) => done += 1,
+            Err(e) => {
+                first_err.get_or_insert(format!("{stem}: {e}"));
+            }
+        }
+    }
+    (done, first_err)
+}
+
 pub fn save_pdf(pages: &[(String, f32, f32)], path: &Path) -> Result<(), String> {
     use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref};
     use resvg::usvg;

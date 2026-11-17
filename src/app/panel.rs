@@ -834,6 +834,7 @@ impl App {
                 1 => "1 page".to_owned(),
                 n => format!("{n} pages"),
             },
+            sel if sel.len() > 1 => format!("{} files", sel.len()),
             _ => "whole document".to_owned(),
         };
         if self.exporting.is_some() {
@@ -917,6 +918,9 @@ impl App {
         if self.ext.export_fmt == 3 {
             return self.export_pdf(ctx);
         }
+        if self.sel.len() > 1 {
+            return self.export_batch(ctx);
+        }
         let only = if self.sel.len() == 1 { Some(self.sel[0]) } else { None };
         let Some((svg, w, h)) = export::to_svg(&self.doc, only, &mut self.fonts, ctx) else {
             self.status = "Nothing to export.".into();
@@ -944,6 +948,33 @@ impl App {
                 Ok(()) => format!("Exported: {}", path.display()),
                 Err(e) => format!("Export failed: {e}"),
             }
+        });
+    }
+
+    /// Batch export: beberapa objek terpilih menjadi satu file per objek di folder pilihan,
+    /// dengan skala dan format yang sedang aktif.
+    fn export_batch(&mut self, ctx: &egui::Context) {
+        let items: Vec<(String, String, f32, f32)> = self
+            .sel
+            .iter()
+            .filter_map(|id| {
+                let name = self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default();
+                let (svg, w, h) = export::to_svg(&self.doc, Some(*id), &mut self.fonts, ctx)?;
+                Some((name, svg, w, h))
+            })
+            .collect();
+        if items.is_empty() {
+            self.status = "Nothing to export.".into();
+            return;
+        }
+        let fmt = self.ext.export_fmt.min(2);
+        let scale = self.ext.export_scale.clamp(0.1, 16.0);
+        let Some(dir) = rfd::FileDialog::new().set_title("Choose a folder for the exported files").pick_folder() else {
+            return;
+        };
+        self.export_spawn(ctx, move || match export::save_batch(&items, &dir, fmt, scale) {
+            (n, None) => format!("Exported {n} files: {}", dir.display()),
+            (n, Some(e)) => format!("Exported {n} of {} files, failed on {e}", items.len()),
         });
     }
 
