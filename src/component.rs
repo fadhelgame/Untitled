@@ -50,12 +50,12 @@ macro_rules! node_fields {
 node_fields! {
     follow: [
         fill, gradient, stroke, stroke_w, radius, font, weight, italic, font_size, line_height, letter_spacing, align,
-        underline, strike, list, valign,
+        underline, strike, list, valign, path_offset, path_side,
         image, crop, flip_h, flip_v, blend, opacity, visible, locked, tag, dash, gap, stroke_align, cap, join, shadow, blur,
         fill_style, stroke_style, type_style,
     ],
     by_hand: [text, spans],
-    fixed: [id, name, kind, x, y, w, h, rotation, wrap, fixed_h, points, closed, holes, group, clip, children, component, instance_of, source, constrain_h, constrain_v, layout, size_h, size_v, absolute],
+    fixed: [id, name, kind, x, y, w, h, rotation, wrap, fixed_h, on_path, points, closed, holes, group, clip, children, component, instance_of, source, constrain_h, constrain_v, layout, size_h, size_v, absolute],
 }
 
 impl Node {
@@ -272,6 +272,20 @@ fn sync_instance(inst: &mut Node, old: &HashMap<u64, &Node>, new: &Node, next_id
     let (from, to) = ((new.x, new.y, new.w, new.h), (inst.x, inst.y, inst.w, inst.h));
     let mut rebuild = Rebuild { old, pool, fit: Fit { to, flip }, groups, next_id, names };
     inst.children = new.children.iter().map(|c| rebuild.part(c, from, to, new.is_auto())).collect();
+    // A text on a path in the main is on the part that mirrors that path here.
+    if new.any(&|c| c.on_path.is_some()) || inst.any(&|c| c.on_path.is_some()) {
+        let mut mine = HashMap::new();
+        inst.walk(&mut |c| {
+            if let Some(s) = c.source {
+                mine.insert(s, c.id);
+            }
+        });
+        inst.walk_mut(&mut |c| {
+            if let Some(m) = c.source.and_then(|s| new_index.get(&s)) {
+                c.on_path = m.on_path.and_then(|p| mine.get(&p).copied());
+            }
+        });
+    }
     // A flipped instance of a main with auto layout runs the other way.
     for (flipped, horizontal) in [(flip.0, true), (flip.1, false)] {
         if flipped {

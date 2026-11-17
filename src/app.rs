@@ -37,6 +37,7 @@ mod stroke;
 mod styles;
 mod svg;
 pub(crate) mod render;
+mod textpath;
 mod theme;
 mod vtext;
 mod wand;
@@ -171,6 +172,7 @@ fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
     n.h *= s;
     n.stroke_w *= s;
     n.dash *= s;
+    n.path_offset *= s;
     n.gap *= s;
     if let Some(shadow) = &mut n.shadow {
         shadow.x *= s;
@@ -323,6 +325,8 @@ struct Bench {
     inject: Vec<(u32, egui::Event)>,
     /// Id node yang dipakai skenario uji yang berjalan lintas frame.
     ids: Vec<u64>,
+    /// A frame number a scenario wants to remember (0 = not yet).
+    aux: u32,
     /// Jarak waktu antar frame (ms) selama fase zoom/pan: menunjukkan refresh rate yang benar-benar dicapai.
     intervals: Vec<f32>,
     last: Option<std::time::Instant>,
@@ -473,7 +477,7 @@ impl App {
             wand: Default::default(),
             font_focus: false,
             ext: Default::default(),
-            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new(), ids: Vec::new(), intervals: Vec::new(), last: None, perf: Default::default() }),
+            bench: bench.map(|out| Bench { out, frame: 0, samples: Vec::new(), shot: false, phase: 0, mark: 0, inject: Vec::new(), ids: Vec::new(), aux: 0, intervals: Vec::new(), last: None, perf: Default::default() }),
             home: false,
             files: home::Files::new(&cc.egui_ctx),
             rembg: None,
@@ -1064,6 +1068,11 @@ impl App {
             .and_then(|v| v.get_mut(CLIP_TAG).map(serde_json::Value::take))
             .and_then(|v| serde_json::from_value::<Vec<Node>>(v).ok());
         let c = self.view.to_world(self.canvas_rect.min, at.unwrap_or(self.canvas_rect.center()));
+        // What is pasted may come from another document: a text is only on a path that came along.
+        let parsed = parsed.map(|mut nodes| {
+            crate::textpath::drop_outside_links(&mut nodes);
+            nodes
+        });
         match parsed {
             Some(nodes) if nodes.is_empty() => {}
             Some(nodes) if in_place => {
@@ -1111,11 +1120,12 @@ impl App {
         let pre = self.doc.clone();
         self.doc.regroup(&mut nodes);
         self.sel.clear();
+        let mut ids = std::collections::HashMap::new();
         for mut n in nodes {
             let source = n.id;
             // A copy of a main component is an instance of it (see `Doc::settle_copy`).
             if !self.doc.settle_copy(&mut n) {
-                self.doc.reassign_ids(&mut n);
+                self.doc.reassign_ids_into(&mut n, &mut ids);
             }
             n.translate(offset.x, offset.y);
             let (cx, cy) = n.center();
@@ -1135,6 +1145,8 @@ impl App {
                 None => self.doc.insert(n, parent),
             }
         }
+        // A text copied together with its path is on the copy of the path.
+        self.relink_paths(&ids);
         self.push_undo(pre);
     }
 
@@ -1169,10 +1181,15 @@ impl App {
         if self.doc.find(id).is_some_and(|n| n.flips() != (false, false)) {
             self.status = "This text is flipped: it reads the normal way while you edit it, and is mirrored again when you are done.".into();
         }
+        if self.doc.find(id).is_some_and(|n| n.on_path.is_some()) {
+            self.status = "This text is on a path: it is straight while you edit it, and goes back on the path when you are done.".into();
+        }
     }
 
     fn finish_text_edit(&mut self) {
         let Some(id) = self.editing.take() else { return };
+        // On a path: where the editor left the box is not a move by hand (see `apply_path_box`).
+        self.ext.path_seen.remove(&id);
         let pre = self.edit_pre.take();
         let empty = self.doc.find(id).map_or(true, |n| n.text.trim().is_empty());
         if empty && self.doc.pinned(id) {
@@ -1386,7 +1403,7 @@ impl App {
             self.new_doc();
         }
         if outline && !ctx.wants_keyboard_input() && self.editing.is_none() && self.ext.picker.eyedrop.is_none() {
-            self.outline_stroke();
+            self.outline_stroke(ctx);
         }
 
         // Eyedropper aktif: Esc membatalkan, shortcut lain ditahan supaya layar tetap sama dengan tangkapannya.
@@ -1561,6 +1578,8 @@ impl App {
                 Key::H if a && s && !c => self.distribute(true),
                 Key::V if a && s && !c => self.distribute(false),
                 Key::T if c && a => self.tidy_up(),
+                // Ctrl+Alt+P: text on path / off it again
+                Key::P if c && a => self.text_on_path(ctx),
                 Key::H if s && !c && !a => self.flip(true),
                 Key::V if s && !c && !a => self.flip(false),
                 Key::A if a && !c => self.align(0),
@@ -1777,9 +1796,17 @@ impl App {
                     ui.close_menu();
                     self.tidy_up();
                 }
-                if ui.add_enabled(has_sel, egui::Button::new("Outline stroke").shortcut_text("Ctrl+Shift+O")).clicked() {
+                if ui.add_enabled(has_sel, egui::Button::new("Outline stroke / text").shortcut_text("Ctrl+Shift+O")).clicked() {
                     ui.close_menu();
-                    self.outline_stroke();
+                    let ctx = ui.ctx().clone();
+                    self.outline_stroke(&ctx);
+                }
+                let on_path = !self.sel_on_path().is_empty();
+                let label = if on_path { "Detach text from path" } else { "Text on path" };
+                if ui.add_enabled(has_sel, egui::Button::new(label).shortcut_text("Ctrl+Alt+P")).on_hover_text("Select one text and one shape: the text runs along the shape and follows it.").clicked() {
+                    ui.close_menu();
+                    let ctx = ui.ctx().clone();
+                    self.text_on_path(&ctx);
                 }
                 ui.separator();
                 if ui.add_enabled(has_sel, egui::Button::new("Add auto layout").shortcut_text("Shift+A")).clicked() {
@@ -1918,6 +1945,7 @@ impl App {
         let clipped = can_clip && targets.iter().all(|id| self.doc.find(*id).is_some_and(|n| n.clip));
         let grouped = !self.selected_groups().is_empty();
         let detachable = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.is_instance()));
+        let on_path = !self.sel_on_path().is_empty();
         // Warna penanda yang sama di seluruh pilihan (untuk menandai bulatan aktif di menu).
         let sel_tag = {
             let mut tags = self.sel.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.tag);
@@ -1938,7 +1966,8 @@ impl App {
             ui.separator();
             item(ui, true, "Group", "Ctrl+G", 1);
             item(ui, grouped, "Ungroup", "Ctrl+Shift+G", 2);
-            item(ui, true, "Outline stroke", "Ctrl+Shift+O", 8);
+            item(ui, true, "Outline stroke / text", "Ctrl+Shift+O", 8);
+            item(ui, true, if on_path { "Detach text from path" } else { "Text on path" }, "Ctrl+Alt+P", 9);
             ui.separator();
             item(ui, true, "Create component", "Ctrl+Alt+K", 6);
             item(ui, detachable, "Detach instance", "Ctrl+Alt+B", 7);
@@ -2319,7 +2348,8 @@ impl App {
             Some(5) => self.delete_selection(),
             Some(6) => self.create_component(),
             Some(7) => self.detach_selection(),
-            Some(8) => self.outline_stroke(),
+            Some(8) => self.outline_stroke(&ui.ctx().clone()),
+            Some(9) => self.text_on_path(&ui.ctx().clone()),
             Some(c @ 10..=18) => {
                 self.edit_selected(|n| n.tag = c - 10);
                 self.status = if c == 10 { "Layer color removed.".into() } else { format!("Layer color: {}.", LAYER_COLORS[(c - 10) as usize].0) };
@@ -2523,6 +2553,7 @@ impl App {
                 }
                 // `KANVAS_BENCH_TYPO=1`: underline, strikethrough, justified text, lists and boxes
                 // of fixed height (see `bench_typo`). The frame is also exported, to compare.
+                // `=outline`: all its texts are turned into paths with Outline text.
                 // `=edit` / `=edit-list`: the justified paragraph / the numbered list is opened in
                 // the text editor with a click in its third line and a drag to its fourth, so the
                 // caret and the selection are in the screenshot. `=keys`: Ctrl+U on the selected list;
@@ -2578,13 +2609,20 @@ impl App {
                 // a bitmap, icons both ways, and stroked shapes before and after Outline stroke
                 // (see `bench_svg` for the modes).
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_SVG") {
-                    self.bench_svg(&mode, &mut b.inject);
+                    self.bench_svg(ctx, &mode, &mut b.inject);
                 }
                 // `KANVAS_BENCH_CAPS=1`: strokes with every cap and join, solid and dashed, beside
                 // the export of the same frame (see `bench_caps`). `=view:x0,y0,x1,y1`: that part.
                 // `=panel`: a dashed path is selected and the panel scrolled to its Stroke section.
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_CAPS") {
                     self.bench_caps(ctx, &mode, &b.out, &mut b.inject);
+                }
+                // `KANVAS_BENCH_TEXTPATH=1`: texts on paths beside the same texts outlined, and the
+                // export of that frame (see `bench_textpath`; the outlining and the export wait
+                // for the fonts). `=view:x0,y0,x1,y1`: that part. `=checks`: sliding, following,
+                // duplicating and deleting are tried too and printed to stderr.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_TEXTPATH") {
+                    b.ids = self.bench_textpath(ctx, &mode);
                 }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
@@ -3200,6 +3238,21 @@ impl App {
                         eprintln!("SVG selection {sel:?}; status: {}", self.status);
                     }
                 }
+                let textpath = std::env::var("KANVAS_BENCH_TEXTPATH").ok();
+                if let (Some(mode), true) = (&textpath, b.ids.len() >= 8) {
+                    if b.aux == 0 && b.frame >= 230 && (!self.fonts.any_loading() || b.frame > 900) {
+                        b.aux = b.frame;
+                        let (stage, ids) = (b.ids[0], b.ids[1..8].to_vec());
+                        self.bench_textpath_finish(ctx, stage, &ids, &b.out);
+                    }
+                    if mode == "checks" && b.aux != 0 {
+                        let ids = b.ids[8..].to_vec();
+                        self.bench_textpath_checks(b.frame, b.aux + 4, &ids, &mut b.inject);
+                    }
+                    if b.aux != 0 && (50..=55).contains(&(b.frame - b.aux)) {
+                        eprintln!("TEXTPATH frame {}: {:.2} ms", b.frame, self.frame_ms);
+                    }
+                }
                 if std::env::var_os("KANVAS_BENCH_CAPS").is_some() && (250..=255).contains(&b.frame) {
                     eprintln!("CAPS frame {}: {:.2} ms", b.frame, self.frame_ms);
                 }
@@ -3211,6 +3264,13 @@ impl App {
                     match (mode.as_str(), b.frame, paragraph) {
                         // `=edit-keys`: after Ctrl+U the selected characters are struck through too.
                         ("edit-keys", 245, _) => self.toggle_decoration(true),
+                        // `=outline`: every text of the frame becomes vector paths (Outline text).
+                        ("outline", 245, _) => {
+                            self.sel = b.ids.first().and_then(|id| self.doc.find(*id)).map(|f| f.children.iter().filter(|c| c.kind == Kind::Text).map(|c| c.id).collect()).unwrap_or_default();
+                            let start = std::time::Instant::now();
+                            self.outline_stroke(ctx);
+                            eprintln!("TYPO outlined in {:.1} ms: {} layers selected; status: {}", start.elapsed().as_secs_f32() * 1000.0, self.sel.len(), self.status);
+                        }
                         // `=resize`: the bottom handle of the justified paragraph is dragged down by
                         // 60, which gives it a fixed height; then its lines go to the bottom.
                         ("resize", 215, Some((x, y, w, h, _))) => {
@@ -3229,6 +3289,7 @@ impl App {
                     }
                 }
                 let settled = b.frame > if nested { 760 } else if component { 640 } else if auto { 356 } else { 260 };
+                let settled = settled && (textpath.is_none() || (b.aux != 0 && b.frame > b.aux + 80));
                 let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && settled && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;

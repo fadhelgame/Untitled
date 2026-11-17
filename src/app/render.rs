@@ -4,6 +4,7 @@ use super::blend;
 use super::picker::Picker;
 use super::vtext;
 use super::{col, View};
+use crate::textpath;
 use crate::doc::{Asset, Doc, Gradient, Kind, Node};
 use crate::fonts::FontManager;
 use eframe::egui::{
@@ -144,8 +145,38 @@ struct DetailReq {
     hpx: f32,
 }
 
+/// A text on a path as it was last laid out, and what that depended on (see `path_laid`).
+struct PathText {
+    key: u64,
+    laid: Arc<textpath::Laid>,
+}
+
+/// What laying out a text on a path reports back to the document: the box around its glyphs,
+/// the direction of the path under its middle and the state of the path it was made for (for
+/// telling a drag of the text from a change of the path).
+pub struct PathBox {
+    pub id: u64,
+    pub bbox: (f32, f32, f32, f32),
+    pub tan: (f32, f32),
+    pub guide: u64,
+}
+
+/// Where a text on a path was last put by the canvas (see `App::apply_path_box`).
+#[derive(Clone, Copy)]
+pub struct PathSeen {
+    pub at: (f32, f32),
+    pub guide: u64,
+    pub offset: u32,
+}
+
 /// State tambahan untuk fitur di luar inti editor.
 pub struct Ext {
+    /// Paths that carry text, flattened: by the id of the path, with `textpath::guide_key`.
+    text_lines: HashMap<u64, (u64, Arc<textpath::Guide>)>,
+    /// Texts on a path, laid out: by the id of the text. Made again only when the text, its
+    /// fonts, its place on the path or the path itself changes.
+    path_texts: HashMap<u64, PathText>,
+    pub path_seen: HashMap<u64, PathSeen>,
     pub frame: u64,
     pub pen: Option<Vec<PenPt>>,
     pub pen_drag: bool,
@@ -252,6 +283,9 @@ impl Default for Ext {
             shadow_failed: HashSet::new(),
             sh_tx,
             sh_rx,
+            text_lines: HashMap::new(),
+            path_texts: HashMap::new(),
+            path_seen: HashMap::new(),
             frame: 0,
             pen: None,
             pen_drag: false,
@@ -540,6 +574,13 @@ pub struct PaintCx<'a> {
     /// Zoom sedang berubah: pakai ukuran glyph bertingkat supaya atlas font tidak membengkak.
     pub moving: bool,
     pub measures: Vec<(u64, f32, f32)>,
+    /// The boxes of the texts on a path that were laid out (see `path_laid`).
+    pub boxes: Vec<PathBox>,
+    /// Every node of the page by its id, with the index of the top-level node it is in. Made
+    /// when the first text on a path asks for its path.
+    pub index: Option<HashMap<u64, (&'a Node, u32)>>,
+    /// While recording: the frame that is being recorded.
+    pub rec_top: Option<u64>,
     pub drawn: usize,
     /// Kalau ada: mesh node ditampung di sini, bukan digambar (dipakai clipping mask).
     pub capture: Option<Vec<egui::Mesh>>,
@@ -557,6 +598,128 @@ pub struct PaintCx<'a> {
     pub no_keep: bool,
     /// While recording: what the GPU draws directly (see `add_special`), with its clip rectangle.
     pub specials: Vec<(Rect, Special)>,
+}
+
+impl<'a> PaintCx<'a> {
+    /// A node of the page by its id, and which top-level node holds it.
+    fn node(&mut self, id: u64) -> Option<(&'a Node, u32)> {
+        let tops = self.tops;
+        let index = self.index.get_or_insert_with(|| {
+            let mut map = HashMap::new();
+            for (i, top) in tops.iter().enumerate() {
+                top.walk(&mut |c| {
+                    map.insert(c.id, (c, i as u32));
+                });
+            }
+            map
+        });
+        index.get(&id).copied()
+    }
+}
+
+/// The text `n` laid along the path it is attached to. `None`: it is not attached, or its path
+/// is gone or has no length: plain text. Laying it out again is only done when something it
+/// depends on changed. Each call reports the box of the text (`PaintCx::boxes`) and leaves the
+/// line with the fonts, where the export code finds it when it draws a shadow or a blur.
+fn path_laid(pc: &mut PaintCx, n: &Node) -> Option<Arc<textpath::Laid>> {
+    use std::hash::{Hash, Hasher};
+    let path_id = n.on_path?;
+    let found = pc.node(path_id).filter(|(p, _)| textpath::can_carry(p));
+    let Some((path, top)) = found else {
+        pc.fonts.paths.remove(&n.id);
+        return None;
+    };
+    // Kept meshes are made again when their frame changes; this text also changes with a path
+    // that is somewhere else.
+    if pc.recording && pc.rec_top.and_then(|id| pc.node(id)).map(|f| f.1) != Some(top) {
+        pc.no_keep = true;
+    }
+    let gkey = textpath::guide_key(path);
+    let guide = match pc.ext.text_lines.get(&path_id) {
+        Some((k, g)) if *k == gkey => g.clone(),
+        _ => {
+            let Some(g) = textpath::guide_of(path).map(Arc::new) else {
+                pc.fonts.paths.remove(&n.id);
+                return None;
+            };
+            if pc.ext.text_lines.len() > 4096 {
+                pc.ext.text_lines.clear();
+            }
+            pc.ext.text_lines.insert(path_id, (gkey, g.clone()));
+            g
+        }
+    };
+    pc.fonts.paths.insert(n.id, guide.clone());
+    let (job, _) = textpath::line_job(n, pc.fonts);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (&job, gkey, n.path_offset.to_bits(), n.path_side, n.align, pc.fonts.usable_count()).hash(&mut h);
+    let key = h.finish();
+    let laid = match pc.ext.path_texts.get(&n.id) {
+        Some(t) if t.key == key => t.laid.clone(),
+        _ => {
+            let _span = super::perf::span(3);
+            let laid = Arc::new(textpath::laid(pc.ctx, n, &guide, pc.fonts));
+            if pc.ext.path_texts.len() > 4096 {
+                pc.ext.path_texts.clear();
+            }
+            pc.ext.path_texts.insert(n.id, PathText { key, laid: laid.clone() });
+            laid
+        }
+    };
+    if let Some(bbox) = laid.bbox {
+        pc.boxes.push(PathBox { id: n.id, bbox, tan: laid.tan, guide: gkey });
+    }
+    Some(laid)
+}
+
+/// Before nodes are turned into SVG off the canvas (for a shadow, a blur): the lines of the
+/// texts on a path among them.
+fn register_paths<T: AsRef<Node>>(pc: &mut PaintCx, nodes: &[T]) {
+    for n in nodes {
+        let n = n.as_ref();
+        if n.kind == Kind::Text && n.on_path.is_some() {
+            path_laid(pc, n);
+        }
+        register_paths(pc, &n.children);
+    }
+}
+
+/// Draw a text on its path: every glyph as a vector mesh, turned to the path, so it is sharp
+/// at any zoom. `clip`: glyphs outside of it are left out.
+fn paint_path_text(pc: &mut PaintCx, sink: &mut Sink, laid: &textpath::Laid, n: &Node, alpha: f32, clip: Option<Rect>) {
+    let (view, o, z) = (pc.view, pc.o, pc.view.zoom);
+    let px = n.max_size() * z;
+    if px < 3.0 {
+        // Too small to read: a faint line where the text runs.
+        let pts: Vec<Pos2> = laid.glyphs.iter().map(|g| view.to_screen(o, g.at.0, g.at.1)).collect();
+        if pts.len() >= 2 {
+            let color = n.fill.map(col).unwrap_or(Color32::BLACK).gamma_multiply(alpha * 0.4);
+            sink.add(Shape::line(pts, Stroke::new((px * 0.5).max(1.0), color)));
+        }
+        return;
+    }
+    let feather = 1.0 / pc.ctx.pixels_per_point().max(0.1);
+    let mut mesh = egui::Mesh::default();
+    for g in &laid.glyphs {
+        if g.chr.is_whitespace() {
+            continue;
+        }
+        let (at, size) = (view.to_screen(o, g.at.0, g.at.1), g.size * z);
+        // (No glyph reaches further than this from its origin.)
+        if clip.is_some_and(|c| !c.expand(size * 2.0).contains(at)) {
+            continue;
+        }
+        vtext::turned(&mut pc.ext.glyphs, pc.fonts, &mut mesh, &g.family, g.chr, size, at, vec2(g.tan.0, g.tan.1), g.color.gamma_multiply(alpha), feather);
+    }
+    if !mesh.indices.is_empty() {
+        sink.add(Shape::mesh(mesh));
+    }
+    for (poly, color) in &laid.bars {
+        let pts: Vec<Pos2> = poly.iter().map(|p| view.to_screen(o, p.0, p.1)).collect();
+        if let Some(mesh) = super::stroke::fill_edge(&[pts], color.gamma_multiply(alpha), feather, 0.5) {
+            sink.add(Shape::mesh(mesh));
+        }
+    }
 }
 
 /// Texture of an image. `mask`: siluet putih (hanya alpha) yang diwarnai lewat tint, untuk color
@@ -1590,6 +1753,7 @@ fn shadow_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: 
         same && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
     });
     if !fresh && !pc.ext.shadow_busy.contains(&n.id) && !pc.ext.shadow_failed.contains(&n.id) {
+        register_paths(pc, run);
         if let Some((svg, region)) = crate::export::shadow_svg(run, pc.assets, pc.fonts, pc.ctx) {
             let scale = shadow_scale(shadow.blur, screen, (region.2 - region.0).max(region.3 - region.1));
             pc.ext.shadow_busy.insert(n.id);
@@ -1630,6 +1794,10 @@ fn measure_texts(pc: &mut PaintCx, n: &Node) {
         measure_texts(pc, c);
     }
     if n.kind != Kind::Text || n.text.is_empty() {
+        return;
+    }
+    // On a path: its box is the one around its glyphs there.
+    if n.on_path.is_some() && path_laid(pc, n).is_some() {
         return;
     }
     let (max, z) = (n.max_size(), pc.view.zoom);
@@ -1682,6 +1850,7 @@ fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[
         same(&c.nodes) && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
     });
     if !fresh && !pc.ext.blur_busy.contains(&key) && !pc.ext.blur_failed.contains(&key) {
+        register_paths(pc, run);
         if let Some((svg, region)) = crate::export::blur_svg(run, pc.assets, pc.fonts, pc.ctx) {
             let scale = blur_scale(first.blur, screen, (region.2 - region.0).max(region.3 - region.1));
             pc.ext.blur_busy.insert(key);
@@ -1931,9 +2100,10 @@ fn record_frame(pc: &mut PaintCx, n: &Node, alpha: f32) -> Option<(Vec<(Rect, Ke
     let (vis, drawn) = (pc.vis, pc.drawn);
     pc.vis = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
     (pc.recording, pc.no_keep, pc.skip_shadow) = (true, false, true);
+    pc.rec_top = Some(n.id);
     pc.specials.clear();
     paint_node(pc, &side, n, alpha);
-    pc.recording = false;
+    (pc.recording, pc.rec_top) = (false, None);
     pc.vis = vis;
     let count = pc.drawn - drawn;
     pc.drawn = drawn;
@@ -2086,6 +2256,15 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
     let alpha = alpha * n.opacity.clamp(0.0, 1.0);
     let (x0, y0, x1, y1) = n.bounds();
     let cull = if n.rotation != 0.0 { n.aabb() } else { (x0, y0, x1, y1) };
+    // A text on a path is where its path is; its own box follows only once it has been laid
+    // out there (the path may have been moved while the text was out of view).
+    let cull = match (n.kind, n.on_path) {
+        (Kind::Text, Some(path)) => pc.node(path).map_or(cull, |(p, _)| {
+            let b = p.aabb();
+            (cull.0.min(b.0), cull.1.min(b.1), cull.2.max(b.2), cull.3.max(b.3))
+        }),
+        _ => cull,
+    };
     let pad = n.stroke_w.max(1.0) + if n.kind == Kind::Text { n.max_size() } else { 0.0 } + n.shadow.map_or(0.0, |s| s.pad());
     if cull.2 + pad < pc.vis.0 || cull.0 - pad > pc.vis.2 || cull.3 + pad < pc.vis.1 || cull.1 - pad > pc.vis.3 {
         return;
@@ -2222,11 +2401,11 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
         }
         Kind::Path => {
             // Jumlah segmen per kurva mengikuti ukuran di layar (simpangan ±0.1 piksel), supaya
-            // kurva tetap mulus saat di-zoom.
-            let segs = ((r.width() + r.height()).sqrt() * 1.2).clamp(4.0, 256.0) as usize;
+            // kurva tetap mulus saat di-zoom. (Each curve by its own size: outlined text is
+            // made of hundreds of small ones.)
             let (view, o) = (pc.view, pc.o);
             let mut all: Vec<Vec<Pos2>> =
-                n.contours(segs).into_iter().map(|c| c.into_iter().map(|(x, y)| view.to_screen(o, x, y)).collect()).collect();
+                n.contours_within(0.1 / z.max(1e-6), 256).into_iter().map(|c| c.into_iter().map(|(x, y)| view.to_screen(o, x, y)).collect()).collect();
             let pts = all.remove(0);
             let holes = all;
             if pts.len() < 2 {
@@ -2284,6 +2463,12 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
         }
         Kind::Text => {
             if pc.editing == Some(n.id) || n.text.is_empty() {
+                return;
+            }
+            if let Some(laid) = path_laid(pc, n) {
+                let clip = (n.rotation == 0.0 && !flipped).then(|| painter.clip_rect());
+                paint_path_text(pc, &mut sink, &laid, n, alpha, clip);
+                flush(pc, &mut sink, n, pivot);
                 return;
             }
             let max = n.max_size();

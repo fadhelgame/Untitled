@@ -45,6 +45,8 @@ impl App {
         if self.components.rev == self.ext.rev && self.components.base.is_some() {
             return self.settle_live();
         }
+        // A text whose path was deleted is plain text again.
+        self.doc.drop_lost_paths();
         let base = self.components.base.take();
         if self.doc.settle(base.as_ref(), &self.lifted()) {
             // Parts whose layer was removed from the main are gone.

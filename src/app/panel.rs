@@ -87,7 +87,10 @@ impl App {
                     "Shift+H V      flip horizontal / vertical",
                     "1 … 9, 0       opacity 10% … 100%",
                     "Shift+X        swap fill/stroke",
-                    "Ctrl+Shift+O   outline stroke",
+                    "Ctrl+Shift+O   outline stroke / text",
+                    "Ctrl+Alt+P     text on path / off it",
+                    "      (select a text and a shape; drag",
+                    "      the text to slide it along)",
                     "Ctrl+V         paste at the pointer",
                     "Ctrl+Shift+V   paste in place",
                     "Ctrl+Shift+H   show/hide",
@@ -130,6 +133,7 @@ impl App {
         let mut flip: Option<bool> = None;
         let mut remove_bg = false;
         let mut crop_image = false;
+        let mut detach_path = false;
         let mut style_action: Option<super::styles::StyleAction> = None;
         let mut comp_act: Option<super::components::Act> = None;
         let mut constrain: super::constraints::Pair = (None, None);
@@ -253,6 +257,20 @@ impl App {
             });
             ui.checkbox(&mut n.locked, "Locked").on_hover_text("Can't be selected or moved on the canvas. Select it in the Layers panel to unlock (Ctrl+Shift+L).");
 
+            if n.kind == Kind::Text && n.on_path.is_some() && range.is_none() {
+                section(ui, "Text on path");
+                ui.horizontal(|ui| {
+                    ui.add_sized([half, 28.0], egui::DragValue::new(&mut n.path_offset).speed(1.0).max_decimals(1).prefix("Offset  "))
+                        .on_hover_text("How far along the path the text is moved from where its alignment puts it. Dragging the text on the canvas changes this too.");
+                    ui.checkbox(&mut n.path_side, "Flip side").on_hover_text("The text stands on the other side of the path and runs the other way.");
+                });
+                ui.add_enabled_ui(!pinned, |ui| {
+                    if ui.add(egui::Button::new("Detach from path").min_size(vec2(ui.available_width(), 28.0))).on_hover_text("Plain text again  (Ctrl+Alt+P)").clicked() {
+                        detach_path = true;
+                    }
+                });
+                ui.weak("One line along the shape; align left / center / right places it on the path.");
+            }
             if n.kind == Kind::Text {
                 self.typography(ui, &ctx, &mut n, editing, range, None);
                 if range.is_none() {
@@ -394,6 +412,10 @@ impl App {
         }
         if crop_image {
             self.start_crop(id);
+            return;
+        }
+        if detach_path {
+            self.detach_from_path();
             return;
         }
         if let Some(action) = style_action {

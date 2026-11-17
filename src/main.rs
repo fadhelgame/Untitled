@@ -11,6 +11,7 @@ mod fonts;
 mod layout;
 mod outline;
 mod svg_import;
+mod textpath;
 
 use eframe::egui;
 

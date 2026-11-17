@@ -170,6 +170,15 @@ fn text_svg(out: &mut String, n: &Node, fonts: &mut FontManager, ctx: &egui::Con
     if n.text.is_empty() {
         return;
     }
+    // On a path: the glyphs where `textpath` puts them, as on the canvas.
+    if let Some(guide) = n.on_path.and_then(|_| fonts.paths.get(&n.id).cloned()) {
+        for part in crate::textpath::path_parts(ctx, n, &guide, fonts) {
+            let mut all: Vec<crate::outline::Contour> = part.glyphs.into_iter().flatten().collect();
+            all.extend(part.bars);
+            let _ = write!(out, r#"<path d="{}" {}/>"#, contour_d(&all), paint("fill", Some(part.color.to_srgba_unmultiplied())));
+        }
+        return;
+    }
     // Layout di ukuran dunia (dibatasi supaya atlas glyph tidak membengkak), lalu diskalakan balik.
     let f = (200.0 / n.max_size()).min(1.0);
     let layout = layout_text(ctx, n, &n.text, fonts, f, 1.0, true);
@@ -661,6 +670,8 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
 /// SVG untuk satu node (mis. frame terpilih) atau seluruh dokumen. Hasil: (svg, lebar, tinggi).
 pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, f32, f32)> {
     let assets = &doc.assets;
+    // Texts on a path find their line here (see `text_svg`).
+    fonts.paths = doc.guides();
     let target = only.and_then(|id| doc.find(id));
     let (x0, y0, x1, y1) = match target {
         Some(n) => {

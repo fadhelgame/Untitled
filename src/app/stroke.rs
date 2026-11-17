@@ -79,6 +79,14 @@ fn area2(c: &[Pos2]) -> f32 {
 /// lie inside it; their soft edge is hidden by an opaque colour, but would show as darker lines
 /// in a see-through one, so for those the polygons are united first.
 pub fn fill(polys: &[Vec<Pos2>], color: Color32, feather: f32) -> Option<Mesh> {
+    fill_edge(polys, color, feather, 0.0)
+}
+
+/// `fill` with the soft edge moved inward by `inner` of its width (0.5: centred on the edge of
+/// the polygons, for shapes that are not made narrower beforehand to make up for it; only an
+/// opaque colour hides the part that then lies on the shape).
+pub fn fill_edge(polys: &[Vec<Pos2>], color: Color32, feather: f32, inner: f32) -> Option<Mesh> {
+    let inner = if color.a() == 255 { inner } else { 0.0 };
     let united: Vec<(Vec<Pos2>, f32)>;
     let clean: Vec<Vec<Pos2>>;
     let (polys, sides): (&[Vec<Pos2>], Vec<f32>) = if color.a() < 255 {
@@ -117,8 +125,8 @@ pub fn fill(polys: &[Vec<Pos2>], color: Color32, feather: f32) -> Option<Mesh> {
             let len2 = m.length_sq();
             let m: Vec2 = if len2 < 0.16 { m.normalized() * 2.5 } else { m * (2.0 / len2) };
             let m = if m.is_finite() { m } else { n2 };
-            mesh.vertices.push(vertex(c[i], color));
-            mesh.vertices.push(vertex(c[i] + m * feather, Color32::TRANSPARENT));
+            mesh.vertices.push(vertex(c[i] - m * (feather * inner), color));
+            mesh.vertices.push(vertex(c[i] + m * (feather * (1.0 - inner)), Color32::TRANSPARENT));
         }
         let n = n as u32;
         for i in 0..n {

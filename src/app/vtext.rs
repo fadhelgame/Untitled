@@ -37,6 +37,17 @@ fn level(px: f32) -> (u8, f32) {
     }
 }
 
+/// The same for text on a path, which is drawn from outlines at every size: small glyphs get
+/// by with far fewer points.
+fn level_fine(px: f32) -> (u8, f32) {
+    match px {
+        p if p <= 20.0 => (8, 20.0),
+        p if p <= 64.0 => (9, 64.0),
+        p if p <= 192.0 => (10, 192.0),
+        p => level(p),
+    }
+}
+
 struct Outline {
     b: lyon_tessellation::path::path::Builder,
     open: bool,
@@ -203,7 +214,10 @@ pub fn fill_contours<C: AsRef<[Pos2]>>(contours: &[C], rule: FillRule) -> Option
 
 impl Cache {
     fn glyph(&mut self, fonts: &FontManager, family: &FontFamily, chr: char, px: f32) -> Option<Arc<GlyphMesh>> {
-        let (lv, max_px) = level(px);
+        self.glyph_at(fonts, family, chr, level(px))
+    }
+
+    fn glyph_at(&mut self, fonts: &FontManager, family: &FontFamily, chr: char, (lv, max_px): (u8, f32)) -> Option<Arc<GlyphMesh>> {
         if self.map.len() > 6000 {
             self.map.clear();
         }
@@ -269,6 +283,39 @@ pub fn mesh(
         }
     }
     Some(mesh)
+}
+
+/// Adds one glyph to `mesh`, turned: its origin (the left end of its baseline) at `at`, the
+/// baseline running along the unit vector `tan`, `size` pixels high. For text on a path.
+/// Result false: the glyph has no outline (a space, or no font has it).
+#[allow(clippy::too_many_arguments)]
+pub fn turned(cache: &mut Cache, fonts: &FontManager, mesh: &mut Mesh, family: &FontFamily, chr: char, size: f32, at: Pos2, tan: Vec2, color: Color32, feather: f32) -> bool {
+    let Some(gm) = cache.glyph_at(fonts, family, chr, level_fine(size)) else { return false };
+    // Glyph space has y down: its y axis is the baseline's normal, a quarter turn on from `tan`.
+    let nrm = vec2(-tan.y, tan.x);
+    let to = |v: [f32; 2]| at + (tan * v[0] + nrm * v[1]) * size;
+    let turn = |v: [f32; 2]| tan * v[0] + nrm * v[1];
+    let vertex = |pos: Pos2, color: Color32| egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color };
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.extend(gm.verts.iter().map(|v| vertex(to(*v), color)));
+    mesh.indices.extend(gm.idx.iter().map(|i| base + i));
+    // The soft edge is centred on the outline, so small text is not made bolder by it. Its
+    // inner half lies on the glyph, which hides it as long as the colour is opaque.
+    let inner = if color.a() == 255 { 0.5 } else { 0.0 };
+    for c in &gm.contours {
+        let n = c.len() as u32;
+        let base = mesh.vertices.len() as u32;
+        for (p, m) in c {
+            let (q, m) = (to(*p), turn(*m) * feather);
+            mesh.vertices.push(vertex(q - m * inner, color));
+            mesh.vertices.push(vertex(q + m * (1.0 - inner), Color32::TRANSPARENT));
+        }
+        for i in 0..n {
+            let (a, b) = (base + 2 * i, base + 2 * ((i + 1) % n));
+            mesh.indices.extend([a, a + 1, b, b, a + 1, b + 1]);
+        }
+    }
+    true
 }
 
 #[cfg(test)]

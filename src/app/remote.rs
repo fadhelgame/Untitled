@@ -47,6 +47,8 @@ enum After {
     /// `replace_text`: measure the texts that changed, then report the counts.
     Replaced { count: usize, ids: Vec<u64> },
     Shot { id: Option<u64>, max: f32 },
+    /// `outline_stroke` with texts among the nodes: once their fonts are there.
+    Outline { ids: Vec<u64> },
     Export { id: Option<u64>, path: PathBuf, scale: f32 },
 }
 
@@ -489,6 +491,11 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
             if n.valign != 0 {
                 put("valign", json!(["top", "middle", "bottom"][n.valign.min(2) as usize]));
             }
+            if let Some(path) = n.on_path {
+                put("on_path", json!(path));
+                put("path_offset", r2(n.path_offset));
+                put("path_side", json!(n.path_side));
+            }
             if !n.spans.is_empty() {
                 let spans: Vec<Value> = n
                     .spans
@@ -647,7 +654,7 @@ impl App {
             "list_fonts" => self.remote_fonts(args).map(Outcome::Now),
             "replace_text" => self.remote_replace(args),
             "import_svg" => self.remote_import_svg(args).map(Outcome::Now),
-            "outline_stroke" => self.remote_outline(args).map(Outcome::Now),
+            "outline_stroke" => self.remote_outline(args),
             "screenshot" => {
                 let id = self.target(args)?;
                 let max = args.get("max_size").map(|v| num("max_size", v)).transpose()?.unwrap_or(1024.0).clamp(64.0, 2048.0);
@@ -732,6 +739,10 @@ impl App {
     /// Ukur teks dengan layout yang sama dengan canvas dan simpan ukurannya di node.
     fn measure_text(&mut self, ctx: &egui::Context, id: u64) {
         let Some(n) = self.doc.find(id).filter(|n| n.kind == Kind::Text && !n.text.is_empty()).cloned() else { return };
+        // On a path: the box around its glyphs there.
+        if n.on_path.is_some() && self.fit_path_text(ctx, id) {
+            return;
+        }
         let f = (200.0 / n.max_size()).min(1.0);
         let layout = render::layout_text(ctx, &n, &n.text, &mut self.fonts, f, 1.0, true);
         let (w, h) = (if n.wrap { n.w } else { (layout.width / f).max(2.0) }, (layout.height / f).max(1.0));
@@ -781,6 +792,7 @@ impl App {
                 let list: Vec<Value> = ids.iter().filter_map(|id| self.doc.find(*id).map(|n| brief(n, self.origin_of(*id)))).collect();
                 Ok(ok(json!({ "replaced": count, "layers": ids.len(), "updated": list })))
             }
+            After::Outline { ids } => self.outline_nodes(Some(ctx), &ids).map(ok),
             After::Shot { id, max } => {
                 let (svg, w, h) = export::to_svg(&self.doc, id, &mut self.fonts, ctx).ok_or("nothing to render: the document is empty")?;
                 let scale = (max / w.max(h)).min(2.0);
@@ -1079,6 +1091,24 @@ impl App {
                         return Err("`fixed_height` only applies to text nodes".into());
                     }
                     n.fixed_h = flag(k, v)?;
+                }
+                "on_path" | "path_offset" | "path_side" => {
+                    if n.kind != Kind::Text {
+                        return Err(format!("`{k}` only applies to text nodes"));
+                    }
+                    match &k[..] {
+                        "on_path" if v.is_null() => crate::textpath::detach(n),
+                        "on_path" => {
+                            let path = v.as_u64().ok_or("`on_path` must be the id of a path, line, ellipse or rect node, or null to take the text off its path")?;
+                            if !self.doc.find(path).is_some_and(crate::textpath::can_carry) {
+                                return Err(format!("`on_path`: node {path} is not a path, line, ellipse or rect of this page (create the shape first, then put the text on it)"));
+                            }
+                            n.on_path = Some(path);
+                            (n.rotation, n.flip_h, n.flip_v) = (0.0, false, false);
+                        }
+                        "path_offset" => n.path_offset = num(k, v)?,
+                        _ => n.path_side = flag(k, v)?,
+                    }
                 }
                 "closed" => n.closed = flag(k, v)?,
                 "image_path" | "svg" => {
@@ -1433,8 +1463,10 @@ impl App {
         Ok(json!({ "id": id, "w": r2(w), "h": r2(h), "shapes": shapes, "groups": groups, "not_supported": dropped }))
     }
 
-    /// `outline_stroke`: strokes become filled paths (see `Doc::outline_strokes`), one undo step.
-    fn remote_outline(&mut self, args: &Value) -> Result<Value, String> {
+    /// `outline_stroke`: strokes become filled paths (see `Doc::outline_strokes`) and texts
+    /// become paths of their glyphs, one undo step. With a text among the nodes the answer
+    /// waits for its fonts.
+    fn remote_outline(&mut self, args: &Value) -> Result<Outcome, String> {
         let ids = id_list(args.get("ids"))?;
         if ids.is_empty() {
             return Err("`ids` is empty".into());
@@ -1445,16 +1477,35 @@ impl App {
         if let Some(id) = ids.iter().find(|id| self.doc.pinned(**id)) {
             return Err(format!("node {id} is part of an instance: its shape follows the main component. Outline the stroke there, or detach the instance first."));
         }
+        let texts: Vec<u64> = ids.iter().copied().filter(|id| self.doc.find(*id).is_some_and(|n| n.kind == Kind::Text)).collect();
+        if texts.is_empty() {
+            return self.outline_nodes(None, &ids).map(Outcome::Now);
+        }
+        let mut warnings = Vec::new();
+        let fonts = self.want_fonts(&texts, &mut warnings);
+        Ok(Outcome::Later(After::Outline { ids }, fonts))
+    }
+
+    /// `ctx`: there to lay texts out; without it only strokes are outlined.
+    fn outline_nodes(&mut self, ctx: Option<&egui::Context>, ids: &[u64]) -> Result<Value, String> {
         let pre = self.doc.clone();
-        let done = self.doc.outline_strokes(&ids);
-        if done.outlines.is_empty() {
+        let (texts, shapes): (Vec<u64>, Vec<u64>) = ids.iter().partition(|id| self.doc.find(**id).is_some_and(|n| n.kind == Kind::Text));
+        let mut glyphs = Vec::new();
+        if let Some(ctx) = ctx {
+            for id in texts {
+                glyphs.extend(self.text_outline(ctx, id));
+            }
+        }
+        let done = self.doc.outline_strokes(&shapes);
+        if done.outlines.is_empty() && glyphs.is_empty() {
             self.doc = pre;
-            return Err("none of those nodes has a stroke that can be outlined (not the stroke of a text, and the border of a frame only when it is inside the frame)".into());
+            return Err("none of those nodes has a stroke that can be outlined or is a text with something to draw (the border of a frame only when it is inside the frame)".into());
         }
         self.push_undo(pre);
         self.sel.clone_from(&done.ids);
-        self.status = format!("Remote: outlined {} stroke{}.", done.outlines.len(), if done.outlines.len() == 1 { "" } else { "s" });
-        Ok(json!({ "outlines": done.outlines, "selected": done.ids, "skipped": done.text + done.skipped }))
+        self.sel.extend(&glyphs);
+        self.status = format!("Remote: outlined {} stroke{} and {} text path{}.", done.outlines.len(), if done.outlines.len() == 1 { "" } else { "s" }, glyphs.len(), if glyphs.len() == 1 { "" } else { "s" });
+        Ok(json!({ "outlines": done.outlines, "text_paths": glyphs, "selected": self.sel, "skipped": done.text + done.skipped }))
     }
 
     fn remote_delete(&mut self, args: &Value) -> Result<Value, String> {

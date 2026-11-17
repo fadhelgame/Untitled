@@ -443,7 +443,7 @@ pub fn stroke_path(contours: &[Contour], style: &StrokeStyle, res: f32) -> Optio
 }
 
 /// A rectangle with rounded corners, clockwise. It starts where the canvas starts its dashes.
-fn rounded_rect((x0, y0, x1, y1): (f32, f32, f32, f32), r: f32) -> Contour {
+pub fn rounded_rect((x0, y0, x1, y1): (f32, f32, f32, f32), r: f32) -> Contour {
     let r = r.min((x1 - x0) * 0.5).min((y1 - y0) * 0.5).max(0.0);
     if r < 0.01 {
         return Contour { pts: vec![corner(x0, y0), corner(x1, y0), corner(x1, y1), corner(x0, y1)], closed: true };
@@ -465,7 +465,7 @@ fn rounded_rect((x0, y0, x1, y1): (f32, f32, f32, f32), r: f32) -> Contour {
 }
 
 /// An ellipse as four curves, clockwise from its rightmost point (like the canvas).
-fn ellipse((cx, cy): (f32, f32), (rx, ry): (f32, f32)) -> Contour {
+pub fn ellipse((cx, cy): (f32, f32), (rx, ry): (f32, f32)) -> Contour {
     let (kx, ky) = (rx * 0.552_284_8, ry * 0.552_284_8);
     let pt = |x: f32, y: f32, hin: [f32; 2], hout: [f32; 2]| PenPt { x, y, hin, hout, r: None };
     let pts = vec![
@@ -692,6 +692,64 @@ impl Doc {
             done.outlines.push(oid);
         }
         done
+    }
+}
+
+impl Doc {
+    /// Outline text: the text node `id` is replaced by filled paths made from `parts` (see
+    /// `textpath::text_parts`): per colour one path with the glyphs, and one with the underlines
+    /// and strikethroughs if there are any. The first takes the place and the id of the text;
+    /// several are one group. Result: the ids of the paths, empty if nothing was made.
+    pub fn text_to_paths(&mut self, id: u64, parts: Vec<crate::textpath::Part>) -> Vec<u64> {
+        let Some(n) = self.find(id).filter(|n| n.kind == Kind::Text).cloned() else { return Vec::new() };
+        let size = n.max_size();
+        let mut made: Vec<Node> = Vec::new();
+        for part in parts {
+            let [r, g, b, a] = part.color.to_srgba_unmultiplied();
+            let glyphs = crate::textpath::even_odd(part.glyphs, size);
+            // Lines of different sizes can overlap where they meet.
+            let bars = simplify(&part.bars, Rule::NonZero, 0.0);
+            for (contours, what) in [(glyphs, "outline"), (bars, "lines")] {
+                if contours.is_empty() {
+                    continue;
+                }
+                let mut o = Node::new(0, Kind::Path, 0.0, 0.0);
+                o.name = format!("{} {what}", n.name);
+                o.fill = Some([r, g, b, a]);
+                o.fill_style = n.fill_style.filter(|_| n.fill == o.fill);
+                (o.visible, o.locked, o.tag) = (n.visible, n.locked, n.tag);
+                (o.opacity, o.blend, o.clip, o.shadow, o.blur) = (n.opacity, n.blend, n.clip, n.shadow, n.blur);
+                (o.constrain_h, o.constrain_v, o.absolute) = (n.constrain_h, n.constrain_v, n.absolute);
+                o.group = n.group;
+                set_contours(&mut o, contours);
+                made.push(o);
+            }
+        }
+        if made.is_empty() {
+            return Vec::new();
+        }
+        let parent = self.parent_of(id);
+        let Some(at) = self.locate(id).and_then(|path| path.last().copied()) else { return Vec::new() };
+        if made.len() > 1 && n.group == 0 {
+            let group = self.alloc_id();
+            self.group_names.insert(group, n.name.clone());
+            made.iter_mut().for_each(|o| o.group = group);
+        }
+        let mut ids = Vec::new();
+        for (i, mut o) in made.into_iter().enumerate() {
+            o.id = if i == 0 { id } else { self.alloc_id() };
+            ids.push(o.id);
+            if i == 0 {
+                if let Some(slot) = self.find_mut(id) {
+                    *slot = o;
+                }
+            } else {
+                // Beside an item of an auto layout the others would be items of their own.
+                o.absolute |= parent.and_then(|p| self.find(p)).is_some_and(|p| p.is_auto());
+                self.insert_at(o, parent, at + i);
+            }
+        }
+        ids
     }
 }
 

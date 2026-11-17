@@ -155,6 +155,9 @@ impl App {
             editing: self.editing,
             moving,
             measures: Vec::new(),
+            boxes: Vec::new(),
+            index: None,
+            rec_top: None,
             drawn: 0,
             capture: None,
             skip_shadow: false,
@@ -203,7 +206,11 @@ impl App {
             render::paint_crop_ghost(&mut pc, &painter, n);
         }
         self.drawn = pc.drawn;
+        let boxes = std::mem::take(&mut pc.boxes);
         let measures = std::mem::take(&mut pc.measures);
+        for b in boxes {
+            self.apply_path_box(b);
+        }
         for (id, w, h) in measures {
             // (A height that was set by hand stays.)
             let differs = self.doc.find(id).is_some_and(|n| (n.w - w).abs() > 0.5 || (!n.fixed_h && (n.h - h).abs() > 0.5));
@@ -374,9 +381,12 @@ impl App {
             Kind::Line => {
                 painter.line_segment([s(n.x, n.y), s(n.x + n.w, n.y + n.h)], Stroke::new(width + 0.5, accent));
             }
-            Kind::Path => {
+            // (A path of very many contours, such as a paragraph of outlined text, gets its box
+            // like other nodes: thousands of little outlines are slow to draw and say nothing.)
+            Kind::Path if n.holes.len() <= 60 => {
                 let stroke = Stroke::new(width, accent);
-                for (c, ring) in n.contours(16).into_iter().enumerate() {
+                // (Each curve by its own size: outlined text is hundreds of small ones.)
+                for (c, ring) in n.contours_within(0.25 / self.view.zoom.max(1e-6), 16).into_iter().enumerate() {
                     let pts: Vec<Pos2> = ring.into_iter().map(|(x, y)| s(x, y)).collect();
                     painter.add(if n.closed || c > 0 { egui::Shape::closed_line(pts, stroke) } else { egui::Shape::line(pts, stroke) });
                 }
@@ -720,10 +730,11 @@ impl App {
                             let (originals, roots, mut nodes) = (self.sel.clone(), self.roots(), self.selected_nodes());
                             self.doc.regroup(&mut nodes);
                             self.sel.clear();
+                            let mut ids = std::collections::HashMap::new();
                             for mut n in nodes {
                                 // Alt-dragging a main component drags out an instance of it.
                                 if !self.doc.settle_copy(&mut n) {
-                                    self.doc.reassign_ids(&mut n);
+                                    self.doc.reassign_ids_into(&mut n, &mut ids);
                                 }
                                 let (cx, cy) = n.center();
                                 let parent = self.doc.frame_for(&n, cx, cy, &[]);
@@ -731,6 +742,8 @@ impl App {
                                 self.sel.push(n.id);
                                 self.doc.insert(n, parent);
                             }
+                            // A text copied together with its path is on the copy of the path.
+                            self.relink_paths(&ids);
                             // The originals go back to where the drag began: also into the frame
                             // and the place in the row that the drag may have taken them out of.
                             let mut back: Vec<(Node, Option<u64>, usize)> = Vec::new();
@@ -1288,6 +1301,13 @@ impl App {
                 n.wrap = dragged;
                 n.w = if dragged { width.round() } else { 4.0 };
                 n.h = n.font_size * 1.2;
+                // A click on the outline of a shape that has no fill: the text goes on it,
+                // starting where the click was.
+                let carrier = if dragged { None } else { self.outline_under((start.x, start.y), 5.0 / self.view.zoom) };
+                if let Some((path, along)) = carrier {
+                    (n.on_path, n.path_offset) = (Some(path), along);
+                    self.status = "Text on a path: type, then click outside. Ctrl+Alt+P detaches it; drag it to slide it along.".into();
+                }
                 self.doc.insert(n, parent);
                 self.start_text_edit(id, pre);
             }

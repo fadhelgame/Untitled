@@ -134,40 +134,56 @@ impl App {
     }
 
     /// Ctrl+Shift+O: the stroke of each selected shape becomes a filled path (see
-    /// `Doc::outline_strokes`), as one undo step. The outlines are selected afterwards.
-    pub(super) fn outline_stroke(&mut self) {
+    /// `Doc::outline_strokes`), and each selected text becomes paths of its glyphs (see
+    /// `text_outline`), as one undo step. What was made is selected afterwards.
+    pub(super) fn outline_stroke(&mut self, ctx: &egui::Context) {
         if self.sel.is_empty() {
-            self.status = "Select a shape with a stroke to outline it.".into();
+            self.status = "Select a shape with a stroke, or a text, to outline it.".into();
             return;
         }
         if self.sel_locked() || self.refuse_pinned() {
             return;
         }
         self.ext.path_edit = None;
+        self.finish_text_edit();
         let pre = self.doc.clone();
-        let ids = self.sel.clone();
-        let done = self.doc.outline_strokes(&ids);
-        let mut left = Vec::new();
-        if done.text > 0 {
-            left.push("the stroke of a text can't be outlined");
+        let (texts, shapes): (Vec<u64>, Vec<u64>) = self.sel.iter().partition(|id| self.doc.find(**id).is_some_and(|n| n.kind == Kind::Text));
+        let (mut glyphs, mut converted) = (Vec::new(), 0);
+        for id in texts {
+            let made = self.text_outline(ctx, id);
+            converted += !made.is_empty() as usize;
+            glyphs.extend(made);
         }
+        let done = self.doc.outline_strokes(&shapes);
+        let mut left = Vec::new();
         if done.skipped > 0 {
             left.push("the border of a frame only when it is inside the frame");
         }
-        if done.outlines.is_empty() {
+        if done.outlines.is_empty() && glyphs.is_empty() {
             self.doc = pre;
             self.status = match left.first() {
                 Some(why) => format!("Nothing outlined: {why}."),
-                None => "Nothing to outline: the selection has no stroke.".into(),
+                None => "Nothing to outline: the selection has no stroke and no text.".into(),
             };
             return;
         }
         self.push_undo(pre);
-        self.sel = done.ids;
-        self.tool = Tool::Select;
         let n = done.outlines.len();
+        self.sel = done.ids;
+        self.sel.extend(glyphs);
+        self.tool = Tool::Select;
         let note = left.first().map(|why| format!(" Left as it was: {why}.")).unwrap_or_default();
-        self.status = if n == 1 { format!("Outlined the stroke: it is a filled path now.{note}") } else { format!("Outlined {n} strokes: they are filled paths now.{note}") };
+        let strokes = match n {
+            0 => String::new(),
+            1 => "Outlined the stroke: it is a filled path now.".into(),
+            _ => format!("Outlined {n} strokes: they are filled paths now."),
+        };
+        let texts = match converted {
+            0 => String::new(),
+            1 => "The text is vector paths now (no longer editable as text).".into(),
+            _ => format!("{converted} texts are vector paths now (no longer editable as text)."),
+        };
+        self.status = [strokes, texts].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ") + &note;
     }
 }
 
@@ -273,7 +289,7 @@ impl App {
     /// `=outline`, `=outline2`, `=view:x0,y0,x1,y1`: the view goes close to that part. `=big`: an SVG of 4000
     /// shapes is imported as well. `=remote`: the two remote commands are run too. `=keys`: the
     /// open path of the first row is selected and Ctrl+Shift+O is pressed. Timings go to stderr.
-    pub(super) fn bench_svg(&mut self, mode: &str, inject: &mut Vec<(u32, egui::Event)>) {
+    pub(super) fn bench_svg(&mut self, ctx: &egui::Context, mode: &str, inject: &mut Vec<(u32, egui::Event)>) {
         use crate::outline::{set_contours, Contour};
         let (x, y) = (-3000.0, 14000.0);
         let stage_id = self.doc.alloc_id();
@@ -380,7 +396,7 @@ impl App {
         let undo = self.undo.len();
         self.sel.clone_from(&rows[1]);
         let start = std::time::Instant::now();
-        self.outline_stroke();
+        self.outline_stroke(ctx);
         let made: Vec<(Kind, usize, usize)> = self.sel.iter().filter_map(|id| self.doc.find(*id)).filter(|n| n.name.ends_with("outline")).map(|n| (n.kind, n.points.len(), n.holes.len())).collect();
         eprintln!("OUTLINE: {} shapes in {:.2} ms, undo steps +{}; status: {}", rows[1].len(), start.elapsed().as_secs_f32() * 1000.0, self.undo.len() - undo, self.status);
         eprintln!("OUTLINE (kind, points, further contours) per outline: {made:?}");

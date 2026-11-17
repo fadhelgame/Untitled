@@ -3,7 +3,7 @@
 
 use crate::layout::{AutoLayout, Constraint, Sizing};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -287,6 +287,17 @@ pub struct Node {
     /// fit run out of the box.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fixed_h: bool,
+    /// Text on a path: the id of the node (a path, line, ellipse or rectangle of the same page)
+    /// this text runs along, as one line with its baseline on that shape. See `textpath.rs`.
+    /// The box of the text is then the box around its glyphs, kept up to date by the canvas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_path: Option<u64>,
+    /// How far along the path the text is moved from where its alignment puts it (world units).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub path_offset: f32,
+    /// The text stands on the other side of the path and runs the other way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub path_side: bool,
     #[serde(default)]
     pub points: Vec<PathPoint>,
     #[serde(default)]
@@ -720,6 +731,9 @@ impl Node {
             list: 0,
             valign: 0,
             fixed_h: false,
+            on_path: None,
+            path_offset: 0.0,
+            path_side: false,
             points: Vec::new(),
             closed: false,
             holes: Vec::new(),
@@ -917,7 +931,26 @@ impl Node {
         out
     }
 
+    /// All contours as world polylines that stay within `tol` of the curves: every curve gets
+    /// as many pieces as its own size asks for (at most `max`), so a path of many small curves,
+    /// such as outlined text, does not get the point count of one large curve for each of them.
+    pub fn contours_within(&self, tol: f32, max: usize) -> Vec<Vec<(f32, f32)>> {
+        let steps = |p: [(f32, f32); 4]| {
+            let dev = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| ((a.0 - 2.0 * b.0 + c.0) * self.w).hypot((a.1 - 2.0 * b.1 + c.1) * self.h);
+            ((0.75 * dev(p[0], p[1], p[2]).max(dev(p[1], p[2], p[3])) / tol.max(1e-6)).sqrt().ceil() as usize).clamp(2, max.max(2))
+        };
+        let mut out = vec![self.flatten_by(&self.points, self.closed, &steps)];
+        out.extend(self.holes.iter().map(|h| self.flatten_by(h, true, &steps)));
+        out
+    }
+
     fn flatten(&self, points: &[PathPoint], closed: bool, segs: usize) -> Vec<(f32, f32)> {
+        self.flatten_by(points, closed, &|_| segs.max(2))
+    }
+
+    /// `curved`: into how many pieces a curve is cut, from its four control points (in the
+    /// space of the box, 0..1).
+    fn flatten_by(&self, points: &[PathPoint], closed: bool, curved: &dyn Fn([(f32, f32); 4]) -> usize) -> Vec<(f32, f32)> {
         let points = &self.rounded_points(points, closed)[..];
         let n = points.len();
         let mut out = Vec::new();
@@ -931,8 +964,8 @@ impl Node {
             let (a, b) = (points[i], points[(i + 1) % n]);
             let last = closed && i == n - 1;
             let straight = a.hout == [0.0, 0.0] && b.hin == [0.0, 0.0];
-            let steps = if straight { 1 } else { segs.max(2) };
             let (c1, c2) = ((a.x + a.hout[0], a.y + a.hout[1]), (b.x + b.hin[0], b.y + b.hin[1]));
+            let steps = if straight { 1 } else { curved([(a.x, a.y), c1, c2, (b.x, b.y)]) };
             for s in 1..=steps {
                 if last && s == steps {
                     break;
@@ -1659,9 +1692,11 @@ impl Doc {
         let (src, guides) = if i == self.page { (&self.nodes, &self.guides) } else { (&self.pages[i].nodes, &self.pages[i].guides) };
         let (mut nodes, guides): (Vec<Node>, Vec<RulerGuide>) = (src.iter().map(|n| (**n).clone()).collect(), guides.clone());
         self.regroup(&mut nodes);
+        let mut map = HashMap::new();
         for n in &mut nodes {
-            self.reassign_ids(n);
+            self.reassign_ids_into(n, &mut map);
         }
+        nodes.iter_mut().for_each(|n| crate::textpath::relink(n, &map));
         let page = Page { id: self.alloc_id(), name: format!("{} copy", self.pages[i].name), nodes: nodes.into_iter().map(Arc::new).collect(), guides };
         self.pages.insert(i + 1, page);
         if self.page > i {
@@ -1972,10 +2007,22 @@ impl Doc {
     }
 
     /// Beri id baru untuk node (dan anak-anaknya), dipakai saat tempel/duplikat.
+    /// Give a copy (with everything in it) ids of its own. A text on a path inside it follows
+    /// the copy of its path when that is inside too, and stays on its path otherwise.
     pub fn reassign_ids(&mut self, node: &mut Node) {
+        let mut map = HashMap::new();
+        self.reassign_ids_into(node, &mut map);
+        crate::textpath::relink(node, &map);
+    }
+
+    /// The same for one of several copies that belong together: `map` collects old id to new
+    /// id, for `textpath::relink` once all of them have their ids.
+    pub fn reassign_ids_into(&mut self, node: &mut Node, map: &mut HashMap<u64, u64>) {
+        let old = node.id;
         node.id = self.alloc_id();
+        map.insert(old, node.id);
         for c in &mut node.children {
-            self.reassign_ids(c);
+            self.reassign_ids_into(c, map);
         }
     }
 

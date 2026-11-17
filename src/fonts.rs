@@ -51,6 +51,10 @@ struct Queue {
 }
 
 pub struct FontManager {
+    /// For texts on a path: the line each follows, by the id of the text. What turns a text
+    /// into outlines (export, shadows) has the fonts at hand but not the document, so whoever
+    /// starts that puts the lines here first (`Doc::guides`, or the canvas as it paints).
+    pub paths: HashMap<u64, Arc<crate::textpath::Guide>>,
     pub catalog: Vec<Family>,
     pub catalog_state: CatalogState,
     defs: FontDefinitions,
@@ -335,6 +339,7 @@ impl FontManager {
             });
         }
         let mut m = FontManager {
+            paths: HashMap::new(),
             catalog: Vec::new(),
             catalog_state: CatalogState::Loading,
             defs,
