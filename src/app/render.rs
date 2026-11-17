@@ -725,6 +725,7 @@ pub fn text_job(n: &Node, text: &str, fonts: &mut FontManager, f: f32, alpha: f3
     job
 }
 
+#[derive(Clone)]
 pub struct TextLayout {
     pub galley: Arc<egui::Galley>,
     /// Ruang di atas baris pertama untuk glyph yang menjulang keluar kotak baris.
@@ -756,8 +757,8 @@ const TEXT_REF: f32 = 128.0;
 /// layar menghasilkan lebar teks, jarak huruf, dan pemenggalan baris yang berubah-ubah saat zoom.
 /// Di sini susunan (baris + posisi glyph) selalu diambil dari layout acuan berukuran tetap lalu
 /// diskalakan; layout di ukuran layar hanya dipakai untuk bitmap glyph-nya.
-fn stable_galley(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManager, f: f32, alpha: f32, aligned: bool) -> Arc<egui::Galley> {
-    let job = text_job(n, text, fonts, f, alpha, aligned);
+#[allow(clippy::too_many_arguments)]
+fn stable_galley(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManager, job: egui::text::LayoutJob, f: f32, alpha: f32, aligned: bool) -> Arc<egui::Galley> {
     let f_ref = TEXT_REF / n.max_size().max(1e-3);
     let ref_job = text_job(n, text, fonts, f_ref, alpha, aligned);
     // Tanpa wrap: urutan glyph sama dengan acuan, pemenggalan baris mengikuti acuan.
@@ -822,6 +823,58 @@ fn stable_galley(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontMana
     Arc::new(g)
 }
 
+/// Finished text layouts, kept between frames (in `FontManager::layouts`).
+///
+/// Building one means laying the text out twice and rebuilding the mesh of every glyph; on a
+/// canvas that stands still that used to be repeated for every text layer on every frame. An
+/// entry is found again by the `LayoutJob` it was built from, which holds everything the result
+/// depends on: text, fonts, sizes, colours, spacing, wrap width.
+#[derive(Default)]
+pub struct TextCache {
+    map: HashMap<u64, (f32, TextLayout, u64)>,
+    /// A galley out of egui's own cache. egui drops that cache together with the font atlas, so
+    /// getting a different one back means the glyph positions in `map` point into an atlas that
+    /// is gone.
+    probe: Option<Arc<egui::Galley>>,
+    pass: u64,
+}
+
+impl TextCache {
+    /// Entries unused for this many frames are dropped.
+    const KEEP: u64 = 240;
+
+    fn key(job: &egui::text::LayoutJob, f: f32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (job, f.to_bits()).hash(&mut h);
+        h.finish()
+    }
+
+    /// Once per frame: empty the cache if the font atlas was rebuilt, drop what is no longer used.
+    fn begin(&mut self, ctx: &egui::Context) {
+        let pass = ctx.cumulative_pass_nr();
+        if pass == self.pass && self.probe.is_some() {
+            return;
+        }
+        self.pass = pass;
+        let probe = ctx.fonts(|f| f.layout_job(egui::text::LayoutJob::simple_singleline(" ".into(), FontId::proportional(10.0), Color32::BLACK)));
+        if !self.probe.as_ref().is_some_and(|old| Arc::ptr_eq(old, &probe)) {
+            self.map.clear();
+        }
+        self.probe = Some(probe);
+        self.map.retain(|_, e| e.2 + Self::KEEP >= pass);
+    }
+
+    fn get(&mut self, key: u64, job: &egui::text::LayoutJob, f: f32) -> Option<TextLayout> {
+        let (at, layout, used) = self.map.get_mut(&key)?;
+        if *at != f || *layout.galley.job != *job {
+            return None;
+        }
+        *used = self.pass;
+        Some(layout.clone())
+    }
+}
+
 /// Layout teks dengan baseline yang benar.
 ///
 /// egui menaruh tiap glyph di *atas* kotak barisnya dan meratakan kotak huruf beda ukuran
@@ -830,7 +883,21 @@ fn stable_galley(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontMana
 /// Di sini tiap baris ditata ulang: semua glyph berbagi satu baseline yang berada di tengah
 /// kotak baris, dan kotak baris (untuk seleksi/kursor) mengikuti tinggi huruf sebenarnya.
 pub fn layout_text(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManager, f: f32, alpha: f32, aligned: bool) -> TextLayout {
-    let galley = stable_galley(ctx, n, text, fonts, f, alpha, aligned);
+    let job = text_job(n, text, fonts, f, alpha, aligned);
+    fonts.layouts.begin(ctx);
+    let key = TextCache::key(&job, f);
+    if let Some(layout) = fonts.layouts.get(key, &job, f) {
+        return layout;
+    }
+    let layout = build_layout(ctx, n, text, fonts, job, f, alpha, aligned);
+    let pass = fonts.layouts.pass;
+    fonts.layouts.map.insert(key, (f, layout.clone(), pass));
+    layout
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_layout(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManager, job: egui::text::LayoutJob, f: f32, alpha: f32, aligned: bool) -> TextLayout {
+    let galley = stable_galley(ctx, n, text, fonts, job, f, alpha, aligned);
     let uniform = n.line_height <= 0.0 && galley.job.sections.windows(2).all(|w| w[0].format.font_id == w[1].format.font_id);
     let (width, height) = (galley.rect.width(), galley.rect.height());
     if uniform {

@@ -62,6 +62,8 @@ pub struct FontManager {
     frame: u64,
     /// Layout acuan teks canvas (lihat `reference_layout`), per hash LayoutJob-nya.
     reference: HashMap<u64, Arc<egui::Galley>>,
+    /// Finished canvas text layouts, reused from frame to frame.
+    pub layouts: crate::app::render::TextCache,
     /// Jumlah font yang bisa dipakai di frame ini (bagian dari kunci `reference`).
     usable: usize,
     /// Bagian atlas font yang terisi glyph acuan sejak atlas terakhir dikosongkan.
@@ -345,6 +347,7 @@ impl FontManager {
             dir,
             frame: 0,
             reference: HashMap::new(),
+            layouts: Default::default(),
             usable: 0,
             ref_weight: 0.0,
             ref_missed: false,
