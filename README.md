@@ -115,6 +115,8 @@ Every screenshot here is the real app.
       <h3>Frames without limits</h3>
       Put as many frames as you like on one infinite canvas: a whole app flow, a slide deck, or twelve months of a calendar. Zoom from the big picture down to a single pixel.
       <br><br>
+      <b>Frames inside frames</b>, as deep as you need: draw a frame in a frame, or drag one in, and it becomes a container that clips its content, such as a card, a header or a list row. Click selects the container, double-click goes one level in, <code>Ctrl</code>+click picks the deepest object.
+      <br><br>
       <b>Nearly 60 frame presets</b> for phones, tablets, desktops, slides, watches, paper sizes (A3 to A6, Letter, business card) and social posts (Instagram, TikTok, X, Facebook).
     </td>
     <td width="50%" valign="top">
@@ -164,7 +166,7 @@ Every screenshot here is the real app.
     </td>
     <td width="33%" valign="top">
       <h4>🗃️ Layers</h4>
-      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree per frame, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
+      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree that follows nested frames to any depth, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
     </td>
     <td width="33%" valign="top">
       <h4>💾 Files</h4>
@@ -206,6 +208,8 @@ Every screenshot here is the real app.
 | `Shift+M` | Shape builder | `Ctrl+Alt+G` | Clipping mask |
 | `T` | Text | `Alt+A` `D` `W` `S` | Align left / right / top / bottom |
 | `I` | Eyedropper | `Alt+H` `V` | Align centers |
+| | | `Enter` / `Shift+Enter` | Select what is inside a frame / the frame around the selection |
+| | | `Ctrl` + click | Select the deepest object under the pointer |
 | | | `Shift+X` | Swap fill and stroke |
 | | | `Ctrl+V` | Paste at the pointer |
 | | | `Ctrl+Shift+V` | Paste in place (same position, in the frame under the pointer) |

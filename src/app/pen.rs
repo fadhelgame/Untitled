@@ -460,7 +460,7 @@ impl App {
         n.name = format!("Vector {id}");
         n.closed = closed;
         set_world_points(&mut n, &pts);
-        let parent = self.doc.frame_at(pts[0].x, pts[0].y, 0);
+        let parent = self.doc.frame_at(pts[0].x, pts[0].y, &[]);
         n.stroke = Some(if parent.is_some() { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
         n.stroke_w = 2.0;
         self.doc.insert(n, parent);

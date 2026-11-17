@@ -808,6 +808,50 @@ mod tests {
     }
 
     #[test]
+    fn nested_frames_clip_their_content() {
+        // White frame 1 (200×100) › blue frame 2 (at 50,20, 100×60) › red rect 3 (at 100,40,
+        // 200×20) that sticks out of both.
+        let mut doc = Doc::default();
+        let mut add = |kind: Kind, parent: Option<u64>, (x, y, w, h): (f32, f32, f32, f32), fill: [u8; 4]| {
+            let id = doc.alloc_id();
+            let mut n = Node::new(id, kind, x, y);
+            (n.w, n.h, n.fill) = (w, h, Some(fill));
+            doc.insert(n, parent);
+            id
+        };
+        add(Kind::Frame, None, (0.0, 0.0, 200.0, 100.0), [255, 255, 255, 255]);
+        add(Kind::Frame, Some(1), (50.0, 20.0, 100.0, 60.0), [0, 0, 255, 255]);
+        add(Kind::Rect, Some(2), (100.0, 40.0, 200.0, 20.0), [255, 0, 0, 255]);
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        let rgb = |svg: &str, w: f32, h: f32, x: u32, y: u32| {
+            let px = rasterize(svg, w, h, 1.0).unwrap().pixel(x, y).unwrap();
+            (px.red(), px.green(), px.blue(), px.alpha())
+        };
+        let (svg, w, h) = to_svg(&doc, Some(1), &mut fonts, &ctx).unwrap();
+        assert_eq!((w, h), (200.0, 100.0));
+        assert_eq!(svg.matches("<clipPath").count(), 2);
+        // Inside the nested frame: its fill, and the rect on top of it.
+        assert_eq!(rgb(&svg, w, h, 60, 30), (0, 0, 255, 255));
+        assert_eq!(rgb(&svg, w, h, 120, 50), (255, 0, 0, 255));
+        // Past the nested frame's edge the rect is cut off: the outer frame shows.
+        assert_eq!(rgb(&svg, w, h, 170, 50), (255, 255, 255, 255));
+        // The nested frame is an export target of its own, at its own size.
+        let (svg, w, h) = to_svg(&doc, Some(2), &mut fonts, &ctx).unwrap();
+        assert_eq!((w, h), (100.0, 60.0));
+        assert_eq!(rgb(&svg, w, h, 10, 10), (0, 0, 255, 255));
+        assert_eq!(rgb(&svg, w, h, 90, 30), (255, 0, 0, 255));
+        // The whole document: nothing of the rect outside the frames.
+        let (svg, w, h) = to_svg(&doc, None, &mut fonts, &ctx).unwrap();
+        assert_eq!((w, h), (200.0, 100.0));
+        assert_eq!(rgb(&svg, w, h, 170, 50), (255, 255, 255, 255));
+        // A hidden nested frame hides what is in it.
+        doc.find_mut(2).unwrap().visible = false;
+        let (svg, w, h) = to_svg(&doc, Some(1), &mut fonts, &ctx).unwrap();
+        assert_eq!(rgb(&svg, w, h, 120, 50), (255, 255, 255, 255));
+    }
+
+    #[test]
     fn export_png_with_text_outlines() {
         let doc = sample();
         let ctx = context();

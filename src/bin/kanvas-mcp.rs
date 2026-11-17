@@ -14,7 +14,7 @@ const TOOLS: &str = include_str!("../mcp_tools.json");
 const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const INSTRUCTIONS: &str = "Kanvas is a native design editor (infinite canvas, frames, shapes, text with Google Fonts, vector paths, images). \
 These tools edit the document that is open in the user's Kanvas window, live — the app is started automatically if it isn't running. \
-Typical flow: get_document to see what exists; create_nodes to add a frame with its children in one call (children use coordinates relative to the frame); \
+Typical flow: get_document to see what exists; create_nodes to add a frame with its children in one call (children use coordinates relative to their parent frame, and frames can be nested); \
 screenshot the frame to check the result and fix spacing/overflow with update_nodes; repeat. Text sizes are returned by create/update, use them for alignment. \
 Every change is a normal undo step in the app, and the user can edit by hand at any time, so re-read the document before relying on old ids or positions.";
 

@@ -375,7 +375,7 @@ impl App {
                 if self.ext.builder.is_none() {
                     self.builder_start(None);
                 }
-                let under = self.doc.hit(wp.x, wp.y, 0.0).filter(|id| self.doc.find(*id).is_some_and(eligible));
+                let under = self.doc.hit_deep(wp.x, wp.y, 0.0).filter(|id| self.doc.find(*id).is_some_and(eligible));
                 if let Some(id) = under {
                     if !self.ext.builder.as_ref().is_some_and(|s| s.owned.contains_key(&id)) {
                         self.builder_start(Some(id));

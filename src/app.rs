@@ -603,13 +603,13 @@ impl App {
 
     // ------------------------------------------------------------ selection helpers
 
-    /// Id terpilih tanpa anak yang frame induknya juga terpilih (supaya tidak digeser dua kali).
+    /// Id terpilih tanpa isi frame yang juga terpilih, di kedalaman mana pun (supaya tidak digeser dua kali).
     fn roots(&self) -> Vec<u64> {
-        self.sel
-            .iter()
-            .copied()
-            .filter(|id| self.doc.parent_of(*id).map_or(true, |p| !self.sel.contains(&p)))
-            .collect()
+        // Satu objek (kasus paling sering, tiap frame saat menggeser): tidak perlu mencari induknya.
+        if self.sel.len() < 2 {
+            return self.sel.clone();
+        }
+        self.doc.roots_of(&self.sel)
     }
 
     /// Move dan Scale sama-sama bisa memilih dan menggeser objek.
@@ -685,9 +685,9 @@ impl App {
         self.push_undo(pre);
     }
 
-    /// Layer ini terkunci, sendiri atau lewat frame induknya.
+    /// Layer ini terkunci, sendiri atau lewat salah satu frame yang memuatnya.
     fn locked(&self, id: u64) -> bool {
-        self.doc.find(id).is_some_and(|n| n.locked) || self.doc.parent_of(id).and_then(|p| self.doc.find(p)).is_some_and(|p| p.locked)
+        self.doc.lineage(id).iter().any(|n| n.locked)
     }
 
     /// Ada layer terkunci di dalam seleksi (seleksinya dibuat dari panel layer).
@@ -705,8 +705,20 @@ impl App {
         self.status = if lock { "Locked. Unlock from the Layers panel or with Ctrl+Shift+L.".into() } else { "Unlocked.".into() };
     }
 
+    /// What a click at this spot selects. Inside a top-level frame that is its direct child under
+    /// the pointer (a nested frame as a whole); when the selection already sits inside a nested
+    /// frame, the children of that frame (then of the nested frames around it) come first.
     fn hit(&self, p: Pos2, wp: Pos2, tol: f32) -> Option<u64> {
         let label = || self.labels.iter().rev().find(|(id, r)| r.contains(p) && !self.locked(*id)).map(|(id, _)| *id);
+        if let Some(first) = self.sel.first() {
+            let around = self.doc.ancestors(*first);
+            // The last one is the top-level frame, which the usual rule below covers.
+            for scope in around.iter().take(around.len().saturating_sub(1)) {
+                if let Some(id) = self.doc.hit_within(*scope, wp.x, wp.y, tol) {
+                    return Some(id);
+                }
+            }
+        }
         match self.doc.hit(wp.x, wp.y, tol) {
             // Seperti Figma: badan frame yang berisi objek tidak bisa dipegang, hanya labelnya.
             Some(id) if self.body_locked(id) => label(),
@@ -715,10 +727,11 @@ impl App {
         }
     }
 
-    /// Frame yang sudah berisi objek: badannya tidak memilih/menggeser frame (pakai label namanya).
-    /// Frame yang terlalu kecil di layar untuk punya label tetap bisa dipegang dari badannya.
+    /// Frame level atas yang sudah berisi objek: badannya tidak memilih/menggeser frame (pakai label
+    /// namanya). Frame yang terlalu kecil di layar untuk punya label tetap bisa dipegang dari badannya,
+    /// begitu juga frame di dalam frame (tidak punya label).
     fn body_locked(&self, id: u64) -> bool {
-        self.doc.find(id).is_some_and(|n| {
+        self.doc.nodes.iter().find(|n| n.id == id).is_some_and(|n| {
             n.kind == Kind::Frame && n.children.iter().any(|c| c.visible) && n.w * self.view.zoom > 36.0
         })
     }
@@ -944,7 +957,7 @@ impl App {
     fn paste_frame(&self, at: Option<Pos2>) -> Option<u64> {
         let hovered = at.and_then(|p| {
             let w = self.view.to_world(self.canvas_rect.min, p);
-            self.doc.frame_at(w.x, w.y, 0)
+            self.doc.frame_at(w.x, w.y, &[])
         });
         hovered.or_else(|| {
             let id = *self.sel.first()?;
@@ -993,7 +1006,7 @@ impl App {
                 let mut n = Node::new(0, Kind::Text, c.x.round(), c.y.round());
                 n.text = text.chars().take(5000).collect();
                 n.name = "Text".into();
-                n.fill = Some(if self.doc.frame_at(c.x, c.y, 0).is_some() { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
+                n.fill = Some(if self.doc.frame_at(c.x, c.y, &[]).is_some() { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
                 n.w = 100.0;
                 n.h = 20.0;
                 self.add_nodes(vec![n], Vec2::ZERO, None);
@@ -1002,7 +1015,8 @@ impl App {
     }
 
     /// Sisipkan salinan node, digeser `offset`. `parent` memaksa frame induknya; tanpa itu
-    /// induknya frame yang memuat titik tengah node.
+    /// induknya frame terdalam yang memuat titik tengah node. Frame hanya masuk ke frame yang
+    /// lebih besar darinya (lihat `Doc::frame_for`).
     fn add_nodes(&mut self, mut nodes: Vec<Node>, offset: Vec2, parent: Option<u64>) {
         if nodes.is_empty() {
             return;
@@ -1014,7 +1028,8 @@ impl App {
             self.doc.reassign_ids(&mut n);
             n.translate(offset.x, offset.y);
             let (cx, cy) = n.center();
-            let parent = if n.kind == Kind::Frame { None } else { parent.or_else(|| self.doc.frame_at(cx, cy, 0)) };
+            let roomy = |p: &u64| n.kind != Kind::Frame || self.doc.find(*p).is_some_and(|f| n.w < f.w && n.h < f.h);
+            let parent = parent.filter(roomy).or_else(|| self.doc.frame_for(&n, cx, cy, &[]));
             self.sel.push(n.id);
             self.doc.insert(n, parent);
         }
@@ -1103,19 +1118,14 @@ impl App {
     /// when their text is first drawn, and each arrival rebuilds the font atlas: zooming into a
     /// document for the first time stuttered once per font.
     fn warm_fonts(&mut self) {
-        fn walk(n: &Node, fonts: &mut FontManager) {
+        let fonts = &mut self.fonts;
+        self.doc.walk_all(|n| {
             if n.kind == Kind::Text {
                 for (_, _, st) in n.segments(n.text.chars().count()) {
                     fonts.resolve(&st.font, st.weight, st.italic);
                 }
             }
-            for c in &n.children {
-                walk(c, fonts);
-            }
-        }
-        for n in self.doc.nodes.iter().chain(self.doc.pages.iter().flat_map(|p| p.nodes.iter())) {
-            walk(n, &mut self.fonts);
-        }
+        });
     }
 
     fn new_doc(&mut self) {
@@ -1402,6 +1412,15 @@ impl App {
                 Key::L if c && s => self.toggle_lock(),
                 // Ctrl+\ tampil/sembunyikan panel
                 Key::Backslash if c => self.show_ui = !self.show_ui,
+                // Shift+Enter: pilih frame yang memuat seleksi (satu tingkat ke luar)
+                Key::Enter if s && !c && !a && !self.sel.is_empty() => {
+                    let mut parents: Vec<u64> = self.sel.iter().filter_map(|id| self.doc.parent_of(*id)).collect();
+                    parents.sort_unstable();
+                    parents.dedup();
+                    if !parents.is_empty() {
+                        self.sel = parents;
+                    }
+                }
                 // Enter: edit teks terpilih
                 Key::Enter if plain && self.sel.len() == 1 => {
                     let id = self.sel[0];
@@ -1412,6 +1431,13 @@ impl App {
                         self.ext.edit_pending = Some(render::EditPending::All);
                     } else if self.doc.find(id).is_some_and(|n| n.kind == Kind::Path) {
                         self.start_path_edit(id);
+                    } else if let Some(f) = self.doc.find(id).filter(|n| n.kind == Kind::Frame) {
+                        // Frame: Enter memilih isinya (satu tingkat ke dalam), seperti Figma.
+                        let inside: Vec<u64> = f.children.iter().filter(|c| c.visible && !c.locked).map(|c| c.id).collect();
+                        if !inside.is_empty() && !self.locked(id) {
+                            self.expanded.insert(id);
+                            self.sel = inside;
+                        }
                     } else {
                         // Gambar: Enter masuk mode crop.
                         self.start_crop(id);
@@ -1607,44 +1633,40 @@ impl App {
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
-        // Daftar datar (frame + anak yang dibuka), digambar virtual: hanya baris yang terlihat.
-        // Anggota group yang berurutan (seinduk) tampil di bawah satu baris group yang bisa dibuka/tutup.
+        // Daftar datar (frame + isi frame yang dibuka, di kedalaman mana pun), digambar virtual: hanya
+        // baris yang terlihat. Anggota group yang berurutan (seinduk) tampil di bawah satu baris
+        // group yang bisa dibuka/tutup.
         #[derive(Clone, Copy)]
-        enum Row {
-            /// (indeks level atas, indeks anak, kedalaman indentasi)
-            Node(usize, Option<usize>, u8),
+        enum Row<'a> {
+            /// (node, frame induk, kedalaman indentasi)
+            Node(&'a Node, Option<u64>, u8),
             /// (id group, kedalaman indentasi, anggota paling depan, frame induk)
             Group(u64, u8, u64, Option<u64>),
         }
-        // Menyisipkan baris group di awal tiap rangkaian; hasilnya: apakah anggotanya ditampilkan.
-        fn header(rows: &mut Vec<Row>, last: &mut u64, n: &Node, parent: Option<u64>, depth: u8, expanded: &HashSet<u64>) -> bool {
-            let g = n.group;
-            if g != *last {
-                *last = g;
-                if g != 0 {
-                    rows.push(Row::Group(g, depth, n.id, parent));
-                }
-            }
-            g == 0 || expanded.contains(&g)
-        }
-        let mut rows: Vec<Row> = Vec::with_capacity(self.doc.nodes.len());
-        let mut last = 0u64;
-        for (ti, n) in self.doc.nodes.iter().enumerate().rev() {
-            if !header(&mut rows, &mut last, n, None, 0, &self.expanded) {
-                continue;
-            }
-            let depth = (n.group != 0) as u8;
-            rows.push(Row::Node(ti, None, depth));
-            if n.kind == Kind::Frame && self.expanded.contains(&n.id) {
-                let mut last = 0u64;
-                for ci in (0..n.children.len()).rev() {
-                    let g = n.children[ci].group;
-                    if header(&mut rows, &mut last, &n.children[ci], Some(n.id), depth + 1, &self.expanded) {
-                        rows.push(Row::Node(ti, Some(ci), depth + 1 + (g != 0) as u8));
+        // Satu daftar saudara dari depan ke belakang; frame yang dibuka diikuti isinya. Baris group
+        // disisipkan di awal tiap rangkaian, dan anggotanya hanya tampil kalau group-nya dibuka.
+        fn list<'a, T: AsRef<Node>>(rows: &mut Vec<Row<'a>>, nodes: &'a [T], parent: Option<u64>, depth: u8, expanded: &HashSet<u64>) {
+            let mut last = 0u64;
+            for n in nodes.iter().rev().map(|n| n.as_ref()) {
+                let g = n.group;
+                if g != last {
+                    last = g;
+                    if g != 0 {
+                        rows.push(Row::Group(g, depth, n.id, parent));
                     }
                 }
+                if g != 0 && !expanded.contains(&g) {
+                    continue;
+                }
+                let depth = depth.saturating_add((g != 0) as u8);
+                rows.push(Row::Node(n, parent, depth));
+                if n.kind == Kind::Frame && expanded.contains(&n.id) {
+                    list(rows, &n.children, Some(n.id), depth.saturating_add(1), expanded);
+                }
             }
         }
+        let mut rows: Vec<Row> = Vec::with_capacity(self.doc.nodes.len());
+        list(&mut rows, &self.doc.nodes, None, 0, &self.expanded);
         let row_h = 30.0;
         let mut click: Option<(u64, bool, bool)> = None; // (id, shift, double)
         let mut click_group: Option<(u64, bool)> = None; // (id group, shift)
@@ -1723,7 +1745,9 @@ impl App {
             open: Option<u64>,
         }
         let drag_pos = if self.layer_drag.is_some() { ui.input(|i| i.pointer.latest_pos()) } else { None };
-        let drag_frame = self.layer_drag.as_ref().is_some_and(|ids| ids.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.kind == Kind::Frame)));
+        // Yang ditarik tidak bisa masuk ke dirinya sendiri atau ke dalam isinya.
+        let dragged: &[u64] = self.layer_drag.as_deref().unwrap_or_default();
+        let enters = |parent: Option<u64>| parent.map_or(true, |p| !dragged.iter().any(|d| *d == p || self.doc.is_descendant(p, *d)));
         let mut drag_start: Option<(Vec<u64>, bool)> = None; // (id yang ditarik, sudah terpilih)
         let mut target: Option<Drop> = None;
         let mut mark: Option<(Rect, bool)> = None; // (garis sisip / baris tujuan, masuk ke dalam?)
@@ -1733,8 +1757,8 @@ impl App {
             let mut last_bottom = ui.cursor().top();
             for i in range {
                 last_bottom = ui.cursor().top() + row_h;
-                let (ti, ci, depth) = match rows[i] {
-                    Row::Node(ti, ci, depth) => (ti, ci, depth),
+                let (n, parent, depth) = match rows[i] {
+                    Row::Node(n, parent, depth) => (n, parent, depth),
                     Row::Group(g, depth, front, parent) => {
                         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                         let members = self.doc.group_members(&[g]);
@@ -1757,7 +1781,7 @@ impl App {
                         if resp.drag_started() {
                             drag_start = Some((members.clone(), selected));
                         }
-                        if let Some(p) = drag_pos.filter(|p| rect.contains(*p) && !(drag_frame && parent.is_some())) {
+                        if let Some(p) = drag_pos.filter(|p| rect.contains(*p) && enters(parent)) {
                             // Tepi atas baris group: di atas group (di luarnya). Selebihnya: masuk ke group.
                             let above = p.y < rect.top() + row_h * 0.3;
                             target = Some(Drop { parent, anchor: Some((front, true)), group: if above { 0 } else { g }, open: (!above).then_some(g) });
@@ -1805,11 +1829,6 @@ impl App {
                         continue;
                     }
                 };
-                let top = &self.doc.nodes[ti];
-                let n: &Node = match ci {
-                    Some(ci) => &top.children[ci],
-                    None => top,
-                };
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 let selected = self.sel.contains(&n.id);
                 let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
@@ -1821,22 +1840,26 @@ impl App {
                 }
                 let indent = 10.0 + 26.0 * depth as f32;
                 let mut x = rect.left() + indent;
-                let is_frame = n.kind == Kind::Frame && ci.is_none();
+                let is_frame = n.kind == Kind::Frame;
                 if resp.drag_started() {
                     drag_start = Some((if selected { self.sel.clone() } else { vec![n.id] }, selected));
                 }
-                let parent = ci.map(|_| top.id);
                 if let Some(p) = drag_pos.filter(|p| rect.contains(*p)) {
                     let t = (p.y - rect.top()) / row_h;
-                    if is_frame && !drag_frame && t > 0.25 && (t < 0.75 || self.expanded.contains(&n.id)) {
+                    if is_frame && enters(Some(n.id)) && t > 0.25 && (t < 0.75 || self.expanded.contains(&n.id)) {
                         // Bagian tengah baris frame: masuk ke frame, paling depan.
                         target = Some(Drop { parent: Some(n.id), anchor: None, group: 0, open: Some(n.id) });
                         mark = Some((rect, true));
-                    } else if !(drag_frame && parent.is_some()) {
+                    } else if enters(parent) {
                         let above = t < 0.5;
                         // Di bawah anggota terakhir sebuah group: pointer di kiri indentasinya = keluar dari group.
-                        let more = matches!(rows.get(i + 1), Some(&Row::Node(t2, c2, _)) if c2.is_some() == ci.is_some() && (ci.is_none() || t2 == ti)
-                            && c2.map_or(&*self.doc.nodes[t2], |c| &self.doc.nodes[t2].children[c]).group == n.group);
+                        // (Anggota berikutnya bisa terpisah beberapa baris kalau anggota ini frame yang dibuka.)
+                        let more = n.group != 0
+                            && rows[i + 1..].iter().find_map(|r| match r {
+                                Row::Node(m, p2, _) if *p2 == parent => Some(m.group == n.group),
+                                Row::Group(_, _, _, p2) if *p2 == parent => Some(false),
+                                _ => None,
+                            }) == Some(true);
                         let out = n.group != 0 && !above && !more && p.x < rect.left() + indent;
                         target = Some(Drop { parent, anchor: Some((n.id, above)), group: if out { 0 } else { n.group }, open: None });
                         let (lx, ly) = (rect.left() + indent - if out { 26.0 } else { 0.0 }, if above { rect.top() } else { rect.bottom() });
@@ -2142,6 +2165,28 @@ impl App {
                         self.sel = id.into_iter().collect();
                         self.zoom_to((b0.0 - 60.0, b0.1 - 60.0, b0.2 + 60.0, b0.3 + 60.0), 8.0);
                     }
+                }
+                // `KANVAS_BENCH_NESTED=1`: frames inside frames (see `bench_nested`), then with the mouse:
+                // a click in the card (selects the card as a whole), a double-click on the badge and
+                // one on its stripe (one level in each time), the loose rect dragged into the card,
+                // and a frame drawn inside the outer frame. What got selected is printed to stderr.
+                if std::env::var("KANVAS_BENCH_NESTED").is_ok() {
+                    b.ids = self.bench_nested();
+                    let (o, base) = (self.canvas_rect.min, self.doc.find(b.ids[0]).map_or((0.0, 0.0), |n| (n.x, n.y)));
+                    let at = |x: f32, y: f32| self.view.to_screen(o, base.0 + x, base.1 + y);
+                    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                    let mv = egui::Event::PointerMoved;
+                    let click = |f: u32, p: Pos2| [(f, mv(p)), (f + 2, button(p, true)), (f + 3, button(p, false))];
+                    let (in_card, on_badge, on_stripe) = (at(110.0, 410.0), at(330.0, 290.0), at(200.0, 338.0));
+                    b.inject.extend(click(200, in_card));
+                    b.inject.extend(click(340, on_badge).into_iter().chain(click(344, on_badge)));
+                    b.inject.extend(click(480, on_stripe).into_iter().chain(click(484, on_stripe)));
+                    let (from, to) = (at(700.0, 200.0), at(180.0, 425.0));
+                    b.inject.extend([(620, mv(from)), (622, button(from, true))]);
+                    b.inject.extend((1..=6u32).map(|s| (622 + s, mv(from + (to - from) * (s as f32 / 6.0)))));
+                    b.inject.push((630, button(to, false)));
+                    let (from, to) = (at(560.0, 330.0), at(740.0, 440.0));
+                    b.inject.extend([(702, mv(from)), (704, button(from, true)), (706, mv(from + (to - from) * 0.5)), (708, mv(to)), (710, button(to, false))]);
                 }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
@@ -2476,7 +2521,25 @@ impl App {
                 if b.frame == 240 && std::env::var("KANVAS_BENCH_OVERLAY").is_ok() {
                     self.edit_selected(|n| n.fill = Some([0, 102, 227, 255]));
                 }
-                let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && b.frame > 260 && (self.fonts.preview_count() >= 8 || b.frame > 700);
+                let nested = b.ids.len() == 5 && std::env::var_os("KANVAS_BENCH_NESTED").is_some();
+                if nested {
+                    let names = |app: &Self| app.sel.iter().filter_map(|id| app.doc.find(*id)).map(|n| n.name.clone()).collect::<Vec<_>>();
+                    let parent = |app: &Self, id: u64| app.doc.parent_of(id).and_then(|p| app.doc.find(p)).map(|n| n.name.clone());
+                    match b.frame {
+                        210 => eprintln!("NESTED click in the card: {:?} (want [Card])", names(self)),
+                        355 => eprintln!("NESTED double-click on the badge: {:?} (want [Badge])", names(self)),
+                        495 => eprintln!("NESTED double-click on the stripe: {:?} (want [Stripe])", names(self)),
+                        640 => eprintln!("NESTED loose rect dragged over the card: {:?} in {:?} (want [Loose] in Card)", names(self), parent(self, b.ids[4])),
+                        700 => self.tool = Tool::Frame,
+                        720 => {
+                            let made = self.sel.first().and_then(|id| self.doc.find(*id)).map(|n| (n.kind, n.w, n.h));
+                            eprintln!("NESTED frame drawn in the outer frame: {made:?} in {:?} (want a Frame in Nested demo)", self.sel.first().and_then(|id| parent(self, *id)));
+                        }
+                        _ => {}
+                    }
+                }
+                let settled = b.frame > if nested { 760 } else { 260 };
+                let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && settled && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));

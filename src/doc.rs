@@ -593,6 +593,26 @@ fn gather<T>(v: &mut Vec<T>, is: impl Fn(&T) -> bool) {
     *v = rest;
 }
 
+/// The front-most visible, unlocked node of a sibling list under a point. A frame under the
+/// point gives way to what it holds, up to `depth` levels further down (0 = the frame itself);
+/// a hidden or locked frame hides or locks everything in it.
+fn hit_list<T: AsRef<Node>>(list: &[T], x: f32, y: f32, tol: f32, depth: usize) -> Option<&Node> {
+    for n in list.iter().rev().map(|n| n.as_ref()) {
+        if !n.visible || n.locked {
+            continue;
+        }
+        if n.kind == Kind::Frame {
+            if n.contains(x, y, 0.0) {
+                let inner = if depth > 0 { hit_list(&n.children, x, y, tol, depth - 1) } else { None };
+                return Some(inner.unwrap_or(n));
+            }
+        } else if n.contains(x, y, tol) {
+            return Some(n);
+        }
+    }
+    None
+}
+
 /// Putar titik (x, y) terhadap (cx, cy) sebesar `deg` derajat (searah jarum jam di layar).
 pub fn rotate(x: f32, y: f32, cx: f32, cy: f32, deg: f32) -> (f32, f32) {
     let (s, c) = deg.to_radians().sin_cos();
@@ -876,6 +896,84 @@ impl Node {
         1 + self.children.iter().map(Node::count).sum::<usize>()
     }
 
+    // ---------------------------------------------------------------- tree
+
+    /// Visit this node and everything below it, parents before children, in stacking order.
+    pub fn walk<'a>(&'a self, f: &mut impl FnMut(&'a Node)) {
+        f(self);
+        for c in &self.children {
+            c.walk(f);
+        }
+    }
+
+    /// Like `walk`, with each node open for changes.
+    pub fn walk_mut(&mut self, f: &mut impl FnMut(&mut Node)) {
+        f(self);
+        for c in &mut self.children {
+            c.walk_mut(f);
+        }
+    }
+
+    /// Does this node, or anything below it, satisfy `pred`?
+    pub fn any(&self, pred: &impl Fn(&Node) -> bool) -> bool {
+        pred(self) || self.children.iter().any(|c| c.any(pred))
+    }
+
+    /// This node or one below it, by id.
+    pub fn find(&self, id: u64) -> Option<&Node> {
+        if self.id == id {
+            return Some(self);
+        }
+        self.children.iter().find_map(|c| c.find(id))
+    }
+
+    pub fn find_mut(&mut self, id: u64) -> Option<&mut Node> {
+        if self.id == id {
+            return Some(self);
+        }
+        self.children.iter_mut().find_map(|c| c.find_mut(id))
+    }
+
+    /// Is `id` somewhere below this node (not the node itself)?
+    pub fn has_descendant(&self, id: u64) -> bool {
+        self.children.iter().any(|c| c.id == id || c.has_descendant(id))
+    }
+
+    /// Is one of `ids` somewhere below this node?
+    pub fn has_any_descendant(&self, ids: &[u64]) -> bool {
+        self.children.iter().any(|c| ids.contains(&c.id) || c.has_any_descendant(ids))
+    }
+
+    /// Child indices leading from this node down to `id`, appended to `path`.
+    fn path_to(&self, id: u64, path: &mut Vec<usize>) -> bool {
+        if self.id == id {
+            return true;
+        }
+        for (i, c) in self.children.iter().enumerate() {
+            path.push(i);
+            if c.path_to(id, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+
+    /// Does some child list at or below this node satisfy `pred`?
+    fn any_list(&self, pred: &impl Fn(&[Node]) -> bool) -> bool {
+        !self.children.is_empty() && (pred(&self.children) || self.children.iter().any(|c| c.any_list(pred)))
+    }
+
+    /// Run `f` on every non-empty child list at or below this node.
+    fn each_list_mut(&mut self, f: &mut impl FnMut(&mut Vec<Node>)) {
+        if !self.children.is_empty() {
+            f(&mut self.children);
+            for c in &mut self.children {
+                c.each_list_mut(f);
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- gaya teks
 
     pub fn base_style(&self) -> Style {
@@ -1128,18 +1226,44 @@ impl Doc {
         id
     }
 
-    /// Ubah node yang memenuhi `uses` (level atas dan anak frame). Frame yang tidak tersentuh
-    /// tidak disalin, jadi snapshot undo tetap berbagi memori.
-    fn update_nodes(&mut self, uses: impl Fn(&Node) -> bool, mut apply: impl FnMut(&mut Node)) {
+    /// Ubah node yang memenuhi `uses` (di kedalaman mana pun, semua halaman). Node level atas
+    /// yang tidak tersentuh tidak disalin, jadi snapshot undo tetap berbagi memori.
+    pub fn update_nodes(&mut self, uses: impl Fn(&Node) -> bool, mut apply: impl FnMut(&mut Node)) {
         for top in self.nodes.iter_mut().chain(self.pages.iter_mut().flat_map(|p| p.nodes.iter_mut())) {
-            if uses(top) || top.children.iter().any(&uses) {
-                let top = Arc::make_mut(top);
-                if uses(top) {
-                    apply(top);
-                }
-                for c in top.children.iter_mut().filter(|c| uses(c)) {
-                    apply(c);
-                }
+            if top.any(&uses) {
+                Arc::make_mut(top).walk_mut(&mut |n| {
+                    if uses(n) {
+                        apply(n);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Visit every node of the current page, parents before children, in stacking order.
+    pub fn walk<'a>(&'a self, mut f: impl FnMut(&'a Node)) {
+        for n in &self.nodes {
+            n.walk(&mut f);
+        }
+    }
+
+    /// Visit every node of every page (the current page first).
+    pub fn walk_all<'a>(&'a self, mut f: impl FnMut(&'a Node)) {
+        for n in self.all_tops() {
+            n.walk(&mut f);
+        }
+    }
+
+    /// Change child lists below the top level of the current page: `edit` runs on each list
+    /// (of a frame at any depth) that `touches` accepts. Top-level nodes without one stay shared.
+    fn edit_lists(&mut self, touches: impl Fn(&[Node]) -> bool, mut edit: impl FnMut(&mut Vec<Node>)) {
+        for top in &mut self.nodes {
+            if top.any_list(&touches) {
+                Arc::make_mut(top).each_list_mut(&mut |list| {
+                    if touches(list) {
+                        edit(list);
+                    }
+                });
             }
         }
     }
@@ -1171,8 +1295,9 @@ impl Doc {
     }
 
     pub fn color_style_uses(&self, id: u64) -> usize {
-        let uses = |n: &Node| (n.fill_style == Some(id)) as usize + (n.stroke_style == Some(id)) as usize;
-        self.all_tops().map(|n| uses(n) + n.children.iter().map(uses).sum::<usize>()).sum()
+        let mut count = 0;
+        self.walk_all(|n| count += (n.fill_style == Some(id)) as usize + (n.stroke_style == Some(id)) as usize);
+        count
     }
 
     /// Setelah style dihapus: lepaskan objek yang masih menunjuk ke style itu (tampilannya tetap).
@@ -1201,7 +1326,9 @@ impl Doc {
 
     /// Id node terbesar di semua halaman (untuk memastikan id baru tidak bentrok).
     pub fn max_node_id(&self) -> u64 {
-        self.all_tops().flat_map(|n| std::iter::once(n.id).chain(n.children.iter().map(|c| c.id))).max().unwrap_or(0)
+        let mut max = 0;
+        self.walk_all(|n| max = max.max(n.id));
+        max
     }
 
     pub fn page_count(&self) -> usize {
@@ -1297,7 +1424,10 @@ impl Doc {
         if self.page > i {
             self.page -= 1;
         }
-        let used: Vec<u64> = self.all_tops().flat_map(|n| std::iter::once(n.group).chain(n.children.iter().map(|c| c.group))).collect();
+        let mut used = std::collections::BTreeSet::new();
+        self.walk_all(|n| {
+            used.insert(n.group);
+        });
         self.group_names.retain(|g, _| used.contains(g));
         true
     }
@@ -1340,63 +1470,116 @@ impl Doc {
         key
     }
 
-    /// Posisi node: (indeks level atas, indeks anak jika node adalah anak frame).
-    pub fn locate(&self, id: u64) -> Option<(usize, Option<usize>)> {
+    /// Where a node is: the index among the top-level nodes, then the child index at each level
+    /// below (so a top-level node has a path of length 1).
+    pub fn locate(&self, id: u64) -> Option<Vec<usize>> {
+        let mut path = Vec::new();
         for (ti, n) in self.nodes.iter().enumerate() {
-            if n.id == id {
-                return Some((ti, None));
+            path.push(ti);
+            if n.path_to(id, &mut path) {
+                return Some(path);
             }
-            if let Some(ci) = n.children.iter().position(|c| c.id == id) {
-                return Some((ti, Some(ci)));
-            }
+            path.pop();
         }
         None
     }
 
-    /// Urutkan id menurut urutan tumpukan dokumen, dari paling bawah ke paling atas.
+    /// The node at a path from `locate`.
+    pub fn at(&self, path: &[usize]) -> Option<&Node> {
+        let (first, rest) = path.split_first()?;
+        let mut n: &Node = self.nodes.get(*first)?;
+        for i in rest {
+            n = n.children.get(*i)?;
+        }
+        Some(n)
+    }
+
+    /// Urutkan id menurut urutan tumpukan dokumen, dari paling bawah ke paling atas
+    /// (induk sebelum isinya).
     pub fn sort_by_stack(&self, ids: &mut [u64]) {
-        ids.sort_by_cached_key(|id| self.locate(*id).map_or((usize::MAX, None), |(ti, ci)| (ti, ci)));
+        ids.sort_by_cached_key(|id| self.locate(*id).unwrap_or_else(|| vec![usize::MAX]));
     }
 
     pub fn find(&self, id: u64) -> Option<&Node> {
-        let (ti, ci) = self.locate(id)?;
-        match ci {
-            None => Some(&self.nodes[ti]),
-            Some(ci) => self.nodes[ti].children.get(ci),
-        }
+        self.nodes.iter().find_map(|n| n.find(id))
     }
 
+    /// Only the top-level node that holds `id` is copied (when an undo snapshot shares it).
     pub fn find_mut(&mut self, id: u64) -> Option<&mut Node> {
-        let (ti, ci) = self.locate(id)?;
-        let top = Arc::make_mut(&mut self.nodes[ti]);
-        match ci {
-            None => Some(top),
-            Some(ci) => top.children.get_mut(ci),
+        let ti = self.nodes.iter().position(|n| n.find(id).is_some())?;
+        Arc::make_mut(&mut self.nodes[ti]).find_mut(id)
+    }
+
+    /// The node and the frames around it, outermost first (the node itself is last).
+    pub fn lineage(&self, id: u64) -> Vec<&Node> {
+        let Some(path) = self.locate(id) else { return Vec::new() };
+        let mut out = Vec::with_capacity(path.len());
+        let mut n: &Node = &self.nodes[path[0]];
+        out.push(n);
+        for i in &path[1..] {
+            n = &n.children[*i];
+            out.push(n);
         }
+        out
+    }
+
+    /// Ids of the frames around a node, nearest first (empty for a top-level node).
+    pub fn ancestors(&self, id: u64) -> Vec<u64> {
+        let mut out: Vec<u64> = self.lineage(id).iter().map(|n| n.id).collect();
+        out.pop();
+        out.reverse();
+        out
     }
 
     pub fn parent_of(&self, id: u64) -> Option<u64> {
-        match self.locate(id)? {
-            (ti, Some(_)) => Some(self.nodes[ti].id),
-            _ => None,
+        let path = self.locate(id)?;
+        self.at(&path[..path.len() - 1]).map(|n| n.id)
+    }
+
+    /// The top-level node that holds `id` (the node itself when it is top-level).
+    pub fn top_of(&self, id: u64) -> Option<u64> {
+        self.nodes.iter().find(|n| n.find(id).is_some()).map(|n| n.id)
+    }
+
+    /// Is `id` somewhere inside `of` (at any depth)? A node is not its own descendant.
+    pub fn is_descendant(&self, id: u64, of: u64) -> bool {
+        self.find(of).is_some_and(|n| n.has_descendant(id))
+    }
+
+    /// Ids of the direct children of `parent`, or of the top level, in stacking order.
+    pub fn child_ids(&self, parent: Option<u64>) -> Vec<u64> {
+        match parent {
+            Some(p) => self.find(p).map(|f| f.children.iter().map(|c| c.id).collect()).unwrap_or_default(),
+            None => self.nodes.iter().map(|n| n.id).collect(),
         }
+    }
+
+    /// Drop the ids that sit inside another node of the list, so a frame and its content are
+    /// handled once. The order of the rest is kept.
+    pub fn roots_of(&self, ids: &[u64]) -> Vec<u64> {
+        ids.iter().copied().filter(|id| !self.ancestors(*id).iter().any(|a| ids.contains(a))).collect()
     }
 
     pub fn remove(&mut self, id: u64) -> Option<Node> {
-        match self.locate(id)? {
-            (ti, None) => Some(Arc::unwrap_or_clone(self.nodes.remove(ti))),
-            (ti, Some(ci)) => Some(Arc::make_mut(&mut self.nodes[ti]).children.remove(ci)),
+        let path = self.locate(id)?;
+        let (last, up) = path.split_last()?;
+        if up.is_empty() {
+            return Some(Arc::unwrap_or_clone(self.nodes.remove(*last)));
         }
+        let mut n = Arc::make_mut(&mut self.nodes[up[0]]);
+        for i in &up[1..] {
+            n = &mut n.children[*i];
+        }
+        Some(n.children.remove(*last))
     }
 
-    /// Sisipkan di urutan paling atas dari `parent` (atau level atas bila `None`).
+    /// Sisipkan di urutan paling atas dari `parent` (frame di kedalaman mana pun), atau di level
+    /// atas bila `None` atau induknya bukan frame.
     pub fn insert(&mut self, node: Node, parent: Option<u64>) {
-        if let Some(p) = parent {
-            if let Some((ti, None)) = self.locate(p) {
-                if self.nodes[ti].kind == Kind::Frame && node.kind != Kind::Frame {
-                    Arc::make_mut(&mut self.nodes[ti]).children.push(node);
-                    return;
-                }
+        if parent.is_some_and(|p| self.find(p).is_some_and(|f| f.kind == Kind::Frame)) {
+            if let Some(f) = parent.and_then(|p| self.find_mut(p)) {
+                f.children.push(node);
+                return;
             }
         }
         self.nodes.push(Arc::new(node));
@@ -1413,36 +1596,55 @@ impl Doc {
     }
 
     fn restack(&mut self, ids: &[u64], up: bool, step: bool) {
+        // Frame yang ikut terpilih pindah beserta isinya; urutan isinya tidak diubah.
+        fn inside(n: &mut Node, ids: &[u64], up: bool, step: bool) {
+            if ids.contains(&n.id) || n.children.is_empty() {
+                return;
+            }
+            restack(&mut n.children, ids, up, step);
+            for c in &mut n.children {
+                inside(c, ids, up, step);
+            }
+        }
         restack(&mut self.nodes, ids, up, step);
         for top in &mut self.nodes {
-            // Frame yang ikut terpilih pindah beserta isinya; urutan isinya tidak diubah.
-            if !ids.contains(&top.id) && top.children.iter().any(|c| ids.contains(&c.id)) {
-                restack(&mut Arc::make_mut(top).children, ids, up, step);
+            if !ids.contains(&top.id) && top.has_any_descendant(ids) {
+                inside(Arc::make_mut(top), ids, up, step);
             }
         }
     }
 
-    /// Pindahkan node-node `ids` (tarik-lepas di panel layer) ke `parent` (frame, atau level atas
-    /// bila `None`). `anchor` = (id saudara, di atasnya?): disisipkan tepat di atas/bawah saudara
-    /// itu dalam urutan tumpukan; `None` = paling depan. Semua yang dipindah ikut `group` tujuan;
-    /// kalau tujuannya bukan group, group yang terbawa utuh tetap jadi group. Urutan relatif yang
-    /// dipindah tetap. Hasil `false`: tidak sah (frame ke dalam frame) atau tidak ada yang berubah.
+    /// Pindahkan node-node `ids` (tarik-lepas di panel layer) ke `parent` (frame di kedalaman mana
+    /// pun, atau level atas bila `None`). `anchor` = (id saudara, di atasnya?): disisipkan tepat
+    /// di atas/bawah saudara itu dalam urutan tumpukan; `None` = paling depan. Semua yang dipindah
+    /// ikut `group` tujuan; kalau tujuannya bukan group, group yang terbawa utuh tetap jadi group.
+    /// Urutan relatif yang dipindah tetap; node yang induknya ikut dipindah tetap di dalam induknya.
+    /// Hasil `false`: tidak sah (tujuan bukan frame, atau frame ke dalam dirinya sendiri / isinya)
+    /// atau tidak ada yang berubah.
     pub fn move_nodes(&mut self, ids: &[u64], parent: Option<u64>, anchor: Option<(u64, bool)>, group: u64) -> bool {
+        fn rows(n: &Node, parent: u64, out: &mut Vec<(u64, u64, u64, bool)>) {
+            out.push((n.id, parent, n.group, n.clip));
+            for c in &n.children {
+                rows(c, n.id, out);
+            }
+        }
         let layout = |d: &Doc| -> Vec<(u64, u64, u64, bool)> {
-            d.nodes.iter().flat_map(|n| std::iter::once((n.id, 0, n.group, n.clip)).chain(n.children.iter().map(|c| (c.id, n.id, c.group, c.clip)))).collect()
+            let mut out = Vec::new();
+            for n in &d.nodes {
+                rows(n, 0, &mut out);
+            }
+            out
         };
+        let ids = &self.roots_of(ids)[..];
         let before = layout(self);
         if let Some(p) = parent {
-            let ok = !ids.contains(&p) && self.nodes.iter().any(|n| n.id == p && n.kind == Kind::Frame);
-            if !ok || self.nodes.iter().any(|n| n.kind == Kind::Frame && ids.contains(&n.id)) {
+            let frame = self.find(p).is_some_and(|n| n.kind == Kind::Frame);
+            if !frame || ids.contains(&p) || self.ancestors(p).iter().any(|a| ids.contains(a)) {
                 return false;
             }
         }
         // Posisi sisip dihitung di daftar tujuan tanpa node yang dipindah.
-        let siblings: Vec<u64> = match parent {
-            Some(p) => self.find(p).map(|f| f.children.iter().map(|c| c.id).collect()).unwrap_or_default(),
-            None => self.nodes.iter().map(|n| n.id).collect(),
-        };
+        let siblings = self.child_ids(parent);
         let stay = |list: &[u64]| list.iter().filter(|id| !ids.contains(id)).count();
         let at = match anchor {
             Some((a, above)) => {
@@ -1456,6 +1658,17 @@ impl Doc {
         whole.dedup();
         whole.retain(|g| before.iter().filter(|r| r.2 == *g).all(|r| ids.contains(&r.0)));
 
+        fn take(list: &mut Vec<Node>, ids: &[u64], moved: &mut Vec<Node>) {
+            let mut i = 0;
+            while i < list.len() {
+                if ids.contains(&list[i].id) {
+                    moved.push(list.remove(i));
+                } else {
+                    take(&mut list[i].children, ids, moved);
+                    i += 1;
+                }
+            }
+        }
         let mut moved: Vec<Node> = Vec::new();
         for top in std::mem::take(&mut self.nodes) {
             if ids.contains(&top.id) {
@@ -1463,15 +1676,8 @@ impl Doc {
                 continue;
             }
             let mut top = top;
-            if top.children.iter().any(|c| ids.contains(&c.id)) {
-                let t = Arc::make_mut(&mut top);
-                for c in std::mem::take(&mut t.children) {
-                    if ids.contains(&c.id) {
-                        moved.push(c);
-                    } else {
-                        t.children.push(c);
-                    }
-                }
+            if top.has_any_descendant(ids) {
+                take(&mut Arc::make_mut(&mut top).children, ids, &mut moved);
             }
             self.nodes.push(top);
         }
@@ -1493,9 +1699,9 @@ impl Doc {
         } else {
             moved[0].clip = false;
         }
-        match parent.and_then(|p| self.nodes.iter_mut().find(|n| n.id == p)) {
+        match parent.and_then(|p| self.find_mut(p)) {
             Some(f) => {
-                Arc::make_mut(f).children.splice(at..at, moved);
+                f.children.splice(at..at, moved);
             }
             None => {
                 self.nodes.splice(at..at, moved.into_iter().map(Arc::new));
@@ -1516,18 +1722,17 @@ impl Doc {
 
     // ---------------------------------------------------------------- group
 
-    /// Id semua node (level atas dan anak frame) yang group-nya ada di `groups`.
+    /// Id semua node (di kedalaman mana pun) yang group-nya ada di `groups`.
     pub fn group_members(&self, groups: &[u64]) -> Vec<u64> {
         let mut out = Vec::new();
         if groups.is_empty() {
             return out;
         }
-        for n in &self.nodes {
+        self.walk(|n| {
             if n.group != 0 && groups.contains(&n.group) {
                 out.push(n.id);
             }
-            out.extend(n.children.iter().filter(|c| c.group != 0 && groups.contains(&c.group)).map(|c| c.id));
-        }
+        });
         out
     }
 
@@ -1542,11 +1747,7 @@ impl Doc {
             }
         }
         gather(&mut self.nodes, |n| n.group == g);
-        for top in &mut self.nodes {
-            if top.children.iter().filter(|c| c.group == g).count() >= 2 {
-                gather(&mut Arc::make_mut(top).children, |c| c.group == g);
-            }
-        }
+        self.edit_lists(|list| list.iter().filter(|c| c.group == g).count() >= 2, |list| gather(list, |c| c.group == g));
         g
     }
 
@@ -1565,11 +1766,7 @@ impl Doc {
     /// Hasil: apakah ada yang berhasil di-clip.
     pub fn make_clip(&mut self, ids: &[u64]) -> bool {
         let mut any = clip_siblings(&mut self.nodes, ids, |t| Arc::make_mut(t));
-        for top in &mut self.nodes {
-            if top.children.iter().any(|c| ids.contains(&c.id)) {
-                any |= clip_siblings(&mut Arc::make_mut(top).children, ids, |t| t);
-            }
-        }
+        self.edit_lists(|list| list.iter().any(|c| ids.contains(&c.id)), |list| any |= clip_siblings(list, ids, |t| t));
         any
     }
 
@@ -1617,35 +1814,50 @@ impl Doc {
         });
     }
 
-    /// Frame level atas paling depan yang memuat titik ini.
-    pub fn frame_at(&self, x: f32, y: f32, exclude: u64) -> Option<u64> {
-        self.nodes
-            .iter()
-            .rev()
-            .find(|n| n.kind == Kind::Frame && n.visible && n.id != exclude && n.contains(x, y, 0.0))
-            .map(|n| n.id)
+    /// The deepest visible frame under this point; frames in `exclude` (and so everything in
+    /// them) are passed over. Content outside its frame is clipped away, so a nested frame only
+    /// counts where its parents show it.
+    pub fn frame_at(&self, x: f32, y: f32, exclude: &[u64]) -> Option<u64> {
+        fn deepest<'a, T: AsRef<Node>>(list: &'a [T], x: f32, y: f32, exclude: &[u64]) -> Option<&'a Node> {
+            list.iter()
+                .rev()
+                .map(|n| n.as_ref())
+                .find(|n| n.kind == Kind::Frame && n.visible && !exclude.contains(&n.id) && n.contains(x, y, 0.0))
+                .map(|n| deepest(&n.children, x, y, exclude).unwrap_or(n))
+        }
+        deepest(&self.nodes, x, y, exclude).map(|n| n.id)
     }
 
-    /// Node paling depan di titik ini (anak frame didahulukan dari frame-nya).
-    pub fn hit(&self, x: f32, y: f32, tol: f32) -> Option<u64> {
-        for n in self.nodes.iter().rev() {
-            if !n.visible || n.locked {
-                continue;
-            }
-            if n.kind == Kind::Frame {
-                if n.contains(x, y, 0.0) {
-                    for c in n.children.iter().rev() {
-                        if c.visible && !c.locked && c.contains(x, y, tol) {
-                            return Some(c.id);
-                        }
-                    }
-                    return Some(n.id);
-                }
-            } else if n.contains(x, y, tol) {
-                return Some(n.id);
-            }
+    /// The frame `n` belongs in when it sits at this point: the deepest frame there, and for a
+    /// frame the nearest one that is larger than it in both directions (so artboards dragged
+    /// past each other do not nest).
+    pub fn frame_for(&self, n: &Node, x: f32, y: f32, exclude: &[u64]) -> Option<u64> {
+        let found = self.frame_at(x, y, exclude)?;
+        if n.kind != Kind::Frame {
+            return Some(found);
         }
-        None
+        self.lineage(found).into_iter().rev().find(|f| n.w.abs() < f.w.abs() && n.h.abs() < f.h.abs()).map(|f| f.id)
+    }
+
+    /// Node paling depan di titik ini menurut aturan klik biasa: objek level atas, atau anak
+    /// langsung frame level atas (frame di dalam frame terpilih utuh), kalau tidak frame-nya.
+    pub fn hit(&self, x: f32, y: f32, tol: f32) -> Option<u64> {
+        hit_list(&self.nodes, x, y, tol, 1).map(|n| n.id)
+    }
+
+    /// The deepest node under this point, however many frames it sits in (Ctrl+click).
+    pub fn hit_deep(&self, x: f32, y: f32, tol: f32) -> Option<u64> {
+        hit_list(&self.nodes, x, y, tol, usize::MAX).map(|n| n.id)
+    }
+
+    /// The front-most direct child of frame `scope` under this point (a nested frame counts as
+    /// a whole). `None` when the point misses them all, lies outside the frame, or the frame or
+    /// one around it is hidden, locked or clips the point away.
+    pub fn hit_within(&self, scope: u64, x: f32, y: f32, tol: f32) -> Option<u64> {
+        let line = self.lineage(scope);
+        let open = line.iter().all(|f| f.kind == Kind::Frame && f.visible && !f.locked && f.contains(x, y, 0.0));
+        let frame = line.last().filter(|_| open)?;
+        hit_list(&frame.children, x, y, tol, 0).map(|n| n.id)
     }
 
     pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
@@ -1658,8 +1870,11 @@ impl Doc {
         self.nodes.iter().map(|n| n.count()).sum()
     }
 
+    /// Frames on the current page, nested ones included.
     pub fn frame_count(&self) -> usize {
-        self.nodes.iter().filter(|n| n.kind == Kind::Frame).count()
+        let mut count = 0;
+        self.walk(|n| count += (n.kind == Kind::Frame) as usize);
+        count
     }
 }
 
@@ -1905,6 +2120,205 @@ mod tests {
         assert!(doc.move_nodes(&[ids[1], ids[4]], Some(frame), Some((ids[3], true)), h));
         assert_eq!(doc.group_members(&[h]), vec![ids[2], ids[3], ids[1], ids[4]]);
         assert_eq!(doc.group_names.keys().copied().collect::<Vec<_>>(), vec![h]);
+    }
+
+    /// Top frame 1 (400×400) › frame 2 (at 100,100, 200×200) › frame 3 (at 150,150, 100×100) ›
+    /// rect 4 (at 180,180, 200×40, sticking out of 3 and 2). Rect 5 in frame 1, rect 6 at top level.
+    fn nested() -> Doc {
+        let mut doc = Doc::default();
+        let mut add = |kind: Kind, parent: Option<u64>, (x, y, w, h): (f32, f32, f32, f32)| {
+            let id = doc.alloc_id();
+            let mut n = Node::new(id, kind, x, y);
+            (n.w, n.h, n.fill) = (w, h, Some([0, 0, 0, 255]));
+            doc.insert(n, parent);
+            id
+        };
+        add(Kind::Frame, None, (0.0, 0.0, 400.0, 400.0));
+        add(Kind::Frame, Some(1), (100.0, 100.0, 200.0, 200.0));
+        add(Kind::Frame, Some(2), (150.0, 150.0, 100.0, 100.0));
+        add(Kind::Rect, Some(3), (180.0, 180.0, 200.0, 40.0));
+        add(Kind::Rect, Some(1), (10.0, 10.0, 50.0, 50.0));
+        add(Kind::Rect, None, (500.0, 0.0, 50.0, 50.0));
+        doc
+    }
+
+    #[test]
+    fn tree_api_reaches_any_depth() {
+        let mut doc = nested();
+        assert_eq!(doc.locate(4), Some(vec![0, 0, 0, 0]));
+        assert_eq!(doc.locate(5), Some(vec![0, 1]));
+        assert_eq!(doc.locate(6), Some(vec![1]));
+        assert_eq!(doc.locate(99), None);
+        assert_eq!(doc.at(&[0, 0, 0]).map(|n| n.id), Some(3));
+        assert_eq!(doc.find(4).map(|n| n.kind), Some(Kind::Rect));
+        assert_eq!((doc.parent_of(4), doc.parent_of(2), doc.parent_of(1), doc.parent_of(99)), (Some(3), Some(1), None, None));
+        assert_eq!(doc.ancestors(4), vec![3, 2, 1]);
+        assert!(doc.ancestors(6).is_empty());
+        assert_eq!(doc.lineage(3).iter().map(|n| n.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!((doc.top_of(4), doc.top_of(6)), (Some(1), Some(6)));
+        assert!(doc.is_descendant(4, 1) && doc.is_descendant(4, 3) && !doc.is_descendant(1, 4) && !doc.is_descendant(3, 3));
+        assert_eq!(doc.child_ids(Some(1)), vec![2, 5]);
+        assert_eq!(doc.child_ids(None), vec![1, 6]);
+        assert_eq!(doc.roots_of(&[4, 6, 2, 5]), vec![6, 2, 5]);
+        assert_eq!((doc.count(), doc.frame_count(), doc.max_node_id()), (6, 3, 6));
+        let mut seen = Vec::new();
+        doc.walk(|n| seen.push(n.id));
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6]);
+        // Parents sort below what they hold.
+        let mut ids = vec![6, 4, 5, 1, 3, 2];
+        doc.sort_by_stack(&mut ids);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+
+        // A change deep inside one frame copies that top-level node only.
+        let snapshot = doc.clone();
+        doc.find_mut(4).unwrap().x = 185.0;
+        assert_eq!((doc.find(4).unwrap().x, snapshot.find(4).unwrap().x), (185.0, 180.0));
+        assert!(!Arc::ptr_eq(&doc.nodes[0], &snapshot.nodes[0]) && Arc::ptr_eq(&doc.nodes[1], &snapshot.nodes[1]));
+
+        // Styles reach every depth, and leave the other top-level nodes shared.
+        let style = doc.add_color_style([1, 2, 3, 255]);
+        doc.find_mut(4).unwrap().fill_style = Some(style);
+        doc.find_mut(2).unwrap().stroke_style = Some(style);
+        assert_eq!(doc.color_style_uses(style), 2);
+        let snapshot = doc.clone();
+        doc.colors[0].color = [9, 9, 9, 255];
+        doc.sync_color_style(style);
+        assert_eq!((doc.find(4).unwrap().fill, doc.find(2).unwrap().stroke), (Some([9, 9, 9, 255]), Some([9, 9, 9, 255])));
+        assert!(Arc::ptr_eq(&doc.nodes[1], &snapshot.nodes[1]));
+        doc.colors.clear();
+        doc.drop_missing_styles();
+        assert_eq!((doc.find(4).unwrap().fill_style, doc.find(2).unwrap().stroke_style), (None, None));
+
+        // Moving a frame carries everything in it; a frame can be inserted into a frame.
+        doc.find_mut(2).unwrap().translate(10.0, 0.0);
+        assert_eq!((doc.find(3).unwrap().x, doc.find(4).unwrap().x), (160.0, 195.0));
+        let taken = doc.remove(3).unwrap();
+        assert_eq!((taken.children.len(), doc.find(4).is_none(), doc.count()), (1, true, 4));
+        doc.insert(taken, Some(1));
+        assert_eq!((doc.parent_of(3), doc.parent_of(4)), (Some(1), Some(3)));
+        // Not a frame: goes to the top level.
+        let id = doc.alloc_id();
+        doc.insert(Node::new(id, Kind::Rect, 0.0, 0.0), Some(5));
+        assert_eq!(doc.parent_of(id), None);
+
+        // Saved and opened again, the tree is the same.
+        let back: Doc = serde_json::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!(back.locate(4), doc.locate(4));
+        assert_eq!(back.nodes[0], doc.nodes[0]);
+    }
+
+    #[test]
+    fn frames_move_into_frames_but_never_into_themselves() {
+        let mut doc = nested();
+        // Into itself, into its own content, into something that is not a frame.
+        assert!(!doc.move_nodes(&[2], Some(2), None, 0));
+        assert!(!doc.move_nodes(&[2], Some(3), None, 0));
+        assert!(!doc.move_nodes(&[1], Some(3), None, 0));
+        assert!(!doc.move_nodes(&[6], Some(5), None, 0));
+        assert_eq!(doc.locate(4), Some(vec![0, 0, 0, 0]));
+        // A nested frame out to the top level, below rect 6, with its content.
+        let snapshot = doc.clone();
+        assert!(doc.move_nodes(&[3], None, Some((6, false)), 0));
+        assert_eq!(doc.child_ids(None), vec![1, 3, 6]);
+        assert_eq!((doc.parent_of(4), doc.child_ids(Some(2))), (Some(3), vec![]));
+        assert!(Arc::ptr_eq(&doc.nodes[2], &snapshot.nodes[1]));
+        // And into another nested frame, above nothing: front-most.
+        assert!(doc.move_nodes(&[3, 6], Some(2), None, 0));
+        assert_eq!(doc.child_ids(Some(2)), vec![3, 6]);
+        assert_eq!(doc.ancestors(4), vec![3, 2, 1]);
+        // A frame picked together with its content moves once, content in place.
+        assert!(doc.move_nodes(&[4, 3], Some(1), Some((2, false)), 0));
+        assert_eq!((doc.child_ids(Some(1)), doc.child_ids(Some(3))), (vec![3, 2, 5], vec![4]));
+        // Between two frames at different depths.
+        assert!(doc.move_nodes(&[4], Some(2), Some((6, true)), 0));
+        assert_eq!(doc.child_ids(Some(2)), vec![6, 4]);
+    }
+
+    #[test]
+    fn clicks_pick_by_depth() {
+        let mut doc = nested();
+        // Inside the top frame: its direct child, a nested frame as a whole.
+        assert_eq!(doc.hit(200.0, 200.0, 1.0), Some(2));
+        assert_eq!(doc.hit(20.0, 20.0, 1.0), Some(5));
+        assert_eq!(doc.hit(350.0, 350.0, 1.0), Some(1));
+        assert_eq!(doc.hit(510.0, 10.0, 1.0), Some(6));
+        assert_eq!(doc.hit(450.0, 450.0, 1.0), None);
+        // One level in at a time.
+        assert_eq!(doc.hit_within(2, 200.0, 200.0, 1.0), Some(3));
+        assert_eq!(doc.hit_within(3, 200.0, 200.0, 1.0), Some(4));
+        assert_eq!(doc.hit_within(3, 160.0, 160.0, 1.0), None);
+        assert_eq!(doc.hit_within(2, 110.0, 110.0, 1.0), None);
+        // The deepest object; where a frame clips it away, whatever shows there instead.
+        assert_eq!(doc.hit_deep(200.0, 200.0, 1.0), Some(4));
+        assert_eq!(doc.hit_deep(160.0, 160.0, 1.0), Some(3));
+        assert_eq!(doc.hit_deep(270.0, 200.0, 1.0), Some(2));
+        assert_eq!(doc.hit_deep(350.0, 200.0, 1.0), Some(1));
+        assert_eq!(doc.hit_within(3, 270.0, 200.0, 1.0), None);
+        // The deepest frame, for dropping things into; without the ones being dragged.
+        assert_eq!(doc.frame_at(200.0, 200.0, &[]), Some(3));
+        assert_eq!(doc.frame_at(200.0, 200.0, &[3]), Some(2));
+        assert_eq!(doc.frame_at(200.0, 200.0, &[2]), Some(1));
+        assert_eq!(doc.frame_at(270.0, 200.0, &[]), Some(2));
+        assert_eq!(doc.frame_at(510.0, 10.0, &[]), None);
+        // A frame only goes into a frame that is larger than it.
+        let mut f = Node::new(0, Kind::Frame, 0.0, 0.0);
+        (f.w, f.h) = (150.0, 90.0);
+        assert_eq!(doc.frame_for(&f, 200.0, 200.0, &[]), Some(2));
+        (f.w, f.h) = (150.0, 500.0);
+        assert_eq!(doc.frame_for(&f, 200.0, 200.0, &[]), None);
+        assert_eq!(doc.frame_for(doc.find(6).unwrap(), 200.0, 200.0, &[]), Some(3));
+        // A locked or hidden frame takes everything in it along.
+        doc.find_mut(3).unwrap().locked = true;
+        assert_eq!(doc.hit_deep(200.0, 200.0, 1.0), Some(2));
+        assert_eq!(doc.hit_within(3, 200.0, 200.0, 1.0), None);
+        doc.find_mut(2).unwrap().visible = false;
+        assert_eq!((doc.hit(200.0, 200.0, 1.0), doc.hit_deep(200.0, 200.0, 1.0)), (Some(1), Some(1)));
+        assert_eq!(doc.frame_at(200.0, 200.0, &[]), Some(1));
+    }
+
+    #[test]
+    fn stacking_groups_and_masks_inside_nested_frames() {
+        let mut doc = nested();
+        let ids: Vec<u64> = (0..4)
+            .map(|_| {
+                let id = doc.alloc_id();
+                doc.insert(Node::new(id, Kind::Rect, 160.0, 160.0), Some(3));
+                id
+            })
+            .collect();
+        let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+        assert_eq!(doc.child_ids(Some(3)), vec![4, a, b, c, d]);
+        let snapshot = doc.clone();
+        doc.reorder(&[a], true);
+        assert_eq!(doc.child_ids(Some(3)), vec![4, b, c, d, a]);
+        doc.reorder_step(&[d], false);
+        assert_eq!(doc.child_ids(Some(3)), vec![4, b, d, c, a]);
+        // A frame picked with its content moves as one; the content keeps its order.
+        doc.reorder(&[2, a], false);
+        assert_eq!((doc.child_ids(Some(1)), doc.child_ids(Some(3))), (vec![2, 5], vec![4, b, d, c, a]));
+        doc.reorder(&[5, a], false);
+        assert_eq!((doc.child_ids(Some(1)), doc.child_ids(Some(3))), (vec![5, 2], vec![a, 4, b, d, c]));
+        assert!(Arc::ptr_eq(&doc.nodes[1], &snapshot.nodes[1]));
+        // Grouping gathers the members where the front-most one is.
+        let g = doc.group(&[a, d]);
+        assert_eq!(doc.child_ids(Some(3)), vec![4, b, a, d, c]);
+        assert_eq!(doc.group_members(&[g]), vec![a, d]);
+        // The group moves as one unit among its siblings.
+        doc.reorder(&[a, d], false);
+        assert_eq!(doc.child_ids(Some(3)), vec![a, d, 4, b, c]);
+        // A clipping mask on the layer below, three frames deep.
+        assert!(doc.make_clip(&[4]));
+        assert!(doc.find(4).unwrap().clip);
+        assert_eq!(clip_run(&doc.find(3).unwrap().children, 0), (2, 3));
+        doc.release_clip(&[4]);
+        doc.ungroup(&[g]);
+        assert!(doc.group_members(&[g]).is_empty() && !doc.find(4).unwrap().clip);
+        // Copies of a nested frame get ids of their own all the way down.
+        let mut copy = doc.find(2).unwrap().clone();
+        doc.reassign_ids(&mut copy);
+        let mut fresh = Vec::new();
+        copy.walk(&mut |n| fresh.push(n.id));
+        assert!(fresh.len() == 7 && fresh.iter().all(|id| doc.find(*id).is_none()));
     }
 
     #[test]

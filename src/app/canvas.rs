@@ -89,9 +89,16 @@ impl App {
                     // Klik dua kali lagi: selesai meng-crop.
                     self.finish_crop(true);
                 } else if self.pointer_tool() && self.editing.is_none() {
-                    let wp = self.view.to_world(o, p);
-                    if let Some(id) = self.doc.hit(wp.x, wp.y, 4.0 / self.view.zoom) {
+                    let (wp, tol) = (self.view.to_world(o, p), 4.0 / self.view.zoom);
+                    // The object a click here selects (the first click of the two already did).
+                    if let Some(id) = self.hit(p, wp, tol) {
                         match self.doc.find(id).map(|n| (n.kind, n.group != 0)) {
+                            // Double-click on a frame: go one level in, to its child under the pointer.
+                            Some((Kind::Frame, grouped)) => match self.doc.hit_within(id, wp.x, wp.y, tol) {
+                                Some(child) => self.sel = self.with_group(child),
+                                None if grouped => self.sel = vec![id],
+                                None => {}
+                            },
                             Some((Kind::Text, _)) => {
                                 let pre = self.doc.clone();
                                 self.start_text_edit(id, pre);
@@ -674,7 +681,7 @@ impl App {
                             for mut n in nodes {
                                 self.doc.reassign_ids(&mut n);
                                 let (cx, cy) = n.center();
-                                let parent = if n.kind == Kind::Frame { None } else { self.doc.frame_at(cx, cy, 0) };
+                                let parent = self.doc.frame_for(&n, cx, cy, &[]);
                                 self.sel.push(n.id);
                                 self.doc.insert(n, parent);
                             }
@@ -945,7 +952,9 @@ impl App {
             // Klik (tanpa menarik) di area kosong frame berisi objek: pilih frame-nya, tanpa menggesernya.
             if let Drag::Marquee { start, .. } = &drag {
                 if (wp - *start).length() * z <= 3.0 {
-                    if let Some(id) = self.doc.hit(wp.x, wp.y, 4.0 / z).filter(|id| self.body_locked(*id)) {
+                    // Ctrl+click: the deepest object under the pointer, however many frames it sits in.
+                    let deep = if inp.mods.command { self.doc.hit_deep(wp.x, wp.y, 4.0 / z) } else { None };
+                    if let Some(id) = deep.or_else(|| self.doc.hit(wp.x, wp.y, 4.0 / z).filter(|id| self.body_locked(*id))) {
                         if !self.sel.contains(&id) {
                             self.sel.push(id);
                         }
@@ -1054,7 +1063,7 @@ impl App {
                         n.fill = Some([255, 255, 255, 255]);
                     }
                     Kind::Line => {
-                        let on_frame = self.doc.frame_at(wp.x, wp.y, 0).is_some();
+                        let on_frame = self.doc.frame_at(wp.x, wp.y, &[]).is_some();
                         n.stroke = Some(if on_frame { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
                         n.stroke_w = 2.0;
                     }
@@ -1067,7 +1076,8 @@ impl App {
                     }
                     _ => n.fill = Some([217, 217, 217, 255]),
                 }
-                let parent = if kind == Kind::Frame { None } else { self.doc.frame_at(wp.x, wp.y, 0) };
+                // A frame drawn inside a frame becomes its child, like any other object.
+                let parent = self.doc.frame_at(wp.x, wp.y, &[]);
                 self.doc.insert(n, parent);
                 self.pre_drag = Some(pre);
                 self.sel = vec![id];
@@ -1086,15 +1096,18 @@ impl App {
                     self.push_undo(pre);
                 }
             }
-            Drag::Move { moved: true, .. } => {
-                // Objek yang digeser masuk/keluar frame berpindah induk (seperti di Figma).
-                for id in self.roots() {
+            Drag::Move { moved: true, start, applied, .. } => {
+                // Objek yang digeser masuk/keluar frame berpindah induk (seperti di Figma): ke frame
+                // terdalam di bawah pointer. Beberapa objek sekaligus: masing-masing menurut titik
+                // tengahnya, supaya seleksi lintas frame tidak terkumpul di satu frame. Frame hanya
+                // masuk ke frame yang lebih besar darinya, dan tidak pernah ke dalam yang ikut digeser.
+                let roots = self.roots();
+                // Titik pegang setelah snapping / Shift, bukan posisi pointer mentah.
+                let grab = start + applied;
+                for &id in &roots {
                     let Some(n) = self.doc.find(id) else { continue };
-                    if n.kind == Kind::Frame {
-                        continue;
-                    }
-                    let (cx, cy) = n.center();
-                    let target = self.doc.frame_at(cx, cy, id);
+                    let (x, y) = if roots.len() == 1 { (grab.x, grab.y) } else { n.center() };
+                    let target = self.doc.frame_for(n, x, y, &roots);
                     if target != self.doc.parent_of(id) {
                         if let Some(node) = self.doc.remove(id) {
                             self.doc.insert(node, target);
@@ -1161,7 +1174,7 @@ impl App {
                 let (x, y) = if dragged { (start.x.min(cur.x), start.y.min(cur.y)) } else { (start.x, start.y) };
                 let mut n = Node::new(id, Kind::Text, x.round(), y.round());
                 n.name = "Text".into();
-                let parent = self.doc.frame_at(start.x, start.y, 0);
+                let parent = self.doc.frame_at(start.x, start.y, &[]);
                 n.fill = Some(if parent.is_some() { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
                 n.wrap = dragged;
                 n.w = if dragged { width.round() } else { 4.0 };
@@ -1317,6 +1330,45 @@ impl App {
         self.sel = vec![multiply_id];
     }
 
+    /// `KANVAS_BENCH_NESTED`: a frame holding a frame holding a frame, each with something sticking
+    /// out of it (to show the clipping), opened in the Layers panel down to the deepest one.
+    /// Result: ids of [outer frame, card, badge, stripe in the badge, loose rect in the outer frame].
+    pub(super) fn bench_nested(&mut self) -> Vec<u64> {
+        let (x, y) = (-1500.0, 1000.0);
+        let mut make = |kind: Kind, name: &str, (nx, ny, w, h): (f32, f32, f32, f32), fill: [u8; 4]| {
+            let mut n = Node::new(self.doc.alloc_id(), kind, x + nx, y + ny);
+            (n.name, n.w, n.h, n.fill) = (name.into(), w, h, Some(fill));
+            n
+        };
+        let mut outer = make(Kind::Frame, "Nested demo", (0.0, 0.0, 900.0, 600.0), [250, 250, 250, 255]);
+        let mut card = make(Kind::Frame, "Card", (80.0, 80.0, 420.0, 360.0), [222, 236, 255, 255]);
+        (card.stroke, card.stroke_w) = (Some([13, 153, 255, 255]), 3.0);
+        card.shadow = Some(crate::doc::Shadow { x: 0.0, y: 12.0, blur: 28.0, color: [0, 0, 0, 90] });
+        // Sticks out of the card at the top and on the right.
+        let circle = make(Kind::Ellipse, "Circle", (380.0, 0.0, 220.0, 220.0), [151, 71, 255, 255]);
+        let mut title = make(Kind::Text, "Title", (110.0, 110.0, 200.0, 40.0), [20, 40, 90, 255]);
+        (title.text, title.font_size, title.weight) = ("Card title".into(), 34.0, 700);
+        let mut badge = make(Kind::Frame, "Badge", (120.0, 270.0, 240.0, 130.0), [255, 196, 87, 255]);
+        badge.opacity = 0.95;
+        // Wider than the badge: cut off on both sides.
+        let stripe = make(Kind::Rect, "Stripe", (60.0, 320.0, 360.0, 36.0), [242, 72, 72, 255]);
+        let mut label = make(Kind::Text, "Label", (136.0, 282.0, 100.0, 24.0), [90, 50, 0, 255]);
+        (label.text, label.font_size) = ("Badge".into(), 20.0);
+        // Sticks out of the outer frame.
+        let corner = make(Kind::Ellipse, "Corner", (760.0, 460.0, 260.0, 260.0), [20, 174, 92, 255]);
+        let loose = make(Kind::Rect, "Loose", (620.0, 120.0, 160.0, 160.0), [255, 102, 196, 255]);
+        let ids = vec![outer.id, card.id, badge.id, stripe.id, loose.id];
+        badge.children = vec![stripe, label];
+        card.children = vec![circle, title, badge];
+        outer.children = vec![card, corner, loose];
+        let b = outer.bounds();
+        self.doc.insert(outer, None);
+        self.expanded.extend(&ids[..3]);
+        self.zoom_to((b.0 - 40.0, b.1 - 40.0, b.2 + 40.0, b.3 + 40.0), 1.0);
+        self.sel.clear();
+        ids
+    }
+
     // ------------------------------------------------------------ gambar
 
     /// Tambah gambar dari byte file (PNG, JPEG, WebP, GIF, BMP). `at` = posisi layar, default tengah canvas.
@@ -1335,7 +1387,7 @@ impl App {
         n.w = w as f32;
         n.h = h as f32;
         n.image = Some(asset);
-        let parent = self.doc.frame_at(c.x, c.y, 0);
+        let parent = self.doc.frame_at(c.x, c.y, &[]);
         self.doc.insert(n, parent);
         self.push_undo(pre);
         self.sel = vec![id];

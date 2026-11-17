@@ -53,6 +53,8 @@ impl App {
                     "Shift while resizing = keep ratio",
                     "Alt while resizing = from center",
                     "Double-click a vector = edit points",
+                    "Double-click a nested frame = go inside",
+                    "Ctrl+click = deepest object",
                     "Moving snaps to edges/centers (Ctrl = off)",
                     "",
                     "Space+drag     pan canvas",
@@ -69,7 +71,8 @@ impl App {
                     "Ctrl+Shift+V   paste in place",
                     "Ctrl+Shift+H   show/hide",
                     "Ctrl+Alt+G     clipping mask",
-                    "Enter          edit text",
+                    "Enter          edit text / into a frame",
+                    "Shift+Enter    select the parent frame",
                     "Ctrl+\\         hide panels",
                 ] {
                     ui.label(egui::RichText::new(line).monospace().size(11.0).weak());

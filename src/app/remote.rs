@@ -593,8 +593,7 @@ impl App {
                 }
                 let mut texts = Vec::new();
                 for n in ids.iter().filter_map(|id| self.doc.find(*id)) {
-                    texts.push(n.id);
-                    texts.extend(n.children.iter().map(|c| c.id));
+                    n.walk(&mut |c| texts.push(c.id));
                 }
                 for id in texts {
                     self.measure_text(ctx, id);
@@ -853,9 +852,6 @@ impl App {
         let m = spec.as_object().ok_or("each node must be an object")?;
         let kind = m.get("kind").and_then(Value::as_str).ok_or("missing `kind`")?;
         let kind = parse_kind(kind).ok_or_else(|| format!("unknown kind \"{kind}\"; use frame, rect, ellipse, line, text, path or image"))?;
-        if child && kind == Kind::Frame {
-            return Err("frames can't be nested inside frames; use a rect for inner containers".into());
-        }
         if kind != Kind::Frame && m.contains_key("children") {
             return Err("only frames can have `children`".into());
         }
@@ -919,11 +915,11 @@ impl App {
         Ok(n)
     }
 
-    /// Frame level atas yang boleh jadi induk: hasilnya titik asalnya.
+    /// Frame (di kedalaman mana pun) yang boleh jadi induk: hasilnya titik asalnya.
     fn parent_origin(&self, id: u64) -> Result<(f32, f32), String> {
         let f = self.doc.find(id).ok_or_else(|| format!("parent {id} not found"))?;
-        if f.kind != Kind::Frame || self.doc.parent_of(id).is_some() {
-            return Err(format!("parent {id} isn't a top-level frame"));
+        if f.kind != Kind::Frame {
+            return Err(format!("parent {id} isn't a frame"));
         }
         Ok((f.x, f.y))
     }
@@ -932,7 +928,7 @@ impl App {
     fn reveal(&mut self, ids: &[u64]) {
         let bounds = ids
             .iter()
-            .filter_map(|id| self.doc.find(self.doc.parent_of(*id).unwrap_or(*id)).map(Node::aabb))
+            .filter_map(|id| self.doc.find(self.doc.top_of(*id)?).map(Node::aabb))
             .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
         let Some(b) = bounds else { return };
         let o = self.canvas_rect.min;
@@ -1014,8 +1010,8 @@ impl App {
             Some(p) => self.parent_origin(p)?,
             None => (0.0, 0.0),
         };
-        if target.is_some() && n.kind == Kind::Frame {
-            return Err("frames can't be nested inside frames".into());
+        if target.is_some_and(|p| p == id || self.doc.is_descendant(p, id)) {
+            return Err("a frame can't be moved into itself or into something inside it".into());
         }
         self.apply(&mut n, m, o, false, notes)?;
         if target != current {
@@ -1281,5 +1277,21 @@ mod tests {
         assert_eq!((c["x"].as_f64(), c["y"].as_f64()), (Some(20.0), Some(30.0)));
         assert_eq!(c["fill"], json!("#ff0000"));
         assert_eq!(describe(&f, (0.0, 0.0), false)["child_count"], json!(1));
+    }
+
+    #[test]
+    fn nested_frames_are_described_relative_to_their_own_parent() {
+        let mut top = Node::new(1, Kind::Frame, 100.0, 50.0);
+        let mut inner = Node::new(2, Kind::Frame, 150.0, 70.0);
+        let mut r = Node::new(3, Kind::Rect, 155.0, 80.0);
+        (top.w, top.h, inner.w, inner.h, r.w, r.h) = (400.0, 300.0, 200.0, 100.0, 10.0, 10.0);
+        inner.children.push(r);
+        top.children.push(inner);
+        let at = |v: &Value| (v["x"].as_f64(), v["y"].as_f64());
+        for v in [describe(&top, (0.0, 0.0), true), brief(&top, (0.0, 0.0))] {
+            let inner = &v["children"][0];
+            assert_eq!((inner["kind"].as_str(), at(inner)), (Some("frame"), (Some(50.0), Some(20.0))));
+            assert_eq!(at(&inner["children"][0]), (Some(5.0), Some(10.0)));
+        }
     }
 }

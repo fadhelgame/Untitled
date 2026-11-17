@@ -1291,7 +1291,7 @@ fn measure_texts(pc: &mut PaintCx, n: &Node) {
 fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[T], alpha: f32) -> bool {
     let first = run[0].as_ref();
     if let Some(id) = pc.editing {
-        if run.iter().map(|n| n.as_ref()).any(|n| n.id == id || n.children.iter().any(|c| c.id == id)) {
+        if run.iter().map(|n| n.as_ref()).any(|n| n.id == id || n.has_descendant(id)) {
             return false;
         }
     }

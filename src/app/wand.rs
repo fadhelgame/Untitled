@@ -96,21 +96,25 @@ impl App {
         }
         let scope = if self.wand.same_frame { Some(self.doc.parent_of(id)) } else { None };
         let mut out = Vec::new();
+        // Isi frame yang tersembunyi atau terkunci tidak ikut, di kedalaman mana pun.
+        fn each<'a>(n: &'a Node, parent: Option<u64>, check: &mut impl FnMut(&'a Node, Option<u64>)) {
+            if !n.visible || n.locked {
+                return;
+            }
+            check(n, parent);
+            for c in &n.children {
+                each(c, Some(n.id), check);
+            }
+        }
         let mut check = |c: &Node, parent: Option<u64>| {
             // Frame hanya ikut kalau yang diklik juga frame.
             let frame_ok = c.kind != Kind::Frame || r.kind == Kind::Frame;
-            if c.visible && !c.locked && frame_ok && scope.map_or(true, |s| s == parent) && self.wand.matches(r, c) {
+            if frame_ok && scope.map_or(true, |s| s == parent) && self.wand.matches(r, c) {
                 out.push(c.id);
             }
         };
         for top in &self.doc.nodes {
-            if !top.visible || top.locked {
-                continue;
-            }
-            check(top, None);
-            for c in &top.children {
-                check(c, Some(top.id));
-            }
+            each(top, None, &mut check);
         }
         out
     }
