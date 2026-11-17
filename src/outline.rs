@@ -3,9 +3,10 @@
 //! and turning overlapping contours (a raw stroke outline, a `fill-rule: nonzero` path) into
 //! plain outer + hole contours that fill the same under the even-odd rule Kanvas paths use.
 //!
-//! The outline follows what the canvas draws: butt ends, mitred corners (on an open path cut off
-//! when sharper than a right angle), the stroke of a rectangle or ellipse moved inside / outside by
-//! shrinking or growing the shape it runs along, and dashes that start at the first point.
+//! The outline follows what the canvas and the export draw (`stroke_lines` is what all three
+//! start from): the caps and joins of the node, mitred corners cut off to a bevel past the miter
+//! limit, the stroke of a rectangle or ellipse moved inside / outside by shrinking or growing the
+//! shape it runs along, and dashes that start at the first point.
 
 use crate::app::builder::fit_closed_tol;
 use crate::app::pen::{set_geo, Geo};
@@ -31,20 +32,42 @@ pub struct Contour {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Cap {
     Butt,
-    #[allow(dead_code)]
     Round,
-    #[allow(dead_code)]
     Square,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Join {
+    /// A pointed corner; a bevel where it would reach further than the miter limit.
     Miter,
-    /// A mitre that is cut off (not replaced by a bevel) past the limit.
-    MiterClip,
-    #[allow(dead_code)]
     Round,
     Bevel,
+}
+
+/// How far a mitred corner may reach, in stroke widths from its inner to its outer tip (the
+/// default of SVG, which the export states too): corners sharper than about 29° are bevelled.
+pub const MITER_LIMIT: f32 = 4.0;
+
+impl Cap {
+    /// From `Node::cap`.
+    pub fn of(v: u8) -> Cap {
+        match v {
+            1 => Cap::Round,
+            2 => Cap::Square,
+            _ => Cap::Butt,
+        }
+    }
+}
+
+impl Join {
+    /// From `Node::join`.
+    pub fn of(v: u8) -> Join {
+        match v {
+            1 => Join::Round,
+            2 => Join::Bevel,
+            _ => Join::Miter,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -239,6 +262,14 @@ fn filled(contours: &[Vec<Pt>], rule: Rule) -> Vec<Vec<Vec<Pt>>> {
     Overlay::<i32>::from_subj(contours).overlay(OverlayRule::Subject, rule)
 }
 
+/// What closed polygons fill under the non-zero rule, as shapes that do not overlap: for each
+/// its outer edge, then its holes.
+pub fn unite(polys: &[Vec<P2>]) -> Vec<Vec<Vec<P2>>> {
+    let Some(grid) = Grid::around(polys) else { return Vec::new() };
+    let shapes = filled(&grid.snap(polys), Rule::NonZero);
+    shapes.iter().map(|shape| shape.iter().map(|c| c.iter().map(|p| grid.back(*p)).collect()).collect()).collect()
+}
+
 fn grid_area(shapes: &[Vec<Vec<Pt>>]) -> f64 {
     shapes
         .iter()
@@ -369,19 +400,29 @@ pub fn area(contours: &[Contour]) -> f64 {
 /// The outline of a stroke along `contours`: closed contours that fill its shape under the
 /// even-odd rule (outer edges and holes).
 pub fn stroke_outline(contours: &[Contour], style: &StrokeStyle) -> Vec<Contour> {
-    if !(style.width > 0.0) {
-        return Vec::new();
+    let res = (64.0 / style.width.max(1e-3)).clamp(4.0, 256.0);
+    let Some((stroked, o)) = stroke_path(contours, style, res) else { return Vec::new() };
+    let mut out = simplify(&from_skia(&stroked), Rule::NonZero, style.width);
+    for q in out.iter_mut().flat_map(|c| c.pts.iter_mut()) {
+        q.x += o.0;
+        q.y += o.1;
     }
-    let Some(first) = contours.iter().flat_map(|c| c.pts.first()).next() else { return Vec::new() };
+    out
+}
+
+/// The shape of a stroke along `contours` as `tiny_skia` makes it (the stroker the export is
+/// rendered with): a path to fill under the non-zero rule, and the offset it has to be moved
+/// by. `res`: how many times finer than one unit its curves have to be.
+pub fn stroke_path(contours: &[Contour], style: &StrokeStyle, res: f32) -> Option<(sk::Path, (f32, f32))> {
+    if !(style.width > 0.0) {
+        return None;
+    }
+    let first = contours.iter().flat_map(|c| c.pts.first()).next()?;
     // Near the origin, where single precision is at its finest.
     let o = (first.x.round(), first.y.round());
-    let Some(mut path) = to_skia(contours, o) else { return Vec::new() };
-    let res = (64.0 / style.width).clamp(4.0, 256.0);
+    let mut path = to_skia(contours, o)?;
     if let Some((dash, gap)) = style.dash.filter(|d| d.0 > 0.0 && d.1 > 0.0) {
-        match sk::StrokeDash::new(vec![dash, gap], 0.0).and_then(|d| path.dash(&d, res)) {
-            Some(dashed) => path = dashed,
-            None => return Vec::new(),
-        }
+        path = sk::StrokeDash::new(vec![dash, gap], 0.0).and_then(|d| path.dash(&d, res))?;
     }
     let stroke = sk::Stroke {
         width: style.width,
@@ -393,19 +434,12 @@ pub fn stroke_outline(contours: &[Contour], style: &StrokeStyle) -> Vec<Contour>
         },
         line_join: match style.join {
             Join::Miter => sk::LineJoin::Miter,
-            Join::MiterClip => sk::LineJoin::MiterClip,
             Join::Round => sk::LineJoin::Round,
             Join::Bevel => sk::LineJoin::Bevel,
         },
         dash: None,
     };
-    let Some(stroked) = path.stroke(&stroke, res) else { return Vec::new() };
-    let mut out = simplify(&from_skia(&stroked), Rule::NonZero, style.width);
-    for q in out.iter_mut().flat_map(|c| c.pts.iter_mut()) {
-        q.x += o.0;
-        q.y += o.1;
-    }
-    out
+    Some((path.stroke(&stroke, res)?, o))
 }
 
 /// A rectangle with rounded corners, clockwise. It starts where the canvas starts its dashes.
@@ -459,27 +493,31 @@ pub fn path_contours(n: &Node) -> Vec<Contour> {
     out
 }
 
-/// The outline of the stroke of a node, where the canvas draws it (rotation and flips
-/// included). `None`: the node has no stroke to outline, or is of a kind that has none (text).
-pub fn node_outline(n: &Node) -> Option<Vec<Contour>> {
-    if n.stroke.is_none_or(|c| c[3] == 0) || !(n.stroke_w > 0.0) {
-        return None;
-    }
+/// What the stroke of a node is made from.
+enum Along {
+    /// The lines it runs along.
+    Lines(Vec<Contour>),
+    /// A stroke as wide as its shape, which covers all of it: the shape to fill.
+    Solid(Vec<Contour>),
+}
+
+fn has_stroke(n: &Node) -> bool {
+    n.kind != Kind::Text && n.stroke.is_some_and(|c| c[3] > 0) && n.stroke_w > 0.0
+}
+
+fn stroke_along(n: &Node) -> Along {
     let (x0, y0, x1, y1) = n.bounds();
-    let dash = (n.dash > 0.0).then(|| (n.dash, if n.gap > 0.0 { n.gap } else { n.dash }));
-    let mut style = StrokeStyle { width: n.stroke_w, cap: Cap::Butt, join: Join::Miter, miter_limit: 4.0, dash };
     let inset = n.stroke_inset();
-    let mut out = match n.kind {
+    match n.kind {
         Kind::Rect | Kind::Frame | Kind::Image => {
             let (w, h) = (x1 - x0, y1 - y0);
             let rad = if n.kind == Kind::Frame { 0.0 } else { n.radius.min(w * 0.5).min(h * 0.5).max(0.0) };
             let along = (x0 + inset, y0 + inset, x1 - inset, y1 - inset);
             if along.2 - along.0 <= 0.0 || along.3 - along.1 <= 0.0 {
-                // The stroke is as wide as the shape: it covers all of it.
                 let grow = n.stroke_w * 0.5 - inset;
-                vec![rounded_rect((x0 - grow, y0 - grow, x1 + grow, y1 + grow), if rad > 0.0 { rad + grow } else { 0.0 })]
+                Along::Solid(vec![rounded_rect((x0 - grow, y0 - grow, x1 + grow, y1 + grow), if rad > 0.0 { rad + grow } else { 0.0 })])
             } else {
-                stroke_outline(&[rounded_rect(along, if rad > 0.0 { (rad - inset).max(0.0) } else { 0.0 })], &style)
+                Along::Lines(vec![rounded_rect(along, if rad > 0.0 { (rad - inset).max(0.0) } else { 0.0 })])
             }
         }
         Kind::Ellipse => {
@@ -487,23 +525,46 @@ pub fn node_outline(n: &Node) -> Option<Vec<Contour>> {
             let c = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
             if rx <= 0.0 || ry <= 0.0 {
                 let grow = n.stroke_w * 0.5 - inset;
-                vec![ellipse(c, ((x1 - x0) * 0.5 + grow, (y1 - y0) * 0.5 + grow))]
+                Along::Solid(vec![ellipse(c, ((x1 - x0) * 0.5 + grow, (y1 - y0) * 0.5 + grow))])
             } else {
-                stroke_outline(&[ellipse(c, (rx, ry))], &style)
+                Along::Lines(vec![ellipse(c, (rx, ry))])
             }
         }
-        Kind::Line => stroke_outline(&[Contour { pts: vec![corner(n.x, n.y), corner(n.x + n.w, n.y + n.h)], closed: false }], &style),
-        Kind::Path => {
-            // As on the canvas: a closed path has pointed corners however sharp, an open one has
-            // those sharper than a right angle cut off, and dashes are pieces without a join.
-            (style.join, style.miter_limit) = match (dash.is_some(), n.closed) {
-                (true, _) => (Join::Bevel, 4.0),
-                (false, true) => (Join::Miter, 100.0),
-                (false, false) => (Join::MiterClip, 1.4143),
-            };
-            stroke_outline(&path_contours(n), &style)
-        }
-        Kind::Text => return None,
+        Kind::Line => Along::Lines(vec![Contour { pts: vec![corner(n.x, n.y), corner(n.x + n.w, n.y + n.h)], closed: false }]),
+        _ => Along::Lines(path_contours(n)),
+    }
+}
+
+/// How the stroke of a node is drawn: its width, caps, joins and dashes.
+pub fn stroke_style(n: &Node) -> StrokeStyle {
+    let dash = (n.dash > 0.0).then(|| (n.dash, if n.gap > 0.0 { n.gap } else { n.dash }));
+    StrokeStyle { width: n.stroke_w, cap: Cap::of(n.cap), join: Join::of(n.join), miter_limit: MITER_LIMIT, dash }
+}
+
+/// The lines the stroke of a node runs along, in world coordinates before its rotation and
+/// flips, with the stroke of a rectangle or ellipse already moved inside / outside. The canvas,
+/// the export of dashed rounded rectangles and Outline stroke all start from these, so a dash
+/// begins at the same point in each. `None`: nothing to stroke, or the stroke covers the whole
+/// shape.
+pub fn stroke_lines(n: &Node) -> Option<Vec<Contour>> {
+    if !has_stroke(n) {
+        return None;
+    }
+    match stroke_along(n) {
+        Along::Lines(lines) if !lines.is_empty() => Some(lines),
+        _ => None,
+    }
+}
+
+/// The outline of the stroke of a node, where the canvas draws it (rotation and flips
+/// included). `None`: the node has no stroke to outline, or is of a kind that has none (text).
+pub fn node_outline(n: &Node) -> Option<Vec<Contour>> {
+    if !has_stroke(n) {
+        return None;
+    }
+    let mut out = match stroke_along(n) {
+        Along::Lines(lines) => stroke_outline(&lines, &stroke_style(n)),
+        Along::Solid(shape) => shape,
     };
     if out.is_empty() {
         return None;
@@ -677,6 +738,74 @@ mod tests {
         let span = |v: &[f32]| (v.iter().copied().fold(f32::MAX, f32::min), v.iter().copied().fold(f32::MIN, f32::max));
         assert_eq!((span(&xs), span(&ys)), ((10.0, 110.0), (16.0, 24.0)));
         assert!(near(area(&out), 800.0, 0.01));
+    }
+
+    #[test]
+    fn round_and_square_caps_reach_past_the_ends() {
+        let line = Contour { pts: vec![corner(10.0, 20.0), corner(110.0, 20.0)], closed: false };
+        let span = |out: &[Contour]| out.iter().flat_map(|c| c.pts.iter()).fold((f32::MAX, f32::MIN), |b, q| (b.0.min(q.x), b.1.max(q.x)));
+        // Square: the rectangle is longer by half the width at each end.
+        let square = stroke_outline(&[line.clone()], &solid(8.0, Cap::Square, Join::Miter));
+        assert_eq!((square.len(), span(&square)), (1, (6.0, 114.0)));
+        assert!(square[0].pts.iter().all(|q| q.hin == [0.0; 2] && q.hout == [0.0; 2]));
+        assert!(near(area(&square), 108.0 * 8.0, 0.01));
+        // Round: a half disc at each end, kept as curves.
+        let round = stroke_outline(&[line], &solid(8.0, Cap::Round, Join::Miter));
+        assert_eq!(round.len(), 1);
+        let (x0, x1) = span(&round);
+        assert!((x0 - 6.0).abs() < 0.05 && (x1 - 114.0).abs() < 0.05, "{x0} .. {x1}");
+        assert!(round[0].pts.iter().any(|q| q.hin != [0.0; 2] || q.hout != [0.0; 2]));
+        let want = 800.0 + std::f64::consts::PI * 16.0;
+        assert!(near(area(&round), want, want * 0.003), "{} (want {want})", area(&round));
+    }
+
+    #[test]
+    fn joins_fill_the_corner_each_in_their_own_way() {
+        // A right angle: the square outside the corner is 5 × 5.
+        let bend = Contour { pts: vec![corner(0.0, 0.0), corner(50.0, 0.0), corner(50.0, 50.0)], closed: false };
+        let of = |join| area(&stroke_outline(&[bend.clone()], &solid(10.0, Cap::Butt, join)));
+        assert!(near(of(Join::Miter), 1000.0, 0.5), "{}", of(Join::Miter));
+        assert!(near(of(Join::Bevel), 987.5, 0.5), "{}", of(Join::Bevel));
+        let round = 975.0 + std::f64::consts::PI * 25.0 / 4.0;
+        assert!(near(of(Join::Round), round, 0.5), "{} (want {round})", of(Join::Round));
+        // A corner of about 14 degrees: past the miter limit, so the point is cut off like a bevel.
+        let spike = Contour { pts: vec![corner(0.0, 0.0), corner(100.0, 12.0), corner(0.0, 24.0)], closed: false };
+        let tip = |join| stroke_outline(&[spike.clone()], &solid(10.0, Cap::Butt, join)).iter().flat_map(|c| c.pts.iter()).fold(f32::MIN, |m, q| m.max(q.x));
+        assert!((tip(Join::Miter) - tip(Join::Bevel)).abs() < 0.01 && tip(Join::Miter) < 102.0, "{}", tip(Join::Miter));
+        // A corner of 60 degrees is within it: the point reaches a whole stroke width past the corner.
+        let wedge = Contour { pts: vec![corner(0.0, 0.0), corner(100.0, 57.735), corner(0.0, 115.47)], closed: false };
+        let reach = stroke_outline(&[wedge], &solid(10.0, Cap::Butt, Join::Miter)).iter().flat_map(|c| c.pts.iter()).fold(f32::MIN, |m, q| m.max(q.x));
+        assert!((reach - 110.0).abs() < 0.05, "{reach}");
+    }
+
+    #[test]
+    fn the_outline_of_a_node_follows_its_cap_and_join() {
+        let mut line = Node::new(1, Kind::Line, 0.0, 0.0);
+        (line.w, line.h, line.stroke, line.stroke_w) = (100.0, 0.0, Some([0, 0, 0, 255]), 10.0);
+        let width = |n: &Node| {
+            let out = node_outline(n).unwrap();
+            let (a, b) = out.iter().flat_map(|c| c.pts.iter()).fold((f32::MAX, f32::MIN), |b, q| (b.0.min(q.x), b.1.max(q.x)));
+            b - a
+        };
+        assert_eq!(width(&line), 100.0);
+        line.cap = 2;
+        assert_eq!(width(&line), 110.0);
+        line.cap = 1;
+        assert!((width(&line) - 110.0).abs() < 0.05);
+        // Each dash gets the caps.
+        (line.dash, line.gap) = (10.0, 10.0);
+        let dashes = node_outline(&line).unwrap();
+        assert_eq!(dashes.len(), 5);
+        let want = 5.0 * (100.0 + std::f64::consts::PI * 25.0);
+        assert!(near(area(&dashes), want, want * 0.003), "{}", area(&dashes));
+        // A square with round corners: the outer edge is rounded, the inner one is not.
+        let mut rect = rect_node(1);
+        rect.join = 1;
+        let want = 4000.0 - (4.0 - std::f64::consts::PI) * 25.0;
+        let got = area(&node_outline(&rect).unwrap());
+        assert!(near(got, want, 1.5), "{got} (want {want})");
+        rect.join = 2;
+        assert!(near(area(&node_outline(&rect).unwrap()), 4000.0 - 50.0, 1.5));
     }
 
     #[test]

@@ -29,16 +29,47 @@ fn stroke(n: &Node) -> String {
             } else {
                 String::new()
             };
-            format!(r#"{} stroke-width="{}"{dash}"#, paint("stroke", n.stroke), n.stroke_w)
+            // Ends and corners as the node has them (butt and miter are what SVG assumes).
+            let cap = ["", r#" stroke-linecap="round""#, r#" stroke-linecap="square""#][n.cap.min(2) as usize];
+            let join = ["", r#" stroke-linejoin="round""#, r#" stroke-linejoin="bevel""#][n.join.min(2) as usize];
+            format!(r#"{} stroke-width="{}" stroke-miterlimit="{}"{dash}{cap}{join}"#, paint("stroke", n.stroke), n.stroke_w, crate::outline::MITER_LIMIT)
         }
         _ => String::new(),
     }
+}
+
+/// Path data of contours in world coordinates.
+fn contour_d(contours: &[crate::outline::Contour]) -> String {
+    let mut d = String::new();
+    for c in contours {
+        let n = c.pts.len();
+        if n < 2 {
+            continue;
+        }
+        let _ = write!(d, "M{:.3} {:.3}", c.pts[0].x, c.pts[0].y);
+        for i in 0..if c.closed { n } else { n - 1 } {
+            let (a, b) = (c.pts[i], c.pts[(i + 1) % n]);
+            let _ = write!(d, "C{:.3} {:.3} {:.3} {:.3} {:.3} {:.3}", a.x + a.hout[0], a.y + a.hout[1], b.x + b.hin[0], b.y + b.hin[1], b.x, b.y);
+        }
+        if c.closed {
+            d.push('Z');
+        }
+    }
+    d
 }
 
 /// Stroke kotak sebagai elemen sendiri, digeser ke dalam/luar sesuai posisi stroke.
 fn stroke_rect(out: &mut String, n: &Node, r: f32) {
     if n.stroke.is_none() || n.stroke_w <= 0.0 {
         return;
+    }
+    // Dashes around rounded corners start where the canvas starts them, not where an SVG
+    // `<rect>` would.
+    if n.dash > 0.0 && r > 0.0 {
+        if let Some(lines) = crate::outline::stroke_lines(n) {
+            let _ = write!(out, r#"<path d="{}" fill="none" {}/>"#, contour_d(&lines), stroke(n));
+            return;
+        }
     }
     let (x0, y0, x1, y1) = n.bounds();
     let i = n.stroke_inset();
@@ -48,7 +79,8 @@ fn stroke_rect(out: &mut String, n: &Node, r: f32) {
         r#"<rect x="{}" y="{}" width="{w}" height="{h}" rx="{}" fill="none" {}/>"#,
         x0 + i,
         y0 + i,
-        (r - i).max(0.0),
+        // Square corners stay square wherever the stroke is, as on the canvas.
+        if r > 0.0 { (r - i).max(0.0) } else { 0.0 },
         stroke(n)
     );
 }
@@ -545,7 +577,7 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
         Kind::Line => {
             let _ = write!(
                 out,
-                r#"<line x1="{}" y1="{}" x2="{}" y2="{}" {} stroke-linecap="round"/>"#,
+                r#"<line x1="{}" y1="{}" x2="{}" y2="{}" {}/>"#,
                 n.x,
                 n.y,
                 n.x + n.w,
@@ -581,7 +613,7 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
             let fill = if n.closed { fill(out, n) } else { r#"fill="none""#.to_owned() };
             let _ = write!(
                 out,
-                r#"<path d="{d}" {fill} fill-rule="evenodd" {} stroke-linejoin="round" stroke-linecap="round"/>"#,
+                r#"<path d="{d}" {fill} fill-rule="evenodd" {}/>"#,
                 stroke(n)
             );
         }
@@ -633,7 +665,8 @@ pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui:
     let (x0, y0, x1, y1) = match target {
         Some(n) => {
             // Stroke garis/path melebar keluar dari kotak pembatas.
-            let pad = if matches!(n.kind, Kind::Line | Kind::Path) && n.stroke.is_some() { n.stroke_w * 0.5 } else { 0.0 };
+            // (A square end reaches out by half the width along the line as well.)
+            let pad = if matches!(n.kind, Kind::Line | Kind::Path) && n.stroke.is_some() { n.stroke_w * if n.cap == 2 { 0.71 } else { 0.5 } } else { 0.0 };
             // Bayangan ikut masuk hasil export, kecuali untuk frame (ukuran halaman harus tetap).
             let pad = pad + n.shadow.filter(|s| s.color[3] > 0 && n.kind != Kind::Frame).map_or(0.0, |s| s.pad());
             // Begitu juga luberan layer blur.
@@ -1089,6 +1122,58 @@ mod tests {
         // Anggota yang bayangannya berbeda keluar dari bayangan bersama.
         doc.find_mut(3).unwrap().shadow = None;
         assert_eq!(crate::doc::shadow_run(&doc.nodes, 1), 2);
+    }
+
+    #[test]
+    fn export_draws_the_caps_and_joins_of_the_node() {
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        // A line from (20, 20) to (80, 20), 10 wide, on a white frame of 100 × 40.
+        let render = |cap: u8, fonts: &mut FontManager| {
+            let mut doc = Doc::default();
+            let mut frame = Node::new(doc.alloc_id(), Kind::Frame, 0.0, 0.0);
+            (frame.w, frame.h, frame.fill) = (100.0, 40.0, Some([255, 255, 255, 255]));
+            let mut line = Node::new(doc.alloc_id(), Kind::Line, 20.0, 20.0);
+            (line.w, line.h, line.stroke, line.stroke_w, line.cap) = (60.0, 0.0, Some([0, 0, 255, 255]), 10.0, cap);
+            frame.children.push(line);
+            let id = frame.id;
+            doc.insert(frame, None);
+            let (svg, w, h) = to_svg(&doc, Some(id), fonts, &ctx).unwrap();
+            let (png, _, _) = render_png(&svg, w, h, 1.0).unwrap();
+            (svg, image::load_from_memory(&png).unwrap().to_rgb8())
+        };
+        let blue = |img: &image::RgbImage, x: u32, y: u32| img.get_pixel(x, y)[0] < 60;
+        // Butt (what a document from before caps existed gets): nothing before the start.
+        let (svg, img) = render(0, &mut fonts);
+        assert!(!svg.contains("stroke-linecap") && !svg.contains("stroke-linejoin"), "{svg}");
+        assert!(blue(&img, 21, 20) && !blue(&img, 18, 20));
+        // Round: reaches 5 past the start on the axis, but not into the corner of that square.
+        let (svg, img) = render(1, &mut fonts);
+        assert!(svg.contains(r#"stroke-linecap="round""#));
+        assert!(blue(&img, 16, 20) && !blue(&img, 15, 15) && !blue(&img, 13, 20));
+        // Square: the corner too.
+        let (svg, img) = render(2, &mut fonts);
+        assert!(svg.contains(r#"stroke-linecap="square""#));
+        assert!(blue(&img, 16, 20) && blue(&img, 15, 15) && blue(&img, 84, 24) && !blue(&img, 13, 20));
+
+        // Joins of a path, and of a square whose stroke is outside (its corners stay square).
+        let mut path = Node::new(1, Kind::Path, 0.0, 0.0);
+        (path.w, path.h, path.stroke, path.stroke_w, path.join) = (10.0, 10.0, Some([0, 0, 0, 255]), 2.0, 2);
+        let p = |x, y| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2], r: None };
+        path.points = vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0)];
+        let mut out = String::new();
+        node_body(&mut out, &path, &Default::default(), &mut fonts, &ctx);
+        assert!(out.contains(r#"stroke-linejoin="bevel""#) && out.contains(r#"stroke-miterlimit="4""#) && !out.contains("linecap"), "{out}");
+        let mut rect = Node::new(2, Kind::Rect, 0.0, 0.0);
+        (rect.w, rect.h, rect.stroke, rect.stroke_w, rect.stroke_align) = (10.0, 10.0, Some([0, 0, 0, 255]), 4.0, Some(2));
+        let mut out = String::new();
+        node_body(&mut out, &rect, &Default::default(), &mut fonts, &ctx);
+        assert!(out.contains(r#"x="-2" y="-2" width="14" height="14" rx="0""#), "{out}");
+        // Dashes around rounded corners are written as a path that starts where the canvas does.
+        (rect.radius, rect.dash, rect.stroke_align) = (3.0, 2.0, Some(1));
+        let mut out = String::new();
+        node_body(&mut out, &rect, &Default::default(), &mut fonts, &ctx);
+        assert!(out.contains(r#"<path d="M7.000 0.000C"#) && out.contains(r#"stroke-dasharray="2 2""#), "{out}");
     }
 
     #[test]

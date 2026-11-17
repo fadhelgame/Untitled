@@ -1515,6 +1515,44 @@ fn add_dashed(sink: &mut Sink, mut pts: Vec<Pos2>, closed: bool, s: Stroke, n: &
     }
 }
 
+/// Draws the stroke of `n` from its own shape (see `stroke.rs`) where egui's plain lines would
+/// not show it as the export does: dashes, round or square ends, corners of a path, round or
+/// bevelled corners of a rectangle. Result false: nothing was drawn, the plain way is as good.
+fn styled_stroke(pc: &PaintCx, sink: &mut Sink, n: &Node, s: Stroke) -> bool {
+    let z = pc.view.zoom;
+    // Dashes too close together to be told apart are drawn as a solid line.
+    let dashed = n.dash > 0.0 && (n.dash + if n.gap > 0.0 { n.gap } else { n.dash }) * z >= 2.0;
+    let wanted = dashed
+        // Thinner than a pixel, ends and corners look the same whatever they are.
+        || s.width >= 1.0
+            && match n.kind {
+                Kind::Rect | Kind::Image => n.join != 0 && n.radius <= 0.0,
+                Kind::Frame => n.join != 0,
+                Kind::Line => n.cap != 0,
+                Kind::Path => true,
+                Kind::Ellipse | Kind::Text => false,
+            };
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // `KANVAS_PLAIN_STROKES`: egui's lines for every stroke (to compare the two, and their cost).
+    if !wanted || *OFF.get_or_init(|| std::env::var_os("KANVAS_PLAIN_STROKES").is_some()) {
+        return false;
+    }
+    let Some(lines) = crate::outline::stroke_lines(n) else { return false };
+    let mut style = crate::outline::stroke_style(n);
+    if !dashed {
+        style.dash = None;
+    }
+    let (view, o) = (pc.view, pc.o);
+    let feather = 1.0 / pc.ctx.pixels_per_point().max(0.1);
+    match super::stroke::mesh(&lines, &style, |x, y| view.to_screen(o, x, y), z, s.color, feather) {
+        Some(mesh) => {
+            sink.add(Shape::mesh(mesh));
+            true
+        }
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------- drop shadow
 
 /// Resolusi tekstur bayangan (piksel per satuan dokumen): tidak perlu lebih halus dari layar,
@@ -2123,7 +2161,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                     pc.depth -= 1;
                 }
             }
-            if let Some(s) = stroke {
+            if let Some(s) = stroke.filter(|s| !styled_stroke(pc, &mut sink, n, *s)) {
                 let inset = n.stroke_inset() * z;
                 if n.dash > 0.0 {
                     let pts = rounded_rect_points(r.shrink(inset), rad.nw as f32 - inset);
@@ -2154,7 +2192,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                     }
                 }
             }
-            if let Some(s) = stroke {
+            if let Some(s) = stroke.filter(|s| !styled_stroke(pc, &mut sink, n, *s)) {
                 let radius = (r.size() * 0.5 - egui::Vec2::splat(n.stroke_inset() * z)).max(egui::Vec2::ZERO);
                 if n.dash > 0.0 {
                     add_dashed(&mut sink, ellipse_points(r.center(), radius), true, s, n, z);
@@ -2172,7 +2210,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
             }
         }
         Kind::Line => {
-            if let Some(s) = stroke {
+            if let Some(s) = stroke.filter(|s| !styled_stroke(pc, &mut sink, n, *s)) {
                 let a = pc.view.to_screen(pc.o, n.x, n.y);
                 let b = pc.view.to_screen(pc.o, n.x + n.w, n.y + n.h);
                 if n.dash > 0.0 {
@@ -2230,7 +2268,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                     }
                 }
             }
-            if let Some(s) = stroke {
+            if let Some(s) = stroke.filter(|s| !styled_stroke(pc, &mut sink, n, *s)) {
                 if n.dash > 0.0 {
                     add_dashed(&mut sink, pts, n.closed, s, n, z);
                     for h in holes {

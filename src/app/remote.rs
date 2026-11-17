@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 
 /// Batas tunggu unduhan font sebelum teks diukur / gambar dirender dengan font cadangan.
 const FONT_WAIT: Duration = Duration::from_secs(8);
+/// Names of `Node::cap` and `Node::join`, by value.
+const CAPS: [&str; 3] = ["butt", "round", "square"];
+const JOINS: [&str; 3] = ["miter", "round", "bevel"];
 /// Di atas jumlah ini `get_document` hanya mengirim node level atas (tanpa anak).
 const DEEP_LIMIT: usize = 400;
 
@@ -387,6 +390,12 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     if let Some(c) = n.stroke.filter(|_| n.stroke_w > 0.0) {
         put("stroke", json!(hex(c)));
         put("stroke_width", r2(n.stroke_w));
+        if n.cap != 0 {
+            put("cap", json!(CAPS[n.cap.min(2) as usize]));
+        }
+        if n.join != 0 {
+            put("join", json!(JOINS[n.join.min(2) as usize]));
+        }
     }
     if n.radius != 0.0 {
         put("radius", r2(n.radius));
@@ -965,6 +974,17 @@ impl App {
                     }
                 }
                 "stroke_width" => n.stroke_w = num(k, v)?.max(0.0),
+                "cap" | "join" => {
+                    let names = if k == "cap" { CAPS } else { JOINS };
+                    let name = if v.is_null() { names[0].to_owned() } else { string(k, v)?.to_lowercase() };
+                    let at = names.iter().position(|c| *c == name || (name == "mitre" && *c == "miter"));
+                    let at = at.ok_or_else(|| format!("unknown {k} \"{name}\"; use one of: {}", names.join(", ")))? as u8;
+                    if k == "cap" {
+                        n.cap = at;
+                    } else {
+                        n.join = at;
+                    }
+                }
                 "radius" => n.radius = num(k, v)?.max(0.0),
                 "shadow" => {
                     n.shadow = if v.is_null() {

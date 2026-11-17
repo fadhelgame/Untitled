@@ -33,6 +33,7 @@ mod presets;
 pub mod rembg;
 mod remote;
 mod rulers;
+mod stroke;
 mod styles;
 mod svg;
 pub(crate) mod render;
@@ -2579,6 +2580,12 @@ impl App {
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_SVG") {
                     self.bench_svg(&mode, &mut b.inject);
                 }
+                // `KANVAS_BENCH_CAPS=1`: strokes with every cap and join, solid and dashed, beside
+                // the export of the same frame (see `bench_caps`). `=view:x0,y0,x1,y1`: that part.
+                // `=panel`: a dashed path is selected and the panel scrolled to its Stroke section.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_CAPS") {
+                    self.bench_caps(ctx, &mode, &b.out, &mut b.inject);
+                }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
                     let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
@@ -3192,6 +3199,9 @@ impl App {
                         let sel: Vec<(String, Kind)> = self.sel.iter().filter_map(|id| self.doc.find(*id)).map(|n| (n.name.clone(), n.kind)).collect();
                         eprintln!("SVG selection {sel:?}; status: {}", self.status);
                     }
+                }
+                if std::env::var_os("KANVAS_BENCH_CAPS").is_some() && (250..=255).contains(&b.frame) {
+                    eprintln!("CAPS frame {}: {:.2} ms", b.frame, self.frame_ms);
                 }
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_TYPO") {
                     if (250..=255).contains(&b.frame) {

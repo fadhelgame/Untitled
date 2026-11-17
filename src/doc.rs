@@ -341,6 +341,13 @@ pub struct Node {
     /// objeknya (kotak, frame, gambar: dalam; lainnya: tengah).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stroke_align: Option<u8>,
+    /// Ends of an open stroke and of each dash: 0 butt, 1 round, 2 square.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub cap: u8,
+    /// Corners of a stroke: 0 miter (cut off to a bevel where the corner is sharper than the
+    /// miter limit of 4 allows, as in SVG), 1 round, 2 bevel.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub join: u8,
     /// Drop shadow di belakang objek.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<Shadow>,
@@ -731,6 +738,8 @@ impl Node {
             dash: 0.0,
             gap: 0.0,
             stroke_align: None,
+            cap: 0,
+            join: 0,
             shadow: None,
             blur: 0.0,
             fill_style: None,
@@ -2264,6 +2273,19 @@ mod tests {
         assert!(!doc.delete_page(0));
         assert_eq!((doc.page, doc.page_count(), doc.nodes[0].id), (0, 1, b));
         // File lama tanpa daftar halaman tetap terbuka sebagai satu halaman.
+        // A node saved before strokes had caps and joins: butt ends and mitred corners, as the
+        // canvas drew it then. Only values that were set are written.
+        let plain = r#"{"id":1,"name":"L","kind":"Line","x":0,"y":0,"w":10,"h":0,"stroke":[0,0,0,255],"stroke_w":2}"#;
+        let mut line: Node = serde_json::from_str(plain).unwrap();
+        assert_eq!((line.cap, line.join), (0, 0));
+        assert_eq!((Node::new(1, Kind::Path, 0.0, 0.0).cap, Node::new(1, Kind::Path, 0.0, 0.0).join), (0, 0));
+        let json = serde_json::to_string(&line).unwrap();
+        assert!(!json.contains("\"cap\"") && !json.contains("\"join\""), "{json}");
+        (line.cap, line.join) = (1, 2);
+        let json = serde_json::to_string(&line).unwrap();
+        assert!(json.contains("\"cap\":1") && json.contains("\"join\":2"), "{json}");
+        let back: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!((back.cap, back.join), (1, 2));
         let old: Doc = serde_json::from_str(r#"{"nodes":[]}"#).unwrap();
         assert_eq!((old.page_count(), old.page_id()), (1, 0));
     }

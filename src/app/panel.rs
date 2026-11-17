@@ -7,6 +7,20 @@ use crate::layout::Sizing;
 
 const FORMATS: [&str; 4] = ["PNG", "JPG", "SVG", "PDF"];
 
+/// A combo box for a property that is one of a few named values (`value` = its index).
+fn choice(ui: &mut egui::Ui, salt: &str, width: f32, label: &str, names: &[&str], value: &mut u8) -> egui::Response {
+    let shown = names[(*value as usize).min(names.len() - 1)];
+    egui::ComboBox::from_id_salt(salt)
+        .width(width - 8.0)
+        .selected_text(format!("{label}  {shown}"))
+        .show_ui(ui, |ui| {
+            for (i, name) in names.iter().enumerate() {
+                ui.selectable_value(value, i as u8, *name);
+            }
+        })
+        .response
+}
+
 impl App {
     pub(super) fn props(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -328,6 +342,26 @@ impl App {
                                 .on_hover_text("Space between dashes; 0 = same as the dash");
                         });
                     });
+                    // Ends: of a line, an open path, and of every dash. Corners: of a path and of
+                    // a rectangle that has no corner radius.
+                    let ends = matches!(n.kind, Kind::Line) || (n.kind == Kind::Path && !n.closed) || n.dash > 0.0;
+                    let corners = match n.kind {
+                        Kind::Path | Kind::Frame => true,
+                        Kind::Rect | Kind::Image => n.radius <= 0.0,
+                        _ => false,
+                    };
+                    if ends || corners {
+                        ui.horizontal(|ui| {
+                            if ends {
+                                choice(ui, "stroke_cap", half, "Cap", &["Butt", "Round", "Square"], &mut n.cap)
+                                    .on_hover_text("Ends of the stroke and of each dash: cut off at the end point, rounded, or squared off half the weight past it");
+                            }
+                            if corners {
+                                choice(ui, "stroke_join", half, "Join", &["Miter", "Round", "Bevel"], &mut n.join)
+                                    .on_hover_text("Corners of the stroke: pointed (very sharp corners are cut off), rounded, or cut off");
+                            }
+                        });
+                    }
                 }
             }
             effects_section(

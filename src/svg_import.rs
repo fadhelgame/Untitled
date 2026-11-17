@@ -291,6 +291,17 @@ impl Cx {
         let k = scale_of(ts);
         n.stroke = Some(flat_color(stroke.paint(), stroke.opacity().get()));
         n.stroke_w = stroke.width().get() * k;
+        n.cap = match stroke.linecap() {
+            usvg::LineCap::Butt => 0,
+            usvg::LineCap::Round => 1,
+            usvg::LineCap::Square => 2,
+        };
+        // (The miter limit of the file is not kept: Kanvas always uses 4, the default of SVG.)
+        n.join = match stroke.linejoin() {
+            usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => 0,
+            usvg::LineJoin::Round => 1,
+            usvg::LineJoin::Bevel => 2,
+        };
         if let Some(d) = stroke.dasharray().filter(|d| !d.is_empty()) {
             n.dash = d[0] * k;
             n.gap = d.get(1).copied().unwrap_or(d[0]) * k;
@@ -511,6 +522,11 @@ mod tests {
         let n = &got.root.children[0];
         assert_eq!((got.shapes, n.closed, n.fill, n.points.len()), (1, false, None, 3));
         assert_eq!((n.stroke, n.stroke_w, n.dash, n.gap), (Some([0x12, 0x34, 0x56, 128]), 6.0, 8.0, 4.0));
+        // Ends and corners: butt and miter unless the file says otherwise.
+        assert_eq!((n.cap, n.join), (0, 0));
+        let got = svg(r##"<path d="M0 0L10 0L10 10" fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="bevel"/><line x2="5" fill="none" stroke="#000" stroke-linecap="square" stroke-linejoin="round"/>"##);
+        let ends: Vec<(u8, u8)> = got.root.children.iter().map(|n| (n.cap, n.join)).collect();
+        assert_eq!(ends, vec![(1, 2), (2, 1)], "{:?}", got.root.children.iter().map(|n| n.name.clone()).collect::<Vec<_>>());
         assert!(boxed(n, (20.0, 20.0, 40.0, 40.0)));
         // Filled and stroked, with an open part: the fill closes it, the stroke does not.
         let got = svg(r##"<path d="M10 10H50V50" fill="#ff0000" stroke="#000"/>"##);
