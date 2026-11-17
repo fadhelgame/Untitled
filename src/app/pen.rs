@@ -264,7 +264,7 @@ impl App {
         // Belum menggambar: path yang terpilih bisa ditambah/dikurangi titiknya atau dilanjutkan.
         let wp = view.to_world(o, p);
         for &id in self.sel.iter().rev() {
-            let Some(n) = self.doc.find(id).filter(|n| n.kind == Kind::Path && n.visible) else { continue };
+            let Some(n) = self.doc.find(id).filter(|n| n.kind == Kind::Path && n.visible && n.source.is_none()) else { continue };
             let g = geo(n);
             if let Some((c, i)) = g.hit_point(s, p) {
                 let end = c == 0 && !g.closed && (i == 0 || i + 1 == g.cs[0].len());

@@ -175,6 +175,11 @@ impl App {
         if self.locked(id) {
             return;
         }
+        // Cropping moves and resizes the box, which a part of an instance takes from its main.
+        if n.source.is_some() {
+            self.status = "An image inside an instance is cropped in the main component (or detach the instance first).".into();
+            return;
+        }
         self.crop = Some(Session { id, orig: (n.x, n.y, n.w, n.h, n.crop) });
         self.sel = vec![id];
         self.tool = Tool::Select;

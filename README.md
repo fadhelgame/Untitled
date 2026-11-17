@@ -144,6 +144,8 @@ Every screenshot here is the real app.
       The <b>Polygon / star</b> tool makes regular polygons and stars with any number of points. Draw with the <b>Pen</b>: click for corners, drag for curves. Double-click any path to edit its points, add or remove anchors, or continue an open path.
       <br><br>
       The <b>Shape builder</b> splits overlapping shapes into regions. Drag across regions to merge them, Alt-click to remove them. The result is clean bezier curves, not jagged polygons.
+      <h3>Components</h3>
+      Turn a frame into a <b>component</b> (<code>Ctrl+Alt+K</code>) and every copy of it is an <b>instance</b>: change the main component and all its instances follow, on every page. An instance keeps what you changed on it (a label, a color, a photo) and still takes everything else from the main; it can be resized, and components can hold instances of other components. The <i>Components</i> button in the toolbar lists them all, one click to place.
       <h3>Select smarter</h3>
       The <b>Magic wand</b> selects every object that shares a property with the one you click, with a tolerance for near-matching colors. Objects snap to edges and centers of their neighbors with guide lines as you move them. Turn on <b>rulers</b> with <code>Shift+R</code> and drag <b>guides</b> out of them; objects snap to guides too.
       <h3>Images</h3>
@@ -166,7 +168,7 @@ Every screenshot here is the real app.
     </td>
     <td width="33%" valign="top">
       <h4>🗃️ Layers</h4>
-      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree that follows nested frames to any depth, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
+      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree that follows nested frames to any depth, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, components and instances, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
     </td>
     <td width="33%" valign="top">
       <h4>💾 Files</h4>
@@ -210,6 +212,8 @@ Every screenshot here is the real app.
 | `I` | Eyedropper | `Alt+H` `V` | Align centers |
 | | | `Enter` / `Shift+Enter` | Select what is inside a frame / the frame around the selection |
 | | | `Ctrl` + click | Select the deepest object under the pointer |
+| | | `Ctrl+Alt+K` | Create a component from the selection |
+| | | `Ctrl+Alt+B` | Detach an instance from its main component |
 | | | `Shift+X` | Swap fill and stroke |
 | | | `Ctrl+V` | Paste at the pointer |
 | | | `Ctrl+Shift+V` | Paste in place (same position, in the frame under the pointer) |

@@ -329,6 +329,16 @@ pub struct Node {
     pub stroke_style: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_style: Option<u64>,
+    /// Main component: instances of it (frames whose `instance_of` is this id) follow its
+    /// changes. See `component.rs`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub component: bool,
+    /// Instance: the id of the main component this frame is a copy of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_of: Option<u64>,
+    /// Inside an instance: the id of the node in the main component that this one mirrors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<u64>,
     #[serde(default)]
     pub children: Vec<Node>,
 }
@@ -595,7 +605,8 @@ fn gather<T>(v: &mut Vec<T>, is: impl Fn(&T) -> bool) {
 
 /// The front-most visible, unlocked node of a sibling list under a point. A frame under the
 /// point gives way to what it holds, up to `depth` levels further down (0 = the frame itself);
-/// a hidden or locked frame hides or locks everything in it.
+/// a hidden or locked frame hides or locks everything in it. An instance at the top level is
+/// picked as a whole by a plain click (`depth` 1), like a nested frame.
 fn hit_list<T: AsRef<Node>>(list: &[T], x: f32, y: f32, tol: f32, depth: usize) -> Option<&Node> {
     for n in list.iter().rev().map(|n| n.as_ref()) {
         if !n.visible || n.locked {
@@ -603,7 +614,7 @@ fn hit_list<T: AsRef<Node>>(list: &[T], x: f32, y: f32, tol: f32, depth: usize) 
         }
         if n.kind == Kind::Frame {
             if n.contains(x, y, 0.0) {
-                let inner = if depth > 0 { hit_list(&n.children, x, y, tol, depth - 1) } else { None };
+                let inner = if depth > 0 && !(depth == 1 && n.instance_of.is_some()) { hit_list(&n.children, x, y, tol, depth - 1) } else { None };
                 return Some(inner.unwrap_or(n));
             }
         } else if n.contains(x, y, tol) {
@@ -674,6 +685,9 @@ impl Node {
             fill_style: None,
             stroke_style: None,
             type_style: None,
+            component: false,
+            instance_of: None,
+            source: None,
             children: Vec::new(),
         }
     }
@@ -719,6 +733,41 @@ impl Node {
         self.y += dy;
         for c in &mut self.children {
             c.translate(dx, dy);
+        }
+    }
+
+    /// Regangkan node mengikuti kotak seleksi: kotak asal berpojok `from` dipetakan ke pojok
+    /// `to` dengan skala (sx, sy). Stroke, radius, dan ukuran font tidak berubah (itu tugas Scale tool).
+    pub fn stretch(&mut self, from: (f32, f32), to: (f32, f32), (sx, sy): (f32, f32)) {
+        let map = |x: f32, y: f32| (to.0 + (x - from.0) * sx, to.1 + (y - from.1) * sy);
+        if self.kind == Kind::Line && self.rotation == 0.0 {
+            (self.x, self.y) = map(self.x, self.y);
+            self.w *= sx;
+            self.h *= sy;
+        } else {
+            let (cx, cy) = self.center();
+            let (cx, cy) = map(cx, cy);
+            // Node berputar: sumbu lokalnya ikut teregang sesuai arahnya.
+            let (sin, cos) = self.rotation.to_radians().sin_cos();
+            let (kw, kh) = ((sx * cos).hypot(sy * sin), (sx * sin).hypot(sy * cos));
+            match self.kind {
+                // Tinggi teks mengikuti isinya; teks lebar-otomatis hanya berpindah tempat.
+                Kind::Text if self.wrap => self.w = (self.w * kw).max(1.0),
+                Kind::Text => {}
+                Kind::Line => {
+                    self.w *= kw;
+                    self.h *= kh;
+                }
+                _ => {
+                    self.w = (self.w * kw).max(1.0);
+                    self.h = (self.h * kh).max(1.0);
+                }
+            }
+            self.x = cx - self.w * 0.5;
+            self.y = cy - self.h * 0.5;
+        }
+        for c in &mut self.children {
+            c.stretch(from, to, (sx, sy));
         }
     }
 
@@ -1816,13 +1865,14 @@ impl Doc {
 
     /// The deepest visible frame under this point; frames in `exclude` (and so everything in
     /// them) are passed over. Content outside its frame is clipped away, so a nested frame only
-    /// counts where its parents show it.
+    /// counts where its parents show it. Instances are passed over as well: what they hold is
+    /// decided by their main component, so nothing gets dropped into them.
     pub fn frame_at(&self, x: f32, y: f32, exclude: &[u64]) -> Option<u64> {
         fn deepest<'a, T: AsRef<Node>>(list: &'a [T], x: f32, y: f32, exclude: &[u64]) -> Option<&'a Node> {
             list.iter()
                 .rev()
                 .map(|n| n.as_ref())
-                .find(|n| n.kind == Kind::Frame && n.visible && !exclude.contains(&n.id) && n.contains(x, y, 0.0))
+                .find(|n| n.kind == Kind::Frame && n.visible && n.instance_of.is_none() && !exclude.contains(&n.id) && n.contains(x, y, 0.0))
                 .map(|n| deepest(&n.children, x, y, exclude).unwrap_or(n))
         }
         deepest(&self.nodes, x, y, exclude).map(|n| n.id)

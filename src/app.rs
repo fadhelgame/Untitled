@@ -12,6 +12,7 @@ mod assist;
 pub(crate) mod blend;
 mod builder;
 mod canvas;
+mod components;
 mod corners;
 mod crop;
 mod home;
@@ -185,41 +186,6 @@ fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
     }
 }
 
-/// Regangkan node mengikuti kotak seleksi: kotak asal berpojok (x0, y0) dipetakan ke pojok
-/// (nx, ny) dengan skala (sx, sy). Stroke, radius, dan ukuran font tidak berubah (itu tugas Scale tool).
-fn stretch_node(n: &mut Node, (x0, y0): (f32, f32), (nx, ny): (f32, f32), (sx, sy): (f32, f32)) {
-    let map = |x: f32, y: f32| (nx + (x - x0) * sx, ny + (y - y0) * sy);
-    if n.kind == Kind::Line && n.rotation == 0.0 {
-        (n.x, n.y) = map(n.x, n.y);
-        n.w *= sx;
-        n.h *= sy;
-    } else {
-        let (cx, cy) = n.center();
-        let (cx, cy) = map(cx, cy);
-        // Node berputar: sumbu lokalnya ikut teregang sesuai arahnya.
-        let (sin, cos) = n.rotation.to_radians().sin_cos();
-        let (kw, kh) = ((sx * cos).hypot(sy * sin), (sx * sin).hypot(sy * cos));
-        match n.kind {
-            // Tinggi teks mengikuti isinya; teks lebar-otomatis hanya berpindah tempat.
-            Kind::Text if n.wrap => n.w = (n.w * kw).max(1.0),
-            Kind::Text => {}
-            Kind::Line => {
-                n.w *= kw;
-                n.h *= kh;
-            }
-            _ => {
-                n.w = (n.w * kw).max(1.0);
-                n.h = (n.h * kh).max(1.0);
-            }
-        }
-        n.x = cx - n.w * 0.5;
-        n.y = cy - n.h * 0.5;
-    }
-    for c in &mut n.children {
-        stretch_node(c, (x0, y0), (nx, ny), (sx, sy));
-    }
-}
-
 /// Putar node sebesar `deg` derajat terhadap titik `pivot` (memutar beberapa objek bersama):
 /// pusat node ikut berpindah mengelilingi pivot, dan rotasinya sendiri bertambah.
 fn spin_node(n: &mut Node, (px, py): (f32, f32), deg: f32) {
@@ -271,7 +237,7 @@ mod tests {
         let mut label = Node::new(3, Kind::Text, 80.0, 40.0);
         (label.w, label.h) = (40.0, 20.0);
         for n in [&mut a, &mut b, &mut label] {
-            stretch_node(n, (0.0, 0.0), (10.0, 20.0), (2.0, 0.5));
+            n.stretch((0.0, 0.0), (10.0, 20.0), (2.0, 0.5));
         }
         assert_eq!((a.x, a.y, a.w, a.h), (10.0, 20.0, 100.0, 50.0));
         assert_eq!((b.x, b.y, b.w, b.h), (310.0, 50.0, 100.0, 20.0));
@@ -417,6 +383,8 @@ pub struct App {
     crop: Option<crop::Session>,
     /// The About window is open.
     about: bool,
+    /// The Components window, and what instances were last synced against.
+    components: components::Components,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -503,6 +471,7 @@ impl App {
             library: library::Library::new(library_dir),
             crop: None,
             about: false,
+            components: Default::default(),
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -571,6 +540,8 @@ impl App {
     fn after_history(&mut self) {
         let doc = &self.doc;
         self.sel.retain(|id| doc.find(*id).is_some());
+        // The restored document is already consistent; an undone change is not one to follow.
+        self.components.rebase();
         self.touch();
     }
 
@@ -618,6 +589,9 @@ impl App {
     }
 
     fn align(&mut self, mode: u8) {
+        if self.refuse_pinned() {
+            return;
+        }
         let ids = self.roots();
         // Satu objek: rata terhadap frame induknya. Banyak objek: terhadap kotak seleksi.
         let target = if ids.len() == 1 {
@@ -677,7 +651,7 @@ impl App {
     }
 
     fn step_order(&mut self, up: bool) {
-        if self.sel.is_empty() {
+        if self.sel.is_empty() || self.refuse_pinned() {
             return;
         }
         let pre = self.doc.clone();
@@ -712,8 +686,10 @@ impl App {
         let label = || self.labels.iter().rev().find(|(id, r)| r.contains(p) && !self.locked(*id)).map(|(id, _)| *id);
         if let Some(first) = self.sel.first() {
             let around = self.doc.ancestors(*first);
-            // The last one is the top-level frame, which the usual rule below covers.
-            for scope in around.iter().take(around.len().saturating_sub(1)) {
+            // The last one is the top-level frame, which the usual rule below covers, unless it
+            // is an instance: a plain click picks that as a whole.
+            let whole = around.last().is_some_and(|top| self.doc.find(*top).is_some_and(|n| n.instance_of.is_some()));
+            for scope in around.iter().take(around.len().saturating_sub(!whole as usize)) {
                 if let Some(id) = self.doc.hit_within(*scope, wp.x, wp.y, tol) {
                     return Some(id);
                 }
@@ -732,12 +708,12 @@ impl App {
     /// begitu juga frame di dalam frame (tidak punya label).
     fn body_locked(&self, id: u64) -> bool {
         self.doc.nodes.iter().find(|n| n.id == id).is_some_and(|n| {
-            n.kind == Kind::Frame && n.children.iter().any(|c| c.visible) && n.w * self.view.zoom > 36.0
+            n.kind == Kind::Frame && n.instance_of.is_none() && n.children.iter().any(|c| c.visible) && n.w * self.view.zoom > 36.0
         })
     }
 
     fn handle_at(&self, p: Pos2) -> Option<(u64, u8)> {
-        if self.sel.len() != 1 || !self.pointer_tool() || self.sel_locked() || self.crop.is_some() {
+        if self.sel.len() != 1 || !self.pointer_tool() || self.sel_locked() || self.sel_pinned() || self.crop.is_some() {
             return None;
         }
         let n = self.doc.find(self.sel[0])?;
@@ -763,7 +739,7 @@ impl App {
     }
 
     fn multi_handle_at(&self, p: Pos2) -> Option<u8> {
-        if self.sel_locked() {
+        if self.sel_locked() || self.sel_pinned() {
             return None;
         }
         let (x0, y0, x1, y1) = self.sel_box()?;
@@ -820,6 +796,9 @@ impl App {
             self.status = "Select two or more objects to group.".into();
             return;
         }
+        if self.refuse_pinned() {
+            return;
+        }
         let pre = self.doc.clone();
         self.doc.group(&ids);
         self.sel = ids;
@@ -829,7 +808,7 @@ impl App {
 
     fn ungroup_selection(&mut self) {
         let groups = self.selected_groups();
-        if groups.is_empty() {
+        if groups.is_empty() || self.refuse_pinned() {
             return;
         }
         let pre = self.doc.clone();
@@ -848,6 +827,9 @@ impl App {
         let ids = self.clip_targets();
         if ids.is_empty() {
             self.status = "Select a layer (not a frame) to make a clipping mask.".into();
+            return;
+        }
+        if self.refuse_pinned() {
             return;
         }
         let pre = self.doc.clone();
@@ -897,7 +879,7 @@ impl App {
     // ------------------------------------------------------------ editing ops
 
     fn delete_selection(&mut self) {
-        if self.sel.is_empty() {
+        if self.sel.is_empty() || self.refuse_pinned() {
             return;
         }
         let pre = self.doc.clone();
@@ -1025,11 +1007,16 @@ impl App {
         self.doc.regroup(&mut nodes);
         self.sel.clear();
         for mut n in nodes {
-            self.doc.reassign_ids(&mut n);
+            // A copy of a main component is an instance of it (see `Doc::settle_copy`).
+            if !self.doc.settle_copy(&mut n) {
+                self.doc.reassign_ids(&mut n);
+            }
             n.translate(offset.x, offset.y);
             let (cx, cy) = n.center();
-            let roomy = |p: &u64| n.kind != Kind::Frame || self.doc.find(*p).is_some_and(|f| n.w < f.w && n.h < f.h);
+            let roomy = |p: &u64| !self.doc.in_instance(*p) && (n.kind != Kind::Frame || self.doc.find(*p).is_some_and(|f| n.w < f.w && n.h < f.h));
             let parent = parent.filter(roomy).or_else(|| self.doc.frame_for(&n, cx, cy, &[]));
+            // Where it would come to contain itself, it goes to the top level instead.
+            let parent = parent.filter(|_| self.may_enter(&n, parent));
             self.sel.push(n.id);
             self.doc.insert(n, parent);
         }
@@ -1038,7 +1025,7 @@ impl App {
 
     fn nudge(&mut self, dx: f32, dy: f32) {
         let ids = self.roots();
-        if ids.is_empty() || self.sel_locked() {
+        if ids.is_empty() || self.sel_locked() || self.refuse_pinned() {
             return;
         }
         let pre = self.doc.clone();
@@ -1051,7 +1038,7 @@ impl App {
     }
 
     fn reorder(&mut self, to_front: bool) {
-        if self.sel.is_empty() {
+        if self.sel.is_empty() || self.refuse_pinned() {
             return;
         }
         let pre = self.doc.clone();
@@ -1070,7 +1057,12 @@ impl App {
         let Some(id) = self.editing.take() else { return };
         let pre = self.edit_pre.take();
         let empty = self.doc.find(id).map_or(true, |n| n.text.trim().is_empty());
-        if empty {
+        if empty && self.doc.pinned(id) {
+            // A part of an instance can't be removed: emptied, it gets its text back.
+            if let (Some(old), Some(n)) = (pre.as_ref().and_then(|d| d.find(id)).cloned(), self.doc.find_mut(id)) {
+                *n = old;
+            }
+        } else if empty {
             self.doc.remove(id);
             self.sel.retain(|s| *s != id);
         }
@@ -1110,6 +1102,7 @@ impl App {
         self.drag = Drag::None;
         self.dirty = false;
         self.fit_pending = true;
+        self.components.rebase();
         self.pages.reset();
         self.warm_fonts();
     }
@@ -1284,8 +1277,10 @@ impl App {
         if ctx.wants_keyboard_input() || self.editing.is_some() {
             return;
         }
-        let (clip_mask, redo, undo, dup, all, ungroup, group) = ctx.input_mut(|i| {
+        let (component, detach, clip_mask, redo, undo, dup, all, ungroup, group) = ctx.input_mut(|i| {
             (
+                i.consume_key(cmd | Modifiers::ALT, Key::K),
+                i.consume_key(cmd | Modifiers::ALT, Key::B),
                 // Sebelum Ctrl+G: pola tanpa Alt juga cocok dengan Ctrl+Alt+G.
                 i.consume_key(cmd | Modifiers::ALT, Key::G),
                 i.consume_key(cmd | Modifiers::SHIFT, Key::Z) || i.consume_key(cmd, Key::Y),
@@ -1296,6 +1291,11 @@ impl App {
                 i.consume_key(cmd, Key::G),
             )
         });
+        if component {
+            self.create_component();
+        } else if detach {
+            self.detach_selection();
+        }
         if clip_mask {
             self.toggle_clip();
         } else if ungroup {
@@ -1430,7 +1430,10 @@ impl App {
                         // Seperti Figma: Enter masuk mode edit dengan seluruh teks terseleksi.
                         self.ext.edit_pending = Some(render::EditPending::All);
                     } else if self.doc.find(id).is_some_and(|n| n.kind == Kind::Path) {
-                        self.start_path_edit(id);
+                        // The points of a part of an instance are those of the main.
+                        if !self.refuse_pinned() {
+                            self.start_path_edit(id);
+                        }
                     } else if let Some(f) = self.doc.find(id).filter(|n| n.kind == Kind::Frame) {
                         // Frame: Enter memilih isinya (satu tingkat ke dalam), seperti Figma.
                         let inside: Vec<u64> = f.children.iter().filter(|c| c.visible && !c.locked).map(|c| c.id).collect();
@@ -1563,6 +1566,16 @@ impl App {
                     self.ungroup_selection();
                 }
                 ui.separator();
+                if ui.add_enabled(has_sel, egui::Button::new("Create component").shortcut_text("Ctrl+Alt+K")).clicked() {
+                    ui.close_menu();
+                    self.create_component();
+                }
+                let instance = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.is_instance()));
+                if ui.add_enabled(instance, egui::Button::new("Detach instance").shortcut_text("Ctrl+Alt+B")).clicked() {
+                    ui.close_menu();
+                    self.detach_selection();
+                }
+                ui.separator();
                 if ui.add(egui::Button::new("Bring to front").shortcut_text("]")).clicked() {
                     ui.close_menu();
                     self.reorder(true);
@@ -1678,6 +1691,7 @@ impl App {
         let can_clip = !targets.is_empty();
         let clipped = can_clip && targets.iter().all(|id| self.doc.find(*id).is_some_and(|n| n.clip));
         let grouped = !self.selected_groups().is_empty();
+        let detachable = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.is_instance()));
         // Warna penanda yang sama di seluruh pilihan (untuk menandai bulatan aktif di menu).
         let sel_tag = {
             let mut tags = self.sel.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.tag);
@@ -1698,6 +1712,9 @@ impl App {
             ui.separator();
             item(ui, true, "Group", "Ctrl+G", 1);
             item(ui, grouped, "Ungroup", "Ctrl+Shift+G", 2);
+            ui.separator();
+            item(ui, true, "Create component", "Ctrl+Alt+K", 6);
+            item(ui, detachable, "Detach instance", "Ctrl+Alt+B", 7);
             ui.separator();
             item(ui, true, "Bring to front", "]", 3);
             item(ui, true, "Send to back", "[", 4);
@@ -1900,8 +1917,18 @@ impl App {
                     Kind::Path => "✎",
                     Kind::Image => "▣",
                 };
-                painter.text(pos2(x + 5.0, rect.center().y), Align2::CENTER_CENTER, tag, FontId::proportional(13.0), ui.visuals().weak_text_color());
-                let color = if n.visible { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
+                // Mains and instances: their own icon and colour, as on the canvas.
+                let linked = n.is_linked();
+                if linked {
+                    components::component_icon(&painter, pos2(x + 5.0, rect.center().y), n.component, components::PURPLE);
+                } else {
+                    painter.text(pos2(x + 5.0, rect.center().y), Align2::CENTER_CENTER, tag, FontId::proportional(13.0), ui.visuals().weak_text_color());
+                }
+                let color = match (n.visible, linked) {
+                    (true, true) => Color32::from_rgb(190, 150, 255),
+                    (true, false) => ui.visuals().text_color(),
+                    (false, _) => ui.visuals().weak_text_color(),
+                };
                 let weight = if is_frame { FontId::new(14.0, theme::strong()) } else { FontId::proportional(14.0) };
                 painter.text(pos2(x + 22.0, rect.center().y), Align2::LEFT_CENTER, &n.name, weight, color);
                 // Gembok di ujung kanan baris: selalu tampil kalau terkunci, samar saat baris disorot.
@@ -1986,7 +2013,15 @@ impl App {
                 self.layer_drag = Some(ids);
             } else if let Some(d) = target.filter(|_| !esc) {
                 let pre = self.doc.clone();
-                if self.doc.move_nodes(&ids, d.parent, d.anchor, d.group) {
+                // Parts of an instance stay where the main has them, and nothing moves into one.
+                let moved: Vec<Node> = self.doc.roots_of(&ids).iter().filter_map(|id| self.doc.find(*id).cloned()).collect();
+                let allowed = if moved.iter().any(|n| n.source.is_some()) {
+                    self.status = "Layers of an instance follow the main component: reorder them there, or detach the instance (Ctrl+Alt+B).".into();
+                    false
+                } else {
+                    moved.iter().all(|n| self.may_enter(n, d.parent))
+                };
+                if allowed && self.doc.move_nodes(&ids, d.parent, d.anchor, d.group) {
                     if let Some(open) = d.open {
                         self.expanded.insert(open);
                     }
@@ -2055,6 +2090,8 @@ impl App {
             Some(3) => self.reorder(true),
             Some(4) => self.reorder(false),
             Some(5) => self.delete_selection(),
+            Some(6) => self.create_component(),
+            Some(7) => self.detach_selection(),
             Some(c @ 10..=18) => {
                 self.edit_selected(|n| n.tag = c - 10);
                 self.status = if c == 10 { "Layer color removed.".into() } else { format!("Layer color: {}.", LAYER_COLORS[(c - 10) as usize].0) };
@@ -2187,6 +2224,27 @@ impl App {
                     b.inject.push((630, button(to, false)));
                     let (from, to) = (at(560.0, 330.0), at(740.0, 440.0));
                     b.inject.extend([(702, mv(from)), (704, button(from, true)), (706, mv(from + (to - from) * 0.5)), (708, mv(to)), (710, button(to, false))]);
+                }
+                // `KANVAS_BENCH_COMPONENT=1`: a main component and two instances (see `bench_component`;
+                // one twice the size, one with a label and fill of its own). The main is restyled at
+                // frames 220 and 226, as a user would. Then with the mouse: a click on the large
+                // instance (selects it as a whole), a double-click (the part under the pointer), and
+                // a drag of that part (must not move). Last, the remote commands: an instance made
+                // with a size of its own, edits that must be refused, the main recoloured.
+                // The outcome is printed to stderr.
+                // `=window` also opens the Components window.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_COMPONENT") {
+                    b.ids = self.bench_component();
+                    self.components.open = mode == "window";
+                    let (o, c) = (self.canvas_rect.min, self.doc.find(b.ids[3]).map_or((0.0, 0.0), |n| n.center()));
+                    let at = self.view.to_screen(o, c.0, c.1);
+                    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                    let mv = egui::Event::PointerMoved;
+                    let click = |f: u32, p: Pos2| [(f, mv(p)), (f + 2, button(p, true)), (f + 3, button(p, false))];
+                    b.inject.extend(click(300, at));
+                    b.inject.extend(click(440, at).into_iter().chain(click(444, at)));
+                    let to = at + vec2(90.0, 60.0);
+                    b.inject.extend([(580, mv(at)), (582, button(at, true)), (584, mv(at + (to - at) * 0.5)), (586, mv(to)), (590, button(to, false)), (596, mv(to + vec2(0.0, 200.0)))]);
                 }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
@@ -2521,6 +2579,73 @@ impl App {
                 if b.frame == 240 && std::env::var("KANVAS_BENCH_OVERLAY").is_ok() {
                     self.edit_selected(|n| n.fill = Some([0, 102, 227, 255]));
                 }
+                let component = b.ids.len() == 6 && std::env::var_os("KANVAS_BENCH_COMPONENT").is_some();
+                if component {
+                    let (main_rect, main_label, wide, own) = (b.ids[1], b.ids[2], b.ids[3], b.ids[4]);
+                    let look = |app: &Self, id: u64| -> Vec<String> {
+                        let parts = app.doc.find(id).map(|n| n.children.iter().collect::<Vec<_>>()).unwrap_or_default();
+                        parts.iter().map(|c| format!("{} fill {:?} radius {} text {:?} size {} at ({:.0}, {:.0}) {:.0}x{:.0}", c.name, c.fill.map(|f| [f[0], f[1], f[2]]), c.radius, c.text, c.font_size, c.x, c.y, c.w, c.h)).collect()
+                    };
+                    let names = |app: &Self| app.sel.iter().filter_map(|id| app.doc.find(*id)).map(|n| (n.name.clone(), n.is_instance(), n.source.is_some())).collect::<Vec<_>>();
+                    match b.frame {
+                        215 => eprintln!("COMPONENT before: large {:?}\nCOMPONENT before: own {:?}", look(self, wide), look(self, own)),
+                        // The edits of the main, through the path that keys and menus take.
+                        220 => {
+                            self.sel = vec![main_rect];
+                            self.edit_selected(|n| (n.fill, n.radius) = (Some([255, 120, 40, 255]), 36.0));
+                        }
+                        226 => {
+                            self.sel = vec![main_label];
+                            self.edit_selected(|n| (n.text, n.font_size, n.fill) = ("Sign up".into(), 30.0, Some([30, 30, 60, 255])));
+                            self.sel.clear();
+                        }
+                        250 => eprintln!("COMPONENT after: large {:?} (want orange, radius 36, \"Sign up\", size 30, dark text)\nCOMPONENT after: own {:?} (want its green and \"Buy now\" kept; radius 36, size 30, dark text)", look(self, wide), look(self, own)),
+                        // Ctrl+D on the main gives an instance; then undo and redo of the edit of the main.
+                        256 => {
+                            self.sel = vec![b.ids[0]];
+                            let nodes = self.selected_nodes();
+                            self.add_nodes(nodes, vec2(24.0, 24.0), None);
+                            let copy = self.sel.first().and_then(|id| self.doc.find(*id)).map(|n| (n.is_instance(), n.instance_of == Some(b.ids[0]), n.children.len()));
+                            eprintln!("COMPONENT duplicate of the main: {copy:?} (want (true, true, 2))");
+                        }
+                        258 | 260 => self.do_undo(),
+                        262 => {
+                            eprintln!("COMPONENT label edit undone: large {:?}, own {:?} (want \"Button\" size 26, \"Buy now\" size 26)", look(self, wide).last(), look(self, own).last());
+                            self.do_redo();
+                        }
+                        266 => eprintln!("COMPONENT and redone: large {:?} (want \"Sign up\" size 30)", look(self, wide).last()),
+                        310 => eprintln!("COMPONENT click on the large instance: {:?} (want [(Button, true, false)])", names(self)),
+                        455 => eprintln!("COMPONENT double-click on it: {:?} (want one part: (_, false, true))", names(self)),
+                        575 | 600 => {
+                            let at = self.sel.first().and_then(|id| self.doc.find(*id)).map(|n| (n.x, n.y));
+                            eprintln!("COMPONENT part {} the drag: {at:?}; parent {:?}; status: {}", if b.frame == 575 { "before" } else { "after" }, self.sel.first().and_then(|id| self.doc.parent_of(*id)) == Some(wide), self.status);
+                        }
+                        606 => {
+                            use serde_json::json;
+                            let (main, part) = (b.ids[0], self.doc.find(wide).and_then(|n| n.children.first()).map_or(0, |c| c.id));
+                            let (x, y) = self.doc.find(own).map_or((0.0, 0.0), |n| (n.x + 300.0, n.y));
+                            let mut run = |cmd: &str, args: serde_json::Value| {
+                                let answer = self.remote_bench(cmd, &args);
+                                eprintln!("COMPONENT remote {cmd} {args} -> {}", answer.chars().take(260).collect::<String>());
+                            };
+                            run("create_nodes", json!({ "nodes": [{ "kind": "instance", "instance_of": main, "x": x, "y": y, "w": 330, "name": "Wide button" }] }));
+                            run("create_nodes", json!({ "parent": wide, "nodes": [{ "kind": "rect" }] }));
+                            run("create_nodes", json!({ "parent": main, "nodes": [{ "kind": "instance", "instance_of": main }] }));
+                            run("update_nodes", json!({ "nodes": [{ "id": part, "x": 5 }] }));
+                            run("update_nodes", json!({ "nodes": [{ "id": part, "opacity": 0.9 }] }));
+                            run("delete_nodes", json!({ "ids": [part] }));
+                            run("arrange", json!({ "action": "front", "ids": [part] }));
+                            run("update_nodes", json!({ "nodes": [{ "id": main_rect, "fill": "#0aa88a" }] }));
+                            run("get_document", json!({ "ids": [part] }));
+                        }
+                        610 => {
+                            let made = self.doc.nodes.iter().find(|n| n.name == "Wide button").map(|n| (n.is_instance(), n.w, look(self, n.id)));
+                            eprintln!("COMPONENT remote instance: {made:?} (want true, 330 wide, teal, its layers stretched)");
+                            self.sel = vec![own];
+                        }
+                        _ => {}
+                    }
+                }
                 let nested = b.ids.len() == 5 && std::env::var_os("KANVAS_BENCH_NESTED").is_some();
                 if nested {
                     let names = |app: &Self| app.sel.iter().filter_map(|id| app.doc.find(*id)).map(|n| n.name.clone()).collect::<Vec<_>>();
@@ -2538,7 +2663,7 @@ impl App {
                         _ => {}
                     }
                 }
-                let settled = b.frame > if nested { 760 } else { 260 };
+                let settled = b.frame > if nested { 760 } else if component { 640 } else { 260 };
                 let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && settled && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;

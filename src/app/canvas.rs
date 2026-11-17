@@ -110,7 +110,9 @@ impl App {
                             }
                             Some((Kind::Path, _)) => {
                                 self.sel = vec![id];
-                                self.start_path_edit(id);
+                                if !self.refuse_pinned() {
+                                    self.start_path_edit(id);
+                                }
                             }
                             // Klik dua kali pada gambar: mode crop (anggota group dipilih sendiri dulu).
                             Some((Kind::Image, grouped)) if !grouped || self.sel == [id] => self.start_crop(id),
@@ -168,12 +170,22 @@ impl App {
                 if r.width() > 36.0 {
                     let lr = Rect::from_min_max(pos2(r.left(), r.top() - 18.0), pos2(r.right(), r.top()));
                     if lr.intersects(rect) {
-                        let color = if sel.contains(&n.id) { ACCENT } else { Color32::from_gray(160) };
+                        // Mains and instances carry their icon and colour in the name.
+                        let linked = n.is_linked();
+                        let color = match (linked, sel.contains(&n.id)) {
+                            (true, _) => components::PURPLE,
+                            (false, true) => ACCENT,
+                            (false, false) => Color32::from_gray(160),
+                        };
+                        if linked {
+                            components::component_icon(&painter.with_clip_rect(lr.intersect(rect)), pos2(r.left() + 6.0, r.top() - 10.0), n.component, color);
+                        }
                         // A name that fits above its frame needs no clip rectangle of its own, so
                         // egui can draw all such names in one go instead of one draw call each.
                         let galley = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), color);
-                        let at = pos2(r.left(), r.top() - 4.0 - galley.size().y);
-                        if galley.size().x <= lr.width() && rect.contains_rect(lr) {
+                        let indent = if linked { 16.0 } else { 0.0 };
+                        let at = pos2(r.left() + indent, r.top() - 4.0 - galley.size().y);
+                        if galley.size().x + indent <= lr.width() && rect.contains_rect(lr) {
                             painter.galley(at, galley, color);
                         } else {
                             painter.with_clip_rect(lr.intersect(rect)).galley(at, galley, color);
@@ -196,6 +208,8 @@ impl App {
                     n.w = w;
                     n.h = h;
                 }
+                // Not an edit, but the instances of a main with this text get its size too.
+                self.components.recheck();
             }
         }
 
@@ -228,7 +242,7 @@ impl App {
             if let Some(n) = self.doc.find(self.sel[0]) {
                 if self.crop.is_some() {
                     self.paint_crop(&painter);
-                } else if self.pointer_tool() {
+                } else if self.pointer_tool() && n.source.is_none() {
                     for (_, x, y) in handles(n, self.tool == Tool::Scale) {
                         let hr = Rect::from_center_size(self.view.to_screen(o, x, y), vec2(7.0, 7.0));
                         painter.rect_filled(hr, CornerRadius::same(1), Color32::WHITE);
@@ -338,6 +352,7 @@ impl App {
     }
 
     fn outline(&self, painter: &egui::Painter, n: &Node, width: f32) {
+        let accent = if n.is_linked() || n.source.is_some() { components::PURPLE } else { ACCENT };
         let o = self.canvas_rect.min;
         let (cx, cy) = n.center();
         // Titik dunia → layar, mengikuti rotasi node.
@@ -347,10 +362,10 @@ impl App {
         };
         match n.kind {
             Kind::Line => {
-                painter.line_segment([s(n.x, n.y), s(n.x + n.w, n.y + n.h)], Stroke::new(width + 0.5, ACCENT));
+                painter.line_segment([s(n.x, n.y), s(n.x + n.w, n.y + n.h)], Stroke::new(width + 0.5, accent));
             }
             Kind::Path => {
-                let stroke = Stroke::new(width, ACCENT);
+                let stroke = Stroke::new(width, accent);
                 for (c, ring) in n.contours(16).into_iter().enumerate() {
                     let pts: Vec<Pos2> = ring.into_iter().map(|(x, y)| s(x, y)).collect();
                     painter.add(if n.closed || c > 0 { egui::Shape::closed_line(pts, stroke) } else { egui::Shape::line(pts, stroke) });
@@ -359,7 +374,7 @@ impl App {
             _ => {
                 let (x0, y0, x1, y1) = n.bounds();
                 let corners = vec![s(x0, y0), s(x1, y0), s(x1, y1), s(x0, y1)];
-                painter.add(egui::Shape::closed_line(corners, Stroke::new(width, ACCENT)));
+                painter.add(egui::Shape::closed_line(corners, Stroke::new(width, accent)));
             }
         }
     }
@@ -643,7 +658,12 @@ impl App {
             Drag::Corner { id, at, single, r0, s0 } => self.corner_drag(*id, *at, *single, *r0, *s0, wp),
             Drag::Move { start, applied, moved, dup } => {
                 let t = wp - *start;
-                if *moved || t.length() * z > 3.0 {
+                // A part of an instance is picked by the click, but stays where the main has it.
+                let free = !self.sel_pinned();
+                if !free && t.length() * z > 3.0 {
+                    self.refuse_pinned();
+                }
+                if free && (*moved || t.length() * z > 3.0) {
                     let mut total = vec2(t.x.round(), t.y.round());
                     if inp.mods.shift {
                         // Shift: kunci ke sumbu yang dominan.
@@ -679,9 +699,13 @@ impl App {
                             self.doc.regroup(&mut nodes);
                             self.sel.clear();
                             for mut n in nodes {
-                                self.doc.reassign_ids(&mut n);
+                                // Alt-dragging a main component drags out an instance of it.
+                                if !self.doc.settle_copy(&mut n) {
+                                    self.doc.reassign_ids(&mut n);
+                                }
                                 let (cx, cy) = n.center();
                                 let parent = self.doc.frame_for(&n, cx, cy, &[]);
+                                let parent = parent.filter(|_| !self.doc.would_cycle(&n, parent));
                                 self.sel.push(n.id);
                                 self.doc.insert(n, parent);
                             }
@@ -808,6 +832,8 @@ impl App {
                         }
                     }
                 }
+                // An instance lays its parts out again as it is resized.
+                self.doc.relayout(*id);
             }
             Drag::Scale { id, handle, orig } => {
                 let (x0, y0, x1, y1) = orig.bounds();
@@ -879,7 +905,7 @@ impl App {
                         scale_node(&mut n, sx, x0, y0);
                         n.translate(nx - x0, ny - y0);
                     } else {
-                        stretch_node(&mut n, (x0, y0), (nx, ny), (sx, sy));
+                        n.stretch((x0, y0), (nx, ny), (sx, sy));
                     }
                     if let Some(slot) = self.doc.find_mut(n.id) {
                         *slot = n;
@@ -1108,7 +1134,9 @@ impl App {
                     let Some(n) = self.doc.find(id) else { continue };
                     let (x, y) = if roots.len() == 1 { (grab.x, grab.y) } else { n.center() };
                     let target = self.doc.frame_for(n, x, y, &roots);
-                    if target != self.doc.parent_of(id) {
+                    if target != self.doc.parent_of(id) && self.doc.would_cycle(n, target) {
+                        self.status = "A component can't contain an instance of itself: the layer stays in the frame it was in.".into();
+                    } else if target != self.doc.parent_of(id) {
                         if let Some(node) = self.doc.remove(id) {
                             self.doc.insert(node, target);
                         }

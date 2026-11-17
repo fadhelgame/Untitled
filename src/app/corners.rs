@@ -129,7 +129,8 @@ impl App {
 
     /// Widget sudut di bawah kursor: (id node, sudut, jari-jari awal, posisi awal sepanjang garis bagi).
     pub(super) fn corner_hit(&self, p: Pos2) -> Option<(u64, (usize, usize), f32, f32)> {
-        let id = self.corner_target()?.id;
+        // The corners of a part of an instance are those of the main.
+        let id = self.corner_target().filter(|n| n.source.is_none())?.id;
         let wp = self.view.to_world(self.canvas_rect.min, p);
         let (c, _) = self.corner_widgets().into_iter().filter(|(_, s)| s.distance(p) <= 8.0).min_by(|a, b| a.1.distance(p).total_cmp(&b.1.distance(p)))?;
         Some((id, c.at, c.r, (wp - c.p).dot(c.bis)))

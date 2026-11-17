@@ -134,7 +134,7 @@ impl App {
 
     /// Kursor tepat di luar salah satu sudut objek terpilih: zona untuk memutar.
     pub(super) fn rotate_zone(&self, p: Pos2) -> Option<u64> {
-        if self.sel.len() != 1 || !self.pointer_tool() || self.editing.is_some() || self.ext.path_edit.is_some() || self.sel_locked() {
+        if self.sel.len() != 1 || !self.pointer_tool() || self.editing.is_some() || self.ext.path_edit.is_some() || self.sel_locked() || self.sel_pinned() {
             return None;
         }
         if self.crop.is_some() {
@@ -163,7 +163,7 @@ impl App {
     /// Seperti `rotate_zone` untuk beberapa objek terpilih (mis. satu group): kursor tepat di luar
     /// sudut kotak seleksi. Hasil: pusat kotak (poros putar). Frame tidak bisa diputar.
     pub(super) fn multi_rotate_zone(&self, p: Pos2) -> Option<Pos2> {
-        if self.sel_locked() || self.crop.is_some() {
+        if self.sel_locked() || self.sel_pinned() || self.crop.is_some() {
             return None;
         }
         let (x0, y0, x1, y1) = self.sel_box()?;

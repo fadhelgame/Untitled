@@ -333,6 +333,15 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     if n.group != 0 {
         put("group", json!(n.group));
     }
+    if n.component {
+        put("component", json!(true));
+    }
+    if let Some(main) = n.instance_of {
+        put("instance_of", json!(main));
+    }
+    if let Some(source) = n.source {
+        put("source", json!(source));
+    }
     match n.kind {
         Kind::Text => {
             put("text", json!(n.text));
@@ -439,7 +448,10 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
             while let Ok(req) = remote.rx.try_recv() {
-                match self.remote_run(&req.cmd, &req.args) {
+                let outcome = self.remote_run(&req.cmd, &req.args);
+                // Instances follow at once, so the next command reads a document that is in line.
+                self.sync_components();
+                match outcome {
                     Ok(Outcome::Now(v)) => {
                         let _ = req.reply.send(ok(v));
                     }
@@ -466,6 +478,19 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
         self.remote = Some(remote);
+    }
+
+    /// `--bench`: run one command the way `remote_poll` does, without the socket (which is off
+    /// in that mode). Result: the answer as text; for created / updated nodes just their ids.
+    pub(super) fn remote_bench(&mut self, cmd: &str, args: &Value) -> String {
+        let outcome = self.remote_run(cmd, args);
+        self.sync_components();
+        match outcome {
+            Ok(Outcome::Now(v)) => v.to_string(),
+            Ok(Outcome::Later(After::Nodes { ids, .. }, _)) => format!("ids {ids:?}"),
+            Ok(Outcome::Later(..)) => "(answers later)".into(),
+            Err(e) => format!("ERROR: {e}"),
+        }
     }
 
     fn remote_run(&mut self, cmd: &str, args: &Value) -> Result<Outcome, String> {
@@ -598,6 +623,8 @@ impl App {
                 for id in texts {
                     self.measure_text(ctx, id);
                 }
+                // A text measured in a main component has a new size for its instances too.
+                self.components.recheck();
                 let list: Vec<Value> = ids.iter().filter_map(|id| self.doc.find(*id).map(|n| brief(n, self.origin_of(*id)))).collect();
                 let mut result = json!({ key: list });
                 if !warnings.is_empty() {
@@ -720,7 +747,15 @@ impl App {
             let k = k.as_str();
             match k {
                 "id" | "points" | "spans" | "parent" => {}
-                "kind" | "children" if creating => {}
+                "kind" | "children" | "instance_of" if creating => {}
+                "instance_of" => return Err("`instance_of` can't be changed; create a new instance instead".into()),
+                "component" => {
+                    let on = flag(k, v)?;
+                    if on && (n.kind != Kind::Frame || n.instance_of.is_some() || n.source.is_some()) {
+                        return Err("only a frame that isn't an instance (or part of one) can be a main component; use arrange with action \"component\" to wrap other layers in one".into());
+                    }
+                    n.component = on;
+                }
                 "kind" => return Err("`kind` can't be changed; delete the node and create a new one".into()),
                 "children" => return Err("`children` can't be set in update_nodes; use create_nodes with `parent`".into()),
                 "name" => n.name = string(k, v)?,
@@ -851,7 +886,10 @@ impl App {
     fn build(&mut self, spec: &Value, o: (f32, f32), child: bool, notes: &mut Notes) -> Result<Node, String> {
         let m = spec.as_object().ok_or("each node must be an object")?;
         let kind = m.get("kind").and_then(Value::as_str).ok_or("missing `kind`")?;
-        let kind = parse_kind(kind).ok_or_else(|| format!("unknown kind \"{kind}\"; use frame, rect, ellipse, line, text, path or image"))?;
+        if kind.eq_ignore_ascii_case("instance") {
+            return self.build_instance(m, o, child, notes);
+        }
+        let kind = parse_kind(kind).ok_or_else(|| format!("unknown kind \"{kind}\"; use frame, rect, ellipse, line, text, path, image or instance"))?;
         if kind != Kind::Frame && m.contains_key("children") {
             return Err("only frames can have `children`".into());
         }
@@ -915,6 +953,32 @@ impl App {
         Ok(n)
     }
 
+    /// A new instance of the main component `instance_of` (not in the document yet).
+    fn build_instance(&mut self, m: &Map<String, Value>, o: (f32, f32), child: bool, notes: &mut Notes) -> Result<Node, String> {
+        let main = m.get("instance_of").and_then(Value::as_u64).ok_or("an instance needs `instance_of`: the id of a main component")?;
+        if m.contains_key("children") {
+            return Err("an instance gets its layers from the main component; `children` can't be given".into());
+        }
+        let mut n = self.doc.instantiate(main).ok_or_else(|| format!("node {main} isn't a main component (those have `component: true` in get_document)"))?;
+        let free = !child && !m.contains_key("x") && !m.contains_key("y");
+        let at = self.doc.bounds().filter(|_| free).map_or(o, |b| ((b.2 + 100.0).round(), b.1.round()));
+        n.translate(at.0 - n.x, at.1 - n.y);
+        notes.natural = None;
+        self.apply(&mut n, m, o, true, notes)?;
+        // Given a size of its own, its layers stretch along.
+        self.doc.fit_instance(&mut n);
+        Ok(n)
+    }
+
+    /// May `node` go into frame `parent`? Not into an instance, and not where a component would contain itself.
+    fn may_hold(&self, node: &Node, parent: Option<u64>) -> Result<(), String> {
+        match parent {
+            Some(p) if self.doc.in_instance(p) => Err(format!("frame {p} is an instance (or part of one): layers can't be added to it. Add them to its main component, or detach the instance first.")),
+            Some(p) if self.doc.would_cycle(node, parent) => Err(format!("frame {p} belongs to a main component that this node holds an instance of: a component can't contain itself")),
+            _ => Ok(()),
+        }
+    }
+
     /// Frame (di kedalaman mana pun) yang boleh jadi induk: hasilnya titik asalnya.
     fn parent_origin(&self, id: u64) -> Result<(f32, f32), String> {
         let f = self.doc.find(id).ok_or_else(|| format!("parent {id} not found"))?;
@@ -953,7 +1017,7 @@ impl App {
         let mut notes = Notes::default();
         let mut ids = Vec::with_capacity(specs.len());
         for (i, spec) in specs.iter().enumerate() {
-            match self.build(spec, o, parent.is_some(), &mut notes) {
+            match self.build(spec, o, parent.is_some(), &mut notes).and_then(|n| self.may_hold(&n, parent).map(|_| n)) {
                 Ok(n) => {
                     ids.push(n.id);
                     self.doc.insert(n, parent);
@@ -1013,6 +1077,15 @@ impl App {
         if target.is_some_and(|p| p == id || self.doc.is_descendant(p, id)) {
             return Err("a frame can't be moved into itself or into something inside it".into());
         }
+        if n.source.is_some() {
+            let fixed = ["x", "y", "w", "h", "rotation", "name", "points", "closed", "wrap", "parent", "component"];
+            if let Some(k) = m.keys().find(|k| fixed.contains(&k.as_str())) {
+                return Err(format!("node {id} is part of an instance: `{k}` follows the main component (only its look and text can be changed). Edit the main component, or detach the instance."));
+            }
+        }
+        if target != current {
+            self.may_hold(&n, target)?;
+        }
         self.apply(&mut n, m, o, false, notes)?;
         if target != current {
             self.doc.remove(id);
@@ -1025,6 +1098,9 @@ impl App {
 
     fn remote_delete(&mut self, args: &Value) -> Result<Value, String> {
         let ids = id_list(args.get("ids"))?;
+        if let Some(id) = ids.iter().find(|id| self.doc.pinned(**id)) {
+            return Err(format!("node {id} is part of an instance and can't be deleted on its own; delete the instance, detach it, or remove the layer from the main component (nothing was deleted)"));
+        }
         let pre = self.doc.clone();
         let removed: Vec<u64> = ids.into_iter().filter(|id| self.doc.remove(*id).is_some()).collect();
         if removed.is_empty() {
@@ -1046,9 +1122,30 @@ impl App {
         if ids.is_empty() {
             return Err("`ids` is empty".into());
         }
+        if !matches!(action, "reset") {
+            if let Some(id) = ids.iter().find(|id| self.doc.pinned(**id)) {
+                return Err(format!("node {id} is part of an instance: its order and grouping follow the main component"));
+            }
+        }
         let pre = self.doc.clone();
         let mut out = json!({ "ok": true });
         match action {
+            "component" => {
+                let id = self.doc.make_component(&ids)?;
+                self.sel = vec![id];
+                out = json!({ "component": id });
+            }
+            "detach" => {
+                let done: Vec<u64> = ids.iter().copied().filter(|id| self.doc.detach(*id)).collect();
+                if done.is_empty() {
+                    return Err("none of those nodes is an instance".into());
+                }
+                out = json!({ "detached": done });
+            }
+            "reset" => {
+                let done: Vec<u64> = ids.iter().copied().filter(|id| self.doc.reset_overrides(*id)).collect();
+                out = json!({ "reset": done });
+            }
             "front" | "back" => self.doc.reorder(&ids, action == "front"),
             "forward" | "backward" => self.doc.reorder_step(&ids, action == "forward"),
             "group" => {
@@ -1068,7 +1165,7 @@ impl App {
                 self.doc.ungroup(&groups);
                 out = json!({ "ungrouped": groups });
             }
-            other => return Err(format!("unknown action \"{other}\"; use front, back, forward, backward, group or ungroup")),
+            other => return Err(format!("unknown action \"{other}\"; use front, back, forward, backward, group, ungroup, component, detach or reset")),
         }
         self.push_undo(pre);
         self.status = format!("Remote: {action}.");
@@ -1277,6 +1374,20 @@ mod tests {
         assert_eq!((c["x"].as_f64(), c["y"].as_f64()), (Some(20.0), Some(30.0)));
         assert_eq!(c["fill"], json!("#ff0000"));
         assert_eq!(describe(&f, (0.0, 0.0), false)["child_count"], json!(1));
+    }
+
+    #[test]
+    fn components_and_instances_say_what_they_are() {
+        let mut main = Node::new(1, Kind::Frame, 0.0, 0.0);
+        main.component = true;
+        let mut inst = Node::new(3, Kind::Frame, 0.0, 0.0);
+        inst.instance_of = Some(1);
+        let mut part = Node::new(4, Kind::Rect, 0.0, 0.0);
+        part.source = Some(2);
+        inst.children.push(part);
+        let (m, i) = (describe(&main, (0.0, 0.0), true), describe(&inst, (0.0, 0.0), true));
+        assert_eq!((&m["component"], &m["instance_of"]), (&json!(true), &Value::Null));
+        assert_eq!((&i["component"], &i["instance_of"], &i["children"][0]["source"]), (&Value::Null, &json!(1), &json!(2)));
     }
 
     #[test]

@@ -321,6 +321,10 @@ impl App {
             None => self.sel.iter().copied().filter(|id| self.doc.find(*id).is_some_and(eligible)).collect(),
         };
         let Some(&first) = picked.first() else { return };
+        // Shapes in an instance are those of the main component.
+        if self.doc.pinned(first) {
+            return;
+        }
         if seed.is_none() && picked.len() < 2 {
             return;
         }

@@ -71,6 +71,8 @@ impl App {
                     "Ctrl+Shift+V   paste in place",
                     "Ctrl+Shift+H   show/hide",
                     "Ctrl+Alt+G     clipping mask",
+                    "Ctrl+Alt+K     create component",
+                    "Ctrl+Alt+B     detach instance",
                     "Enter          edit text / into a frame",
                     "Shift+Enter    select the parent frame",
                     "Ctrl+\\         hide panels",
@@ -99,47 +101,56 @@ impl App {
         let mut remove_bg = false;
         let mut crop_image = false;
         let mut style_action: Option<super::styles::StyleAction> = None;
+        let mut comp_act: Option<super::components::Act> = None;
         let has_parent = self.doc.parent_of(id).is_some();
+        // A part of an instance: its look can be changed, its place, size and name follow the main.
+        let pinned = orig.source.is_some();
+        let linked = orig.is_linked() || pinned;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.label(theme::title(n.kind.label()));
-            ui.add(egui::TextEdit::singleline(&mut n.name).desired_width(f32::INFINITY));
+            ui.add_enabled(!pinned, egui::TextEdit::singleline(&mut n.name).desired_width(f32::INFINITY));
+            if linked {
+                comp_act = self.component_section(ui);
+            }
 
-            section(ui, "Position");
-            sub(ui, "Alignment");
-            ui.add_enabled_ui(has_parent, |ui| {
-                if let Some(mode) = align_buttons(ui) {
-                    align = Some(mode);
-                }
-            });
-            sub(ui, "Position");
             let half = (ui.available_width() - 8.0) / 2.0;
-            ui.horizontal(|ui| {
-                field(ui, half, "X", &mut n.x);
-                field(ui, half, "Y", &mut n.y);
-            });
-            if !matches!(n.kind, Kind::Frame | Kind::Line) {
-                sub(ui, "Rotation");
-                ui.add_sized(
-                    [half, 28.0],
-                    egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
-                )
-                .on_hover_text("Or drag just outside a corner of the selection (Shift = 15° steps)");
-            }
-
-            if n.kind != Kind::Text || n.wrap {
-                section(ui, "Layout");
-                sub(ui, "Dimensions");
-                ui.horizontal(|ui| {
-                    field(ui, half, "W", &mut n.w);
-                    ui.add_enabled_ui(n.kind != Kind::Text, |ui| field(ui, half, "H", &mut n.h));
+            ui.add_enabled_ui(!pinned, |ui| {
+                section(ui, "Position");
+                sub(ui, "Alignment");
+                ui.add_enabled_ui(has_parent, |ui| {
+                    if let Some(mode) = align_buttons(ui) {
+                        align = Some(mode);
+                    }
                 });
-                if n.kind != Kind::Line {
-                    n.w = n.w.max(1.0);
-                    n.h = n.h.max(1.0);
+                sub(ui, "Position");
+                ui.horizontal(|ui| {
+                    field(ui, half, "X", &mut n.x);
+                    field(ui, half, "Y", &mut n.y);
+                });
+                if !matches!(n.kind, Kind::Frame | Kind::Line) {
+                    sub(ui, "Rotation");
+                    ui.add_sized(
+                        [half, 28.0],
+                        egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
+                    )
+                    .on_hover_text("Or drag just outside a corner of the selection (Shift = 15° steps)");
                 }
-            }
+
+                if n.kind != Kind::Text || n.wrap {
+                    section(ui, "Layout");
+                    sub(ui, "Dimensions");
+                    ui.horizontal(|ui| {
+                        field(ui, half, "W", &mut n.w);
+                        ui.add_enabled_ui(n.kind != Kind::Text, |ui| field(ui, half, "H", &mut n.h));
+                    });
+                    if n.kind != Kind::Line {
+                        n.w = n.w.max(1.0);
+                        n.h = n.h.max(1.0);
+                    }
+                }
+            });
 
             section(ui, "Appearance");
             ui.horizontal(|ui| {
@@ -280,6 +291,9 @@ impl App {
                 "",
                 "Blurs the whole layer, with its shadow. On a frame, the contents are blurred too.",
             );
+            if !linked {
+                comp_act = self.component_section(ui);
+            }
             self.export_section(ui, &ctx);
             ui.add_space(12.0);
         });
@@ -299,6 +313,13 @@ impl App {
         if let Some(action) = style_action {
             self.style_action(id, action);
             return;
+        }
+        if let Some(act) = comp_act {
+            self.component_act(act);
+            return;
+        }
+        if pinned {
+            (n.x, n.y, n.w, n.h, n.rotation, n.wrap) = (before.x, before.y, before.w, before.h, before.rotation, before.wrap);
         }
         if n == before {
             return;
@@ -387,6 +408,8 @@ impl App {
         let before = n.clone();
         let key = ids[0];
         let group = self.selected_whole_group();
+        let pinned = self.sel_pinned();
+        let mut comp_act: Option<super::components::Act> = None;
         let mut align: Option<u8> = None;
         const MIXED: &str = "Mixed — showing the first layer; a change applies to all.";
 
@@ -409,7 +432,7 @@ impl App {
                 align = Some(mode);
             }
             let half = (ui.available_width() - 8.0) / 2.0;
-            if spinnable {
+            if spinnable && !pinned {
                 sub(ui, "Rotation");
                 ui.add_sized(
                     [half, 28.0],
@@ -487,12 +510,19 @@ impl App {
                     "Blurs each selected layer. Group them first to blur them together as one."
                 },
             );
+            if !pinned {
+                comp_act = self.component_section(ui);
+            }
             self.export_section(ui, ctx);
             ui.add_space(12.0);
         });
 
         if let Some(mode) = align {
             self.align(mode);
+            return;
+        }
+        if let Some(act) = comp_act {
+            self.component_act(act);
             return;
         }
         if n == before {
@@ -1055,6 +1085,13 @@ impl App {
                             if resp.on_hover_text("Library: your own logos and images").clicked() {
                                 self.toggle_library();
                             }
+                            // Components: every main component of the document; a click places an instance.
+                            let active = self.components.open;
+                            let (rect, resp) = button(ui, active);
+                            super::components::toolbar_icon(ui.painter(), rect.center(), if active { Color32::WHITE } else { Color32::from_gray(225) });
+                            if resp.on_hover_text("Components").clicked() {
+                                self.toggle_components();
+                            }
                             // Export: popup di atas toolbar dengan skala dan format.
                             separator(ui);
                             let popup_id = ui.make_persistent_id("export_popup");
@@ -1246,6 +1283,7 @@ impl eframe::App for App {
         self.icons_window(ctx);
         self.photos_window(ctx);
         self.library_window(ctx);
+        self.components_window(ctx);
         self.eyedropper(ctx);
         self.about_window(ctx);
 
@@ -1255,6 +1293,8 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
+        // After everything that edits the document, before it is saved.
+        self.sync_components();
         self.autosave(ctx);
         self.run_bench(ctx);
     }
