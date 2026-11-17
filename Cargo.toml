@@ -21,6 +21,9 @@ i_overlay = "9.1.0"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-31"] }
 svg2pdf = { version = "0.13", default-features = false, features = ["image", "filters"] }
 pdf-writer = "0.12"
+# Both are in the build already (image, svg2pdf): used directly for CMYK export.
+moxcms = "0.8"
+miniz_oxide = "0.8"
 
 [build-dependencies]
 winresource = "0.1"

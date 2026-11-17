@@ -278,6 +278,8 @@ pub struct Ext {
     in_rx: mpsc::Receiver<InnerDone>,
     pub export_scale: f32,
     pub export_fmt: usize,
+    /// Print settings of the export: bleed, crop marks, CMYK (see `crate::print`).
+    pub print: crate::print::Print,
     pub v_plain: bool,
     pub paste_seen: bool,
     /// Top-level frames as finished meshes (see `frame_cached`), per frame id.
@@ -358,6 +360,7 @@ impl Default for Ext {
             glyphs: vtext::Cache::default(),
             export_scale: 1.0,
             export_fmt: 0,
+            print: Default::default(),
             v_plain: false,
             paste_seen: false,
             frames: HashMap::new(),

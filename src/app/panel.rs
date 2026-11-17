@@ -1169,6 +1169,7 @@ impl App {
                     }
                 });
         });
+        self.print_controls(ui);
         let target = match self.sel.as_slice() {
             [id] => self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default(),
             _ if self.ext.export_fmt == 3 => match self.pdf_targets().len() {
@@ -1191,6 +1192,97 @@ impl App {
         }
     }
 
+    /// The "Print" group of the export controls: bleed and crop marks for every format, and
+    /// for PDF the colour (RGB or CMYK), flattening and the ICC profile of the press.
+    fn print_controls(&mut self, ui: &mut egui::Ui) {
+        let pdf = self.ext.export_fmt == 3;
+        let size = self.print_size();
+        let mut note = None;
+        let p = &mut self.ext.print;
+        // (Open from the start when something in it is set.)
+        let open = *p != crate::print::Print::default();
+        egui::CollapsingHeader::new("Print").id_salt(ui.id().with("export_print")).default_open(open).show(ui, |ui| {
+            egui::Grid::new(ui.id().with("export_print_grid")).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                ui.label("Bleed");
+                ui.add(egui::DragValue::new(&mut p.bleed_mm).speed(0.1).range(0.0..=50.0).max_decimals(1).suffix(" mm"))
+                    .on_hover_text("Extra area around the page, cut off after printing (usually 3 mm).
+A frame's fill and the layers that stick out of it fill the bleed.");
+                ui.end_row();
+                ui.label("Resolution");
+                ui.add(egui::DragValue::new(&mut p.ppi).speed(1.0).range(18.0..=2400.0).max_decimals(0).suffix(" ppi"))
+                    .on_hover_text("How many px of the document make one inch on paper.
+72: 1 px is 1 pt, as in the Paper presets (A4 = 595 × 842).
+300: for a design made in 300 dpi pixels (A4 = 2480 × 3508).");
+                ui.end_row();
+                if pdf {
+                    ui.label("Colour");
+                    egui::ComboBox::from_id_salt(ui.id().with("export_colour")).width(70.0).selected_text(if p.cmyk { "CMYK" } else { "RGB" }).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut p.cmyk, false, "RGB");
+                        ui.selectable_value(&mut p.cmyk, true, "CMYK");
+                    });
+                    ui.end_row();
+                }
+            });
+            ui.checkbox(&mut p.marks, "Crop marks").on_hover_text("Trim marks at the four corners, in a margin around the bleed");
+            if pdf {
+                ui.checkbox(&mut p.flatten, "Flatten to image (300 dpi)")
+                    .on_hover_text("Every page as one picture instead of vectors: looks exactly like the PNG export,
+but text and shapes are no longer sharp at any size");
+            }
+            if pdf && p.cmyk {
+                ui.horizontal(|ui| {
+                    let name = p.icc.as_ref().and_then(|f| f.file_name()).map(|f| f.to_string_lossy().into_owned());
+                    let label = name.as_deref().map_or("ICC profile…".to_owned(), |n| n.chars().take(20).collect());
+                    let tip = "The CMYK profile of the press (.icc), from your print shop. It is embedded as the
+output intent and colours are converted through it. Without one, colours are
+converted by a plain formula that knows nothing about the press.";
+                    if ui.button(label).on_hover_text(tip).clicked() {
+                        if let Some(file) = rfd::FileDialog::new().add_filter("ICC profile", &["icc", "icm"]).pick_file() {
+                            match crate::print::read_profile(&file) {
+                                Ok(profile) => {
+                                    note = Some(format!("ICC profile: {}", profile.name));
+                                    p.icc = Some(file);
+                                }
+                                Err(e) => note = Some(format!("Can't use that profile: {e}")),
+                            }
+                        }
+                    }
+                    if p.icc.is_some() && ui.small_button("×").on_hover_text("Remove the profile").clicked() {
+                        p.icc = None;
+                    }
+                });
+            }
+            if let Some((w, h)) = size {
+                ui.weak(p.hint(w, h));
+            }
+        });
+        if let Some(note) = note {
+            self.status = note;
+        }
+    }
+
+    /// The size, in document px, of the first thing the Export button would write.
+    fn print_size(&self) -> Option<(f32, f32)> {
+        let first = match (self.sel.first(), self.ext.export_fmt) {
+            (Some(id), _) => Some(*id),
+            (None, 3) => export::pdf_pages(&self.doc).first().copied(),
+            _ => None,
+        };
+        let (x0, y0, x1, y1) = match first {
+            Some(id) => self.doc.find(id)?.aabb(),
+            None => self.doc.bounds()?,
+        };
+        Some((x1 - x0, y1 - y0))
+    }
+
+    /// The export of `only` with the print settings: the bleed around it (see
+    /// `export::to_svg_bleed`) and, for the formats that are one picture, the crop marks.
+    fn print_svg(&mut self, only: Option<u64>, marks: bool, ctx: &egui::Context) -> Option<(String, f32, f32)> {
+        let print = self.ext.print.clone();
+        let (svg, w, h) = export::to_svg_bleed(&self.doc, only, print.bleed_px(), &mut self.fonts, ctx)?;
+        Some(if marks { crate::print::sheet_svg(svg, w, h, &print) } else { (svg, w, h) })
+    }
+
     fn export_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         section(ui, "Export");
         self.export_controls(ui, ctx);
@@ -1211,11 +1303,12 @@ impl App {
 
     fn export_pdf(&mut self, ctx: &egui::Context) {
         let targets = self.pdf_targets();
-        let pages: Vec<(String, f32, f32)> = targets.iter().filter_map(|t| export::to_svg(&self.doc, *t, &mut self.fonts, ctx)).collect();
+        let pages: Vec<(String, f32, f32)> = targets.iter().filter_map(|t| self.print_svg(*t, false, ctx)).collect();
         if pages.is_empty() {
             self.status = "Nothing to export.".into();
             return;
         }
+        let print = self.ext.print.clone();
         let name = match (targets.as_slice(), &self.path) {
             ([Some(id)], _) => self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default(),
             (_, Some(path)) => path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -1225,8 +1318,8 @@ impl App {
         let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{safe}.pdf")).save_file() else {
             return;
         };
-        self.export_spawn(ctx, move || match export::save_pdf(&pages, &path) {
-            Ok(()) => format!("Exported {} page(s): {}", pages.len(), path.display()),
+        self.export_spawn(ctx, move || match crate::print::save_pdf(&pages, &print, &path) {
+            Ok(colour) => format!("Exported {} page(s), {colour}: {}", pages.len(), path.display()),
             Err(e) => format!("Export failed: {e}"),
         });
     }
@@ -1263,7 +1356,7 @@ impl App {
             return self.export_batch(ctx);
         }
         let only = if self.sel.len() == 1 { Some(self.sel[0]) } else { None };
-        let Some((svg, w, h)) = export::to_svg(&self.doc, only, &mut self.fonts, ctx) else {
+        let Some((svg, w, h)) = self.print_svg(only, true, ctx) else {
             self.status = "Nothing to export.".into();
             return;
         };
@@ -1295,12 +1388,12 @@ impl App {
     /// Batch export: beberapa objek terpilih menjadi satu file per objek di folder pilihan,
     /// dengan skala dan format yang sedang aktif.
     fn export_batch(&mut self, ctx: &egui::Context) {
-        let items: Vec<(String, String, f32, f32)> = self
-            .sel
+        let sel = self.sel.clone();
+        let items: Vec<(String, String, f32, f32)> = sel
             .iter()
             .filter_map(|id| {
                 let name = self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default();
-                let (svg, w, h) = export::to_svg(&self.doc, Some(*id), &mut self.fonts, ctx)?;
+                let (svg, w, h) = self.print_svg(Some(*id), true, ctx)?;
                 Some((name, svg, w, h))
             })
             .collect();

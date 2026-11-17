@@ -49,7 +49,7 @@ enum After {
     Shot { id: Option<u64>, max: f32 },
     /// `outline_stroke` with texts among the nodes: once their fonts are there.
     Outline { ids: Vec<u64> },
-    Export { id: Option<u64>, path: PathBuf, scale: f32 },
+    Export { id: Option<u64>, path: PathBuf, scale: f32, print: crate::print::Print },
 }
 
 enum Outcome {
@@ -688,12 +688,37 @@ impl App {
                     return Err("`path` must be an absolute file path".into());
                 }
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-                if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "svg") {
-                    return Err("`path` must end in .png, .jpg or .svg".into());
+                if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "svg" | "pdf") {
+                    return Err("`path` must end in .png, .jpg, .svg or .pdf".into());
                 }
                 let scale = args.get("scale").map(|v| num("scale", v)).transpose()?.unwrap_or(1.0).clamp(0.1, 16.0);
+                // Print settings: bleed and crop marks for every format, the rest for PDF.
+                let mut print = crate::print::Print::default();
+                if let Some(v) = args.get("bleed") {
+                    print.bleed_mm = num("bleed", v)?.clamp(0.0, 50.0);
+                }
+                if let Some(v) = args.get("resolution") {
+                    print.ppi = num("resolution", v)?.clamp(18.0, 2400.0);
+                }
+                if let Some(v) = args.get("crop_marks") {
+                    print.marks = flag("crop_marks", v)?;
+                }
+                if let Some(v) = args.get("flatten") {
+                    print.flatten = flag("flatten", v)?;
+                }
+                match args.get("color").map(|v| string("color", v)).transpose()?.as_deref() {
+                    None | Some("rgb") => {}
+                    Some("cmyk") if ext == "pdf" => print.cmyk = true,
+                    Some("cmyk") => return Err("`color`: \"cmyk\" is for .pdf only".into()),
+                    Some(_) => return Err("`color` must be \"rgb\" or \"cmyk\"".into()),
+                }
+                if let Some(v) = args.get("icc") {
+                    let file = PathBuf::from(string("icc", v)?);
+                    crate::print::read_profile(&file)?;
+                    print.icc = Some(file);
+                }
                 let fonts = self.target_fonts(id);
-                Ok(Outcome::Later(After::Export { id, path, scale }, fonts))
+                Ok(Outcome::Later(After::Export { id, path, scale, print }, fonts))
             }
             other => Err(format!("unknown command \"{other}\"")),
         }
@@ -772,6 +797,17 @@ impl App {
         }
     }
 
+    /// `--bench`: an `export` command run to its end at once (the fonts have to be there
+    /// already). Result: the answer as text.
+    pub(super) fn remote_bench_export(&mut self, ctx: &egui::Context, args: &Value) -> String {
+        let done = match self.remote_run("export", args) {
+            Ok(Outcome::Later(after, fonts)) => self.remote_finish(ctx, after, &fonts),
+            Ok(Outcome::Now(v)) => Ok(v),
+            Err(e) => Err(e),
+        };
+        done.map_or_else(|e| format!("ERROR: {e}"), |v| v.to_string())
+    }
+
     fn origin_of(&self, id: u64) -> (f32, f32) {
         self.doc.parent_of(id).and_then(|p| self.doc.find(p)).map_or((0.0, 0.0), |p| (p.x, p.y))
     }
@@ -821,9 +857,24 @@ impl App {
                 answer["image"] = json!(b64::encode(&png));
                 Ok(answer)
             }
-            After::Export { id, path, scale } => {
-                let (svg, w, h) = export::to_svg(&self.doc, id, &mut self.fonts, ctx).ok_or("nothing to export: the document is empty")?;
+            After::Export { id, path, scale, print } => {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+                if ext == "pdf" {
+                    // One page for the node; without one, every frame is a page, as in the app.
+                    let frames = export::pdf_pages(&self.doc);
+                    let targets: Vec<Option<u64>> = if id.is_some() || frames.is_empty() { vec![id] } else { frames.into_iter().map(Some).collect() };
+                    let pages: Vec<(String, f32, f32)> = targets.iter().filter_map(|t| export::to_svg_bleed(&self.doc, *t, print.bleed_px(), &mut self.fonts, ctx)).collect();
+                    if pages.is_empty() {
+                        return Err("nothing to export: the document is empty".into());
+                    }
+                    let colour = crate::print::save_pdf(&pages, &print, &path)?;
+                    self.status = format!("Remote: exported {}", path.display());
+                    let scale = print.pt_per_px();
+                    let sizes: Vec<Value> = pages.iter().map(|(_, w, h)| json!([r2((w - print.page_bleed(*w, *h) * 2.0) * scale), r2((h - print.page_bleed(*w, *h) * 2.0) * scale)])).collect();
+                    return Ok(ok(json!({ "path": path, "pages": pages.len(), "trim_size_pt": sizes, "bleed_mm": print.bleed(), "crop_marks": print.marks, "color": colour, "flatten": print.flatten })));
+                }
+                let (svg, w, h) = export::to_svg_bleed(&self.doc, id, print.bleed_px(), &mut self.fonts, ctx).ok_or("nothing to export: the document is empty")?;
+                let (svg, w, h) = crate::print::sheet_svg(svg, w, h, &print);
                 match ext.as_str() {
                     "svg" => std::fs::write(&path, svg).map_err(|e| e.to_string())?,
                     other => export::save_raster(&svg, w, h, scale, other != "png", &path)?,

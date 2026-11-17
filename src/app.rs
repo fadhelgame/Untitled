@@ -31,6 +31,7 @@ mod photos;
 mod picker;
 mod polygon;
 mod presets;
+mod print_bench;
 pub mod rembg;
 mod remote;
 mod rulers;
@@ -2644,6 +2645,12 @@ impl App {
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_EFFECTS") {
                     b.ids = self.bench_effects(ctx, &mode, &mut b.inject);
                 }
+                // `KANVAS_BENCH_PRINT=1`: a page for print, exported with bleed, crop marks and in
+                // CMYK once its fonts are there (see `bench_print`); the sample files are written
+                // beside the screenshot. `=view:x0,y0,x1,y1`: that part.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_PRINT") {
+                    b.ids = self.bench_print(ctx, &mode, &mut b.inject);
+                }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
                     let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
@@ -3273,12 +3280,13 @@ impl App {
                         eprintln!("TEXTPATH frame {}: {:.2} ms", b.frame, self.frame_ms);
                     }
                 }
+                let print = std::env::var_os("KANVAS_BENCH_PRINT").is_some() && b.ids.len() == 3;
                 let effects = std::env::var_os("KANVAS_BENCH_EFFECTS").is_some() && b.ids.len() == 1;
-                if effects {
+                if effects || print {
                     // Every font of the frame has to be there, as the export is made only once;
                     // they are asked for here, since the frame may be out of view.
                     let mut fonts = Vec::new();
-                    if let Some(stage) = self.doc.find(b.ids[0]) {
+                    for stage in b.ids.iter().filter_map(|id| self.doc.find(*id)) {
                         stage.walk(&mut |n| {
                             if n.kind == Kind::Text {
                                 fonts.push((n.font.clone(), n.weight, n.italic));
@@ -3289,11 +3297,16 @@ impl App {
                         self.fonts.resolve(font, *weight, *italic);
                     }
                     let loaded = fonts.iter().all(|(font, weight, italic)| self.fonts.settled(font, *weight, *italic));
+                    let loaded = loaded && (!print || self.bench_print_ready(&b.ids));
                     if b.aux == 0 && b.frame >= 230 && (loaded || b.frame > 900) {
                         b.aux = b.frame;
-                        self.bench_effects_finish(ctx, b.ids[0], &b.out);
+                        if print {
+                            self.bench_print_finish(ctx, &b.ids, &b.out);
+                        } else {
+                            self.bench_effects_finish(ctx, b.ids[0], &b.out);
+                        }
                     }
-                    if b.aux != 0 && (50..=55).contains(&(b.frame - b.aux)) {
+                    if effects && b.aux != 0 && (50..=55).contains(&(b.frame - b.aux)) {
                         eprintln!("EFFECTS frame {}: {:.2} ms", b.frame, self.frame_ms);
                     }
                 }
@@ -3334,6 +3347,7 @@ impl App {
                 }
                 let settled = b.frame > if nested { 760 } else if component { 640 } else if auto { 356 } else { 260 };
                 let settled = settled && (textpath.is_none() || (b.aux != 0 && b.frame > b.aux + 80));
+                let settled = settled && (!print || (b.aux != 0 && b.frame > b.aux + 80));
                 let settled = settled && (!effects || (b.aux != 0 && b.frame > b.aux + 80 && self.ext.busy() == 0));
                 let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && settled && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {

@@ -110,13 +110,19 @@
   },
   {
     "name": "export",
-    "description": "Export a node or the whole document to a file on disk. The format follows the file extension: .png, .jpg or .svg.",
+    "description": "Export a node or the whole document to a file on disk. The format follows the file extension: .png, .jpg, .svg or .pdf. A PDF is vector (text as outlines); with `id` it has one page, without it every top-level frame of the current page becomes a PDF page (rows top to bottom, left to right). Print options: `bleed` extends the exported area on all four sides (a frame's own fill and the layers sticking out of it fill the bleed; layers outside the frame are not shown), `crop_marks` adds trim marks in a margin around it, and for PDF `color: \"cmyk\"` converts everything to DeviceCMYK (neutral vector colours such as black text become black ink only). A PDF with bleed or marks carries TrimBox and BleedBox. Without `icc` the CMYK conversion is a plain formula with no colour management. Returns the path and, for PDF, `pages`, `trim_size_pt` and how the colours were made.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "path": { "type": "string", "description": "Absolute output path ending in .png, .jpg or .svg." },
-        "id": { "type": "integer", "description": "Node to export. Omit for the whole document." },
-        "scale": { "type": "number", "description": "Pixel scale for PNG/JPG, e.g. 2 for @2x (default 1)." }
+        "path": { "type": "string", "description": "Absolute output path ending in .png, .jpg, .svg or .pdf." },
+        "id": { "type": "integer", "description": "Node to export. Omit for the whole document (PDF: every frame as a page)." },
+        "scale": { "type": "number", "description": "Pixel scale for PNG/JPG, e.g. 2 for @2x (default 1)." },
+        "bleed": { "type": "number", "description": "Bleed in millimetres on every side (default 0; print shops usually ask for 3)." },
+        "resolution": { "type": "number", "description": "Document px per inch of paper, for the size of a PDF page and of the bleed (default 72: 1 px = 1 pt, as the Paper presets; use 300 for a design made in 300 dpi pixels, e.g. A4 = 2480 x 3508)." },
+        "crop_marks": { "type": "boolean", "description": "Crop marks at the four corners, outside the bleed (default false)." },
+        "color": { "type": "string", "enum": ["rgb", "cmyk"], "description": "PDF only: colour of the output (default rgb)." },
+        "flatten": { "type": "boolean", "description": "PDF only: every page as one 300 dpi image instead of vectors (default false)." },
+        "icc": { "type": "string", "description": "PDF with color cmyk: absolute path of the CMYK ICC profile of the press; embedded as the output intent and used for the conversion." }
       },
       "required": ["path"]
     }

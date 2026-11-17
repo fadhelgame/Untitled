@@ -10,6 +10,7 @@ mod find;
 mod fonts;
 mod layout;
 mod outline;
+mod print;
 mod svg_import;
 mod textpath;
 

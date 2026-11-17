@@ -930,10 +930,41 @@ pub fn inner_shadow_svg(n: &Node, fonts: &mut FontManager, ctx: &egui::Context) 
 
 /// SVG untuk satu node (mis. frame terpilih) atau seluruh dokumen. Hasil: (svg, lebar, tinggi).
 pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, f32, f32)> {
+    to_svg_bleed(doc, only, 0.0, fonts, ctx)
+}
+
+/// A frame as it is exported with `bleed` around it: its own rectangle is larger by the bleed
+/// on every side (its corners square, as the page is cut out of it), so its fill, gradient or
+/// image is drawn for the larger area and what it holds is clipped there instead of at the
+/// frame's edge. The layers inside keep their places.
+fn bleed_frame(n: &Node, bleed: f32) -> Node {
+    let mut f = n.clone();
+    let grow = |at: &mut f32, size: &mut f32| {
+        let sign = if *size < 0.0 { -1.0 } else { 1.0 };
+        *at -= bleed * sign;
+        *size += bleed * 2.0 * sign;
+    };
+    grow(&mut f.x, &mut f.w);
+    grow(&mut f.y, &mut f.h);
+    f.radius = 0.0;
+    f
+}
+
+/// `to_svg` for print, with `bleed` document px around the exported area: the result is
+/// larger by twice the bleed each way. A frame fills its bleed (see `bleed_frame`); layers
+/// outside the frame are not shown. Around any other layer, or the whole document, the bleed
+/// is only as full as the layers that reach into it.
+pub fn to_svg_bleed(doc: &Doc, only: Option<u64>, bleed: f32, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, f32, f32)> {
     let assets = &doc.assets;
+    let bleed = if bleed.is_finite() { bleed.max(0.0) } else { 0.0 };
     // Texts on a path find their line here (see `text_svg`).
     fonts.paths = doc.guides();
     let target = only.and_then(|id| doc.find(id));
+    let grown = target.filter(|n| bleed > 0.0 && n.kind == Kind::Frame).map(|n| bleed_frame(n, bleed));
+    let (target, bleed) = match &grown {
+        Some(frame) => (Some(frame), 0.0),
+        None => (target, bleed),
+    };
     let (x0, y0, x1, y1) = match target {
         Some(n) => {
             // Stroke garis/path melebar keluar dari kotak pembatas.
@@ -948,6 +979,7 @@ pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui:
         }
         None => doc.bounds()?,
     };
+    let (x0, y0, x1, y1) = (x0 - bleed, y0 - bleed, x1 + bleed, y1 + bleed);
     let (w, h) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{x0} {y0} {w} {h}">"#
@@ -1121,7 +1153,7 @@ fn backdrop_image(
 }
 
 /// Render SVG ke PNG atau JPG pada skala tertentu (1x, 2x, 0.5x, …).
-fn rasterize(svg: &str, w: f32, h: f32, scale: f32) -> Result<resvg::tiny_skia::Pixmap, String> {
+pub(crate) fn rasterize(svg: &str, w: f32, h: f32, scale: f32) -> Result<resvg::tiny_skia::Pixmap, String> {
     use resvg::{tiny_skia, usvg};
     let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).map_err(|e| e.to_string())?;
     let (pw, ph) = ((w * scale).ceil() as u32, (h * scale).ceil() as u32);
@@ -1196,40 +1228,9 @@ pub fn save_batch(items: &[(String, String, f32, f32)], dir: &Path, fmt: usize, 
     (done, first_err)
 }
 
+/// (See `print::pdf_bytes`; this is the export without any print settings.)
 pub fn save_pdf(pages: &[(String, f32, f32)], path: &Path) -> Result<(), String> {
-    use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref};
-    use resvg::usvg;
-    let mut alloc = Ref::new(1);
-    let (catalog_id, tree_id) = (alloc.bump(), alloc.bump());
-    let mut pdf = Pdf::new();
-    let mut kids = Vec::new();
-    let name = Name(b"S");
-    for (svg, w, h) in pages {
-        let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).map_err(|e| e.to_string())?;
-        // Bagian yang memakai filter (bayangan, color overlay) menjadi bitmap; 3× cukup tajam untuk cetak.
-        let options = svg2pdf::ConversionOptions { raster_scale: 3.0, ..Default::default() };
-        let (chunk, root) = svg2pdf::to_chunk(&tree, options).map_err(|e| e.to_string())?;
-        // Nomor objek tiap halaman dibuat ulang supaya tidak bertabrakan di dalam satu file.
-        let mut map = std::collections::HashMap::new();
-        let chunk = chunk.renumber(|old| *map.entry(old).or_insert_with(|| alloc.bump()));
-        let root = *map.get(&root).ok_or("the page couldn't be converted")?;
-        let (page_id, content_id) = (alloc.bump(), alloc.bump());
-        let mut page = pdf.page(page_id);
-        page.media_box(Rect::new(0.0, 0.0, *w, *h));
-        page.parent(tree_id);
-        page.contents(content_id);
-        page.resources().x_objects().pair(name, root);
-        page.finish();
-        // Hasil konversi berukuran 1×1; dibentangkan ke ukuran halaman.
-        let mut content = Content::new();
-        content.transform([*w, 0.0, 0.0, *h, 0.0, 0.0]).x_object(name);
-        pdf.stream(content_id, &content.finish());
-        pdf.extend(&chunk);
-        kids.push(page_id);
-    }
-    pdf.catalog(catalog_id).pages(tree_id);
-    pdf.pages(tree_id).kids(kids.iter().copied()).count(kids.len() as i32);
-    std::fs::write(path, pdf.finish()).map_err(|e| e.to_string())
+    crate::print::save_pdf(pages, &crate::print::Print::default(), path).map(|_| ())
 }
 
 /// Urutan halaman untuk export PDF: frame level atas yang terlihat, dibaca seperti teks

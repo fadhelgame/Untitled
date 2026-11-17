@@ -1695,6 +1695,8 @@ dependencies = [
  "i_overlay",
  "image",
  "lyon_tessellation",
+ "miniz_oxide 0.8.9",
+ "moxcms",
  "ort",
  "pdf-writer",
  "resvg",
