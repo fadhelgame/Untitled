@@ -1611,7 +1611,7 @@ impl App {
         true
     }
 
-    /// File yang dijatuhkan ke jendela: gambar jadi node, `.kanvas` dibuka.
+    /// File yang dijatuhkan ke jendela: gambar jadi node (an SVG becomes editable layers), `.kanvas` dibuka.
     pub(super) fn dropped_files(&mut self, ctx: &egui::Context) {
         let (files, pos) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.latest_pos()));
         if self.library_take_drop(ctx, &files, pos) {
@@ -1638,7 +1638,7 @@ impl App {
             };
             match bytes {
                 Some(bytes) => {
-                    if self.add_image(bytes, &name, pos.map(|p| p + vec2(offset, offset))) {
+                    if self.place_file(bytes, &name, pos.map(|p| p + vec2(offset, offset))) {
                         offset += 24.0;
                     }
                 }

@@ -9,6 +9,8 @@ mod file;
 mod find;
 mod fonts;
 mod layout;
+mod outline;
+mod svg_import;
 
 use eframe::egui;
 

@@ -62,6 +62,30 @@
     }
   },
   {
+    "name": "import_svg",
+    "description": "Import SVG markup as editable layers (not as a picture; for that use create_nodes with kind image and `svg`). The result is one frame the size of the SVG (its width / height, or its viewBox), named `name`, that holds a vector path per SVG shape with fill, stroke, opacity and gradients carried over and all transforms applied; basic shapes, `use` and text (if the font is installed) become paths too, groups become Kanvas groups (one level), embedded bitmaps become image layers. Not carried over, and reported in `not_supported` by kind: masks, clip paths (other than one around the whole page), filters, pattern fills, blend modes Kanvas does not have. Stroke caps and joins are not part of the Kanvas model. One undo step. Returns the frame `id`, its size, and the number of `shapes`; read the layers with get_document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "svg": { "type": "string", "description": "The SVG document as text (starts with <svg … or <?xml …)." },
+        "name": { "type": "string", "description": "Name of the frame (default \"SVG\")." },
+        "x": { "type": "number", "description": "Left edge of the frame, relative to `parent` if given (default 0)." },
+        "y": { "type": "number", "description": "Top edge of the frame (default 0)." },
+        "parent": { "type": "integer", "description": "Frame to put it in. Omit for the top level." }
+      },
+      "required": ["svg"]
+    }
+  },
+  {
+    "name": "outline_stroke",
+    "description": "Outline stroke (Ctrl+Shift+O in the app): turn the stroke of each node into a filled vector path of the same shape and color, so it can be edited, united or given a gradient like any other shape. Works for rectangles (with corner radius), ellipses, lines, vector paths (open or closed, with holes, dashed) and images; inside / center / outside alignment, rotation and flips are taken into account. A shape that has a fill stays, without its stroke, and the outline is put right above it in one group with it; a shape without a fill is replaced by its outline and keeps its id. The inside border of a frame becomes the top layer in that frame. Text strokes and other frame borders are skipped, nodes without a stroke are ignored. One undo step. Returns `outlines` (ids of the outline paths), `selected` (those plus the shapes they belong to) and `skipped`.",
+    "inputSchema": {
+      "type": "object",
+      "properties": { "ids": { "type": "array", "items": { "type": "integer" } } },
+      "required": ["ids"]
+    }
+  },
+  {
     "name": "select_nodes",
     "description": "Select layers in the app so the user can see what you mean, and by default zoom the view to them. Empty ids clears the selection and zooms to fit the whole document.",
     "inputSchema": {

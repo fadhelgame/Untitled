@@ -621,6 +621,12 @@ fn unit(a: P2) -> P2 {
 /// Ubah poligon tertutup (hasil boolean atas kurva yang diratakan) kembali jadi titik path:
 /// sudut tajam dan sisi lurus dipertahankan, bagian melengkung dicocokkan dengan kurva bezier.
 fn fit_closed(poly: &[P2]) -> Vec<PenPt> {
+    fit_closed_tol(poly, None)
+}
+
+/// `fit_closed` with the largest distance the curves may stray from the polygon given (`None`: a
+/// small part of its size).
+pub(crate) fn fit_closed_tol(poly: &[P2], tol: Option<f64>) -> Vec<PenPt> {
     // Buang titik yang nyaris berimpit (potongan sangat pendek di titik potong).
     let mut p: Vec<P2> = Vec::with_capacity(poly.len());
     for &q in poly {
@@ -640,7 +646,7 @@ fn fit_closed(poly: &[P2]) -> Vec<PenPt> {
     for q in &p {
         (x0, y0, x1, y1) = (x0.min(q.0), y0.min(q.1), x1.max(q.0), y1.max(q.1));
     }
-    let tol = ((x1 - x0).hypot(y1 - y0) * 0.0002).max(0.04);
+    let tol = tol.unwrap_or(((x1 - x0).hypot(y1 - y0) * 0.0002).max(0.04));
 
     let seg = |i: usize| sub(p[(i + 1) % m], p[i]);
     let seg_len: Vec<f64> = (0..m).map(|i| len(seg(i))).collect();

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 mod assist;
 mod autolayout;
 pub(crate) mod blend;
-mod builder;
+pub(crate) mod builder;
 mod canvas;
 mod components;
 mod constraints;
@@ -24,7 +24,7 @@ mod library;
 mod pacer;
 mod pages;
 mod panel;
-mod pen;
+pub(crate) mod pen;
 pub(crate) mod perf;
 mod photos;
 mod picker;
@@ -34,6 +34,7 @@ pub mod rembg;
 mod remote;
 mod rulers;
 mod styles;
+mod svg;
 pub(crate) mod render;
 mod theme;
 mod vtext;
@@ -1084,6 +1085,8 @@ impl App {
                 let d = vec2((c.x - (b.0 + b.2) * 0.5).round(), (c.y - (b.1 + b.3) * 0.5).round());
                 self.add_nodes(nodes, d, None);
             }
+            // SVG markup: editable layers.
+            None if self.paste_svg(text, at) => {}
             None => {
                 // Teks biasa dari clipboard: jadikan node teks di posisi pointer.
                 let mut n = Node::new(0, Kind::Text, c.x.round(), c.y.round());
@@ -1360,8 +1363,10 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let cmd = Modifiers::COMMAND;
-        let (save_as, save, open, new) = ctx.input_mut(|i| {
+        // Ctrl+Shift+O (outline stroke) before Ctrl+O, whose pattern would match it as well.
+        let (outline, save_as, save, open, new) = ctx.input_mut(|i| {
             (
+                i.consume_key(cmd | Modifiers::SHIFT, Key::O),
                 i.consume_key(cmd | Modifiers::SHIFT, Key::S),
                 i.consume_key(cmd, Key::S),
                 i.consume_key(cmd, Key::O),
@@ -1378,6 +1383,9 @@ impl App {
         }
         if new {
             self.new_doc();
+        }
+        if outline && !ctx.wants_keyboard_input() && self.editing.is_none() && self.ext.picker.eyedrop.is_none() {
+            self.outline_stroke();
         }
 
         // Eyedropper aktif: Esc membatalkan, shortcut lain ditahan supaya layar tetap sama dengan tangkapannya.
@@ -1679,6 +1687,15 @@ impl App {
                     ui.close_menu();
                     self.save(true);
                 }
+                ui.separator();
+                if ui.button("Import…").on_hover_text("Place images on the canvas. An SVG becomes editable layers.").clicked() {
+                    ui.close_menu();
+                    self.import_dialog(false);
+                }
+                if ui.button("Place SVG as image…").on_hover_text("Keep an SVG as one picture instead of converting it to layers.").clicked() {
+                    ui.close_menu();
+                    self.import_dialog(true);
+                }
             });
             ui.menu_button("Edit", |ui| {
                 let can_undo = self.pen_can_undo() || !self.undo.is_empty();
@@ -1758,6 +1775,10 @@ impl App {
                 if ui.add_enabled(several, egui::Button::new("Tidy up").shortcut_text("Ctrl+Alt+T")).clicked() {
                     ui.close_menu();
                     self.tidy_up();
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Outline stroke").shortcut_text("Ctrl+Shift+O")).clicked() {
+                    ui.close_menu();
+                    self.outline_stroke();
                 }
                 ui.separator();
                 if ui.add_enabled(has_sel, egui::Button::new("Add auto layout").shortcut_text("Shift+A")).clicked() {
@@ -1916,6 +1937,7 @@ impl App {
             ui.separator();
             item(ui, true, "Group", "Ctrl+G", 1);
             item(ui, grouped, "Ungroup", "Ctrl+Shift+G", 2);
+            item(ui, true, "Outline stroke", "Ctrl+Shift+O", 8);
             ui.separator();
             item(ui, true, "Create component", "Ctrl+Alt+K", 6);
             item(ui, detachable, "Detach instance", "Ctrl+Alt+B", 7);
@@ -2296,6 +2318,7 @@ impl App {
             Some(5) => self.delete_selection(),
             Some(6) => self.create_component(),
             Some(7) => self.detach_selection(),
+            Some(8) => self.outline_stroke(),
             Some(c @ 10..=18) => {
                 self.edit_selected(|n| n.tag = c - 10);
                 self.status = if c == 10 { "Layer color removed.".into() } else { format!("Layer color: {}.", LAYER_COLORS[(c - 10) as usize].0) };
@@ -2549,6 +2572,12 @@ impl App {
                 // are described at `bench_find_frame`, which drives them on later frames.
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_FIND") {
                     self.bench_find(&mode);
+                }
+                // `KANVAS_BENCH_SVG=<mode>`: an SVG imported as editable layers beside the same SVG as
+                // a bitmap, icons both ways, and stroked shapes before and after Outline stroke
+                // (see `bench_svg` for the modes).
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_SVG") {
+                    self.bench_svg(&mode, &mut b.inject);
                 }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
@@ -3156,6 +3185,13 @@ impl App {
                 }
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_FIND") {
                     self.bench_find_frame(ctx, &mode, b.frame, &mut b.inject);
+                }
+                if std::env::var_os("KANVAS_BENCH_SVG").is_some() && (250..=255).contains(&b.frame) {
+                    eprintln!("SVG frame {}: {:.2} ms", b.frame, self.frame_ms);
+                    if b.frame == 250 {
+                        let sel: Vec<(String, Kind)> = self.sel.iter().filter_map(|id| self.doc.find(*id)).map(|n| (n.name.clone(), n.kind)).collect();
+                        eprintln!("SVG selection {sel:?}; status: {}", self.status);
+                    }
                 }
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_TYPO") {
                     if (250..=255).contains(&b.frame) {

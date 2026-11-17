@@ -350,6 +350,11 @@ impl App {
     /// Taruh icon hasil pencarian ke tengah canvas.
     pub(super) fn add_icon(&mut self, index: usize) {
         let Some((id, Some(svg))) = self.icons.entries.get(index).map(|e| (e.id.clone(), e.svg.clone())) else { return };
+        // As editable vectors, one group; an icon that cannot be converted comes in as an image.
+        if self.add_svg(&svg, &id, None, Some(INSERT_SIDE)).is_ok() {
+            self.status = format!("Added icon \"{id}\" as editable vectors. Recolor it with Fill or Stroke.");
+            return;
+        }
         if !self.add_image(svg, &id, None) {
             return;
         }

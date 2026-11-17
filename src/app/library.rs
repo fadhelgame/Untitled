@@ -266,8 +266,13 @@ impl App {
         match std::fs::read(self.library.dir.join(&name)) {
             Ok(bytes) => {
                 let label = stem(&name).to_owned();
-                let ok = self.add_image(bytes, &label, at);
-                if ok {
+                // An SVG comes in as editable layers, at its own size (see `place_file`).
+                let ok = self.place_file(bytes, &name, at);
+                let image = self.sel.first().and_then(|id| self.doc.find(*id)).is_some_and(|n| n.kind == Kind::Image);
+                if ok && image {
+                    if let Some(n) = self.sel.first().copied().and_then(|id| self.doc.find_mut(id)) {
+                        n.name.clone_from(&label);
+                    }
                     self.fit_placed();
                     self.status = format!("Added \"{label}\" from the library.");
                 }

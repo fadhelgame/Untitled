@@ -2159,7 +2159,15 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 if n.dash > 0.0 {
                     add_dashed(&mut sink, ellipse_points(r.center(), radius), true, s, n, z);
                 } else {
-                    sink.add(egui::epaint::EllipseShape::stroke(r.center(), radius, s));
+                    // egui draws the stroke of an ellipse outside the radius it is given; the stroke
+                    // belongs centred on it (as in the export, the dashes and Outline stroke).
+                    let inner = radius - egui::Vec2::splat(s.width * 0.5);
+                    if inner.x > 0.0 && inner.y > 0.0 {
+                        sink.add(egui::epaint::EllipseShape::stroke(r.center(), inner, s));
+                    } else {
+                        // As wide as the ellipse itself: the stroke covers all of it.
+                        sink.add(egui::epaint::EllipseShape::filled(r.center(), radius + egui::Vec2::splat(s.width * 0.5), s.color));
+                    }
                 }
             }
         }

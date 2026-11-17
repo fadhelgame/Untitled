@@ -620,7 +620,7 @@ impl App {
 
     fn remote_run(&mut self, cmd: &str, args: &Value) -> Result<Outcome, String> {
         // Perintah yang mengubah dokumen: akhiri dulu mode edit teks / titik path.
-        if matches!(cmd, "create_nodes" | "update_nodes" | "delete_nodes" | "arrange" | "history" | "file" | "pages" | "replace_text") {
+        if matches!(cmd, "create_nodes" | "update_nodes" | "delete_nodes" | "arrange" | "history" | "file" | "pages" | "replace_text" | "import_svg" | "outline_stroke") {
             self.finish_text_edit();
             self.ext.path_edit = None;
         }
@@ -637,6 +637,8 @@ impl App {
             "file" => self.remote_file(args).map(Outcome::Now),
             "list_fonts" => self.remote_fonts(args).map(Outcome::Now),
             "replace_text" => self.remote_replace(args),
+            "import_svg" => self.remote_import_svg(args).map(Outcome::Now),
+            "outline_stroke" => self.remote_outline(args).map(Outcome::Now),
             "screenshot" => {
                 let id = self.target(args)?;
                 let max = args.get("max_size").map(|v| num("max_size", v)).transpose()?.unwrap_or(1024.0).clamp(64.0, 2048.0);
@@ -1375,6 +1377,64 @@ impl App {
         self.home = false;
         self.status = format!("Remote: replaced {count} match{} in {} layer{}.", if count == 1 { "" } else { "es" }, ids.len(), if ids.len() == 1 { "" } else { "s" });
         Ok(Outcome::Later(After::Replaced { count, ids }, Vec::new()))
+    }
+
+    /// `import_svg`: SVG markup as editable layers in a frame of its own (see `svg_import`).
+    fn remote_import_svg(&mut self, args: &Value) -> Result<Value, String> {
+        let markup = args.get("svg").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).ok_or("`svg` must be SVG markup (a string that starts with <svg …>)")?;
+        let name = args.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("SVG");
+        let parent = args.get("parent").and_then(Value::as_u64).filter(|p| *p != 0);
+        let o = match parent {
+            Some(p) => self.parent_origin(p)?,
+            None => (0.0, 0.0),
+        };
+        let at = |key: &str| args.get(key).map(|v| num(key, v)).transpose().map(|v| v.unwrap_or(0.0));
+        let (x, y) = (at("x")?, at("y")?);
+        let imp = crate::svg_import::import(markup.as_bytes(), name).map_err(|e| format!("couldn't read the SVG: {e}"))?;
+        if imp.shapes == 0 {
+            return Err("the SVG has nothing in it that can be imported (no shapes, text or images)".into());
+        }
+        let (shapes, groups) = (imp.shapes, imp.groups.len());
+        let dropped: Map<String, Value> = imp.dropped.iter().map(|(kind, count)| ((*kind).to_owned(), json!(count))).collect();
+        let pre = self.doc.clone();
+        let mut root = self.adopt_svg(imp, true);
+        root.translate(o.0 + x, o.1 + y);
+        if let Err(e) = self.may_hold(&root, parent) {
+            self.doc = pre;
+            return Err(e);
+        }
+        let (id, w, h) = (root.id, root.w, root.h);
+        self.doc.insert(root, parent);
+        self.push_undo(pre);
+        self.sel = vec![id];
+        self.home = false;
+        self.reveal(&[id]);
+        self.status = format!("Remote: imported {shapes} shape{} from an SVG.", if shapes == 1 { "" } else { "s" });
+        Ok(json!({ "id": id, "w": r2(w), "h": r2(h), "shapes": shapes, "groups": groups, "not_supported": dropped }))
+    }
+
+    /// `outline_stroke`: strokes become filled paths (see `Doc::outline_strokes`), one undo step.
+    fn remote_outline(&mut self, args: &Value) -> Result<Value, String> {
+        let ids = id_list(args.get("ids"))?;
+        if ids.is_empty() {
+            return Err("`ids` is empty".into());
+        }
+        if let Some(missing) = ids.iter().find(|id| self.doc.find(**id).is_none()) {
+            return Err(format!("node {missing} not found"));
+        }
+        if let Some(id) = ids.iter().find(|id| self.doc.pinned(**id)) {
+            return Err(format!("node {id} is part of an instance: its shape follows the main component. Outline the stroke there, or detach the instance first."));
+        }
+        let pre = self.doc.clone();
+        let done = self.doc.outline_strokes(&ids);
+        if done.outlines.is_empty() {
+            self.doc = pre;
+            return Err("none of those nodes has a stroke that can be outlined (not the stroke of a text, and the border of a frame only when it is inside the frame)".into());
+        }
+        self.push_undo(pre);
+        self.sel.clone_from(&done.ids);
+        self.status = format!("Remote: outlined {} stroke{}.", done.outlines.len(), if done.outlines.len() == 1 { "" } else { "s" });
+        Ok(json!({ "outlines": done.outlines, "selected": done.ids, "skipped": done.text + done.skipped }))
     }
 
     fn remote_delete(&mut self, args: &Value) -> Result<Value, String> {
