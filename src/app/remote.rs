@@ -315,6 +315,12 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     if n.rotation != 0.0 {
         put("rotation", r2(n.rotation));
     }
+    if n.flips().0 {
+        put("flip_h", json!(true));
+    }
+    if n.flips().1 {
+        put("flip_v", json!(true));
+    }
     if n.opacity != 1.0 {
         put("opacity", r2(n.opacity));
     }
@@ -793,6 +799,20 @@ impl App {
                 }
                 "blur" => n.blur = if v.is_null() { 0.0 } else { num(k, v)?.clamp(0.0, 500.0) },
                 "rotation" => n.rotation = num(k, v)?,
+                "flip_h" | "flip_v" => {
+                    let on = flag(k, v)?;
+                    // These mirror what a node shows in its box. A path or line has its points
+                    // mirrored instead, and a frame takes its content along: both by `arrange`.
+                    if matches!(n.kind, Kind::Path | Kind::Line | Kind::Frame) {
+                        if on {
+                            return Err(format!("`{k}` is a property of rects, ellipses, images and text; to flip a {}, use arrange with action \"{k}\"", n.kind.label().to_lowercase()));
+                        }
+                    } else if k == "flip_h" {
+                        n.flip_h = on;
+                    } else {
+                        n.flip_v = on;
+                    }
+                }
                 "opacity" => n.opacity = num(k, v)?.clamp(0.0, 1.0),
                 "visible" => n.visible = flag(k, v)?,
                 "locked" => n.locked = flag(k, v)?,
@@ -1124,7 +1144,7 @@ impl App {
         }
         if !matches!(action, "reset") {
             if let Some(id) = ids.iter().find(|id| self.doc.pinned(**id)) {
-                return Err(format!("node {id} is part of an instance: its order and grouping follow the main component"));
+                return Err(format!("node {id} is part of an instance: its place, order and grouping follow the main component (to mirror what it shows, set flip_h / flip_v with update_nodes)"));
             }
         }
         let pre = self.doc.clone();
@@ -1165,7 +1185,20 @@ impl App {
                 self.doc.ungroup(&groups);
                 out = json!({ "ungrouped": groups });
             }
-            other => return Err(format!("unknown action \"{other}\"; use front, back, forward, backward, group, ungroup, component, detach or reset")),
+            "distribute_h" | "distribute_v" => {
+                if !self.doc.distribute(&ids, action == "distribute_h") {
+                    return Err("distributing needs at least three nodes (the members of a group count as one)".into());
+                }
+            }
+            "tidy" => {
+                if !self.doc.tidy(&ids) {
+                    return Err("tidying up needs at least two nodes (the members of a group count as one)".into());
+                }
+            }
+            "flip_h" | "flip_v" => {
+                self.doc.flip(&ids, action == "flip_h");
+            }
+            other => return Err(format!("unknown action \"{other}\"; use front, back, forward, backward, group, ungroup, component, detach, reset, distribute_h, distribute_v, tidy, flip_h or flip_v")),
         }
         self.push_undo(pre);
         self.status = format!("Remote: {action}.");

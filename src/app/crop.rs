@@ -30,6 +30,8 @@ pub enum Part {
 pub struct Geom {
     pivot: Pos2,
     rot: f32,
+    /// The image is flipped (left-right, top-bottom): local space is mirrored about the pivot.
+    flip: (bool, bool),
     pub crop: Rect,
     pub img: Rect,
 }
@@ -42,6 +44,7 @@ impl Geom {
         Geom {
             pivot: pos2(cx, cy),
             rot: n.rotation,
+            flip: n.flips(),
             crop: Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)),
             img: Rect::from_min_max(pos2(ix0, iy0), pos2(ix1, iy1)),
         }
@@ -55,14 +58,18 @@ impl Geom {
         pos2(x, y)
     }
 
+    fn mirror(&self, p: Pos2) -> Pos2 {
+        pos2(if self.flip.0 { 2.0 * self.pivot.x - p.x } else { p.x }, if self.flip.1 { 2.0 * self.pivot.y - p.y } else { p.y })
+    }
+
     /// Dunia → ruang lokal.
     fn local(&self, p: Pos2) -> Pos2 {
-        self.turn(p, -self.rot)
+        self.mirror(self.turn(p, -self.rot))
     }
 
     /// Ruang lokal → dunia.
     fn world(&self, p: Pos2) -> Pos2 {
-        self.turn(p, self.rot)
+        self.turn(self.mirror(p), self.rot)
     }
 
     /// Tulis ke node. Node berputar terhadap pusat kotaknya sendiri, jadi posisinya dihitung dari
@@ -302,10 +309,12 @@ impl App {
 
     pub(super) fn crop_cursor(&self, p: Option<Pos2>) -> Option<CursorIcon> {
         self.crop.as_ref()?;
-        if let Drag::Crop { part, .. } = &self.drag {
-            return Some(part_cursor(*part, true));
+        // Flipped one way only, the diagonals on screen are the other ones.
+        let odd = |g: &Geom| g.flip.0 != g.flip.1;
+        if let Drag::Crop { part, geom, .. } = &self.drag {
+            return Some(part_cursor(*part, true, odd(geom)));
         }
-        Some(p.and_then(|p| self.crop_hit(p)).map_or(CursorIcon::Default, |(part, _)| part_cursor(part, false)))
+        Some(p.and_then(|p| self.crop_hit(p)).map_or(CursorIcon::Default, |(part, g)| part_cursor(part, false, odd(&g))))
     }
 
     /// Overlay mode crop: garis gambar utuh dengan pegangan sudutnya, dan pegangan siku kotak crop.
@@ -424,13 +433,13 @@ impl App {
     }
 }
 
-fn part_cursor(part: Part, dragging: bool) -> CursorIcon {
+fn part_cursor(part: Part, dragging: bool, odd: bool) -> CursorIcon {
     match part {
         Part::Pan if dragging => CursorIcon::Grabbing,
         Part::Pan => CursorIcon::Grab,
         Part::Edge(h) | Part::Image(h) => match h {
-            0 | 4 => CursorIcon::ResizeNwSe,
-            2 | 6 => CursorIcon::ResizeNeSw,
+            0 | 4 | 2 | 6 if (h % 4 == 0) == odd => CursorIcon::ResizeNeSw,
+            0 | 4 | 2 | 6 => CursorIcon::ResizeNwSe,
             1 | 5 => CursorIcon::ResizeVertical,
             _ => CursorIcon::ResizeHorizontal,
         },
@@ -469,6 +478,30 @@ mod tests {
             // Kotak gambar utuh yang diturunkan dari node tetap berukuran semula.
             let g = Geom::of(&n);
             assert!((g.img.width() - 400.0).abs() < 1e-2 && (g.img.height() - 200.0).abs() < 1e-2);
+        }
+    }
+
+    #[test]
+    fn cropping_a_flipped_image_keeps_it_in_place() {
+        for (rot, flip_h, flip_v) in [(0.0, true, false), (30.0, true, false), (0.0, false, true), (-20.0, true, true)] {
+            let mut n = image(rot);
+            (n.flip_h, n.flip_v) = (flip_h, flip_v);
+            let g = Geom::of(&n);
+            // The top-left handle of the crop box sits where the mirrored corner is on screen.
+            let corner = g.world(g.crop.min);
+            if rot == 0.0 {
+                assert_eq!(corner, pos2(if flip_h { 500.0 } else { 100.0 }, if flip_v { 250.0 } else { 50.0 }));
+            }
+            assert!((g.local(corner) - g.crop.min).length() < 1e-3);
+            // Dragging on screen towards the middle of the image shrinks the crop box.
+            let before = image_origin(&n);
+            let (from, to) = (g.local(corner), g.local(g.world(g.crop.min + vec2(100.0, 40.0))));
+            let mut g = g;
+            g.drag_edge(0, to - from, false);
+            g.write(&mut n);
+            assert!((n.w - 300.0).abs() < 1e-2 && (n.h - 160.0).abs() < 1e-2, "{rot} {flip_h} {flip_v}: {} x {}", n.w, n.h);
+            let after = image_origin(&n);
+            assert!((after - before).length() < 2e-2, "rot {rot}: {before:?} -> {after:?}");
         }
     }
 

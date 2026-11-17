@@ -589,6 +589,12 @@ impl App {
     }
 
     fn align(&mut self, mode: u8) {
+        // The buttons beside the alignment ones.
+        match mode {
+            6 | 7 => return self.distribute(mode == 6),
+            8 => return self.tidy_up(),
+            _ => {}
+        }
         if self.refuse_pinned() {
             return;
         }
@@ -616,6 +622,56 @@ impl App {
                 };
                 n.translate(dx.round(), dy.round());
             }
+        }
+        self.push_undo(pre);
+    }
+
+    /// Alt+Shift+H / Alt+Shift+V: equal gaps between the selected objects (a group is one).
+    fn distribute(&mut self, horizontal: bool) {
+        if self.sel.is_empty() || self.sel_locked() || self.refuse_pinned() {
+            return;
+        }
+        let pre = self.doc.clone();
+        if self.doc.distribute(&self.sel, horizontal) {
+            self.push_undo(pre);
+        } else {
+            self.status = "Select three or more objects to distribute the spacing between them.".into();
+        }
+    }
+
+    /// Ctrl+Alt+T: straighten a row or a column, or snap a loose layout into a grid.
+    fn tidy_up(&mut self) {
+        if self.sel.is_empty() || self.sel_locked() || self.refuse_pinned() {
+            return;
+        }
+        let pre = self.doc.clone();
+        if self.doc.tidy(&self.sel) {
+            self.push_undo(pre);
+        } else {
+            self.status = "Select two or more objects to tidy up.".into();
+        }
+    }
+
+    /// Shift+H / Shift+V: mirror the selection about the centre of the box around it.
+    fn flip(&mut self, horizontal: bool) {
+        if self.sel.is_empty() || self.sel_locked() {
+            return;
+        }
+        let pre = self.doc.clone();
+        if self.sel_pinned() {
+            // A part of an instance stays where the main has it: only what it shows is mirrored.
+            let stuck = |n: &Node| n.source.is_none() || matches!(n.kind, Kind::Path | Kind::Line | Kind::Frame);
+            if self.sel.iter().any(|id| self.doc.find(*id).is_some_and(stuck)) {
+                self.status = "Inside an instance only shapes, images and text can be flipped, each in place. Flip the whole instance, or edit the main component.".into();
+                return;
+            }
+            for id in self.sel.clone() {
+                if let Some(n) = self.doc.find_mut(id) {
+                    n.mirror_look(horizontal);
+                }
+            }
+        } else if !self.doc.flip(&self.sel, horizontal) {
+            return;
         }
         self.push_undo(pre);
     }
@@ -1051,6 +1107,9 @@ impl App {
         self.edit_frames = 0;
         self.edit_pre = Some(pre);
         self.sel = vec![id];
+        if self.doc.find(id).is_some_and(|n| n.flips() != (false, false)) {
+            self.status = "This text is flipped: it reads the normal way while you edit it, and is mirrored again when you are done.".into();
+        }
     }
 
     fn finish_text_edit(&mut self) {
@@ -1393,6 +1452,12 @@ impl App {
                 Key::M if s && !c && !a => self.tool = Tool::ShapeBuilder,
                 Key::I if plain => self.toggle_eyedropper(),
                 // Rata: Alt+A/D kiri/kanan, Alt+W/S atas/bawah, Alt+H/V tengah
+                // Alt+Shift+H/V jarak sama rata, Ctrl+Alt+T rapikan, Shift+H/V balik
+                Key::H if a && s && !c => self.distribute(true),
+                Key::V if a && s && !c => self.distribute(false),
+                Key::T if c && a => self.tidy_up(),
+                Key::H if s && !c && !a => self.flip(true),
+                Key::V if s && !c && !a => self.flip(false),
                 Key::A if a && !c => self.align(0),
                 Key::D if a && !c => self.align(1),
                 Key::H if a && !c => self.align(2),
@@ -1564,6 +1629,28 @@ impl App {
                 if ui.add(egui::Button::new("Ungroup").shortcut_text("Ctrl+Shift+G")).clicked() {
                     ui.close_menu();
                     self.ungroup_selection();
+                }
+                ui.separator();
+                if ui.add_enabled(has_sel, egui::Button::new("Flip horizontal").shortcut_text("Shift+H")).clicked() {
+                    ui.close_menu();
+                    self.flip(true);
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Flip vertical").shortcut_text("Shift+V")).clicked() {
+                    ui.close_menu();
+                    self.flip(false);
+                }
+                let several = self.sel.len() > 1;
+                if ui.add_enabled(several, egui::Button::new("Distribute horizontal spacing").shortcut_text("Alt+Shift+H")).clicked() {
+                    ui.close_menu();
+                    self.distribute(true);
+                }
+                if ui.add_enabled(several, egui::Button::new("Distribute vertical spacing").shortcut_text("Alt+Shift+V")).clicked() {
+                    ui.close_menu();
+                    self.distribute(false);
+                }
+                if ui.add_enabled(several, egui::Button::new("Tidy up").shortcut_text("Ctrl+Alt+T")).clicked() {
+                    ui.close_menu();
+                    self.tidy_up();
                 }
                 ui.separator();
                 if ui.add_enabled(has_sel, egui::Button::new("Create component").shortcut_text("Ctrl+Alt+K")).clicked() {
@@ -2174,10 +2261,12 @@ impl App {
                 }
                 // `KANVAS_BENCH_CROP=<derajat>`: klik dua kali gambar demo (mode crop), tarik pegangan
                 // crop kiri-atas ke dalam, lalu geser gambarnya. Gambarnya diputar sebesar nilai itu.
+                // With `KANVAS_BENCH_CROP_FLIP` the image is flipped left-right first.
                 if let Ok(rot) = std::env::var("KANVAS_BENCH_CROP") {
                     let id = self.doc.nodes.iter().flat_map(|n| n.children.iter()).find(|c| c.name == "Image").map(|c| c.id);
                     if let Some(n) = id.and_then(|id| self.doc.find_mut(id)) {
                         n.rotation = rot.parse().unwrap_or(0.0);
+                        n.flip_h = std::env::var_os("KANVAS_BENCH_CROP_FLIP").is_some();
                         let (b0, c, o) = (n.aabb(), n.center(), self.canvas_rect.min);
                         let h0 = handles(n, false)[0];
                         self.zoom_to((b0.0 - 60.0, b0.1 - 60.0, b0.2 + 60.0, b0.3 + 60.0), 8.0);
@@ -2245,6 +2334,29 @@ impl App {
                     b.inject.extend(click(440, at).into_iter().chain(click(444, at)));
                     let to = at + vec2(90.0, 60.0);
                     b.inject.extend([(580, mv(at)), (582, button(at, true)), (584, mv(at + (to - at) * 0.5)), (586, mv(to)), (590, button(to, false)), (596, mv(to + vec2(0.0, 200.0)))]);
+                }
+                // `KANVAS_BENCH_FLIP=1`: an image, a text, a gradient shape and a vector, each beside
+                // its flipped copies (see `bench_flip`). The frame is also exported, to compare.
+                if std::env::var("KANVAS_BENCH_FLIP").is_ok() {
+                    self.bench_flip();
+                }
+                // `KANVAS_BENCH_DISTRIBUTE=1`: a row distributed and a loose grid tidied up (see
+                // `bench_distribute`), then a box dragged to just short of equal spacing and held
+                // there, so the snap and its markers are in the screenshot.
+                // `=panel` leaves out the drag and keeps the row selected, to show the panel.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_DISTRIBUTE") {
+                    let (from, to, id) = self.bench_distribute();
+                    b.ids = vec![id];
+                    if mode == "panel" {
+                        let row = self.doc.parent_of(id).and_then(|p| self.doc.find(p)).map(|p| p.children.iter().filter(|c| c.name == "Row").map(|c| c.id).collect());
+                        self.sel = row.unwrap_or_default();
+                    }
+                    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                    let mv = egui::Event::PointerMoved;
+                    if mode != "panel" {
+                        b.inject.extend([(200, mv(from)), (202, button(from, true))]);
+                        b.inject.extend((1..=8u32).map(|s| (202 + s, mv(from + (to - from) * (s as f32 / 8.0)))));
+                    }
                 }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
@@ -2579,6 +2691,10 @@ impl App {
                 if b.frame == 240 && std::env::var("KANVAS_BENCH_OVERLAY").is_ok() {
                     self.edit_selected(|n| n.fill = Some([0, 102, 227, 255]));
                 }
+                if b.frame == 250 && b.ids.len() == 1 && std::env::var_os("KANVAS_BENCH_DISTRIBUTE").is_some() {
+                    let left = self.doc.find(b.ids[0]).zip(self.doc.parent_of(b.ids[0]).and_then(|p| self.doc.find(p))).map(|(n, p)| n.x - p.x);
+                    eprintln!("DISTRIBUTE dragged box at {left:?} (want 320: 50 from its neighbour, like the two beside it), {} markers", self.ext.gaps.len());
+                }
                 let component = b.ids.len() == 6 && std::env::var_os("KANVAS_BENCH_COMPONENT").is_some();
                 if component {
                     let (main_rect, main_label, wide, own) = (b.ids[1], b.ids[2], b.ids[3], b.ids[4]);
@@ -2668,6 +2784,11 @@ impl App {
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                    if let Some(id) = self.doc.nodes.iter().find(|n| n.name == "Flip demo").map(|n| n.id) {
+                        if let Some((svg, w, h)) = export::to_svg(&self.doc, Some(id), &mut self.fonts, ctx) {
+                            let _ = export::save_raster(&svg, w, h, 1.0, false, &b.out.with_file_name("bench-flip-export.png"));
+                        }
+                    }
                     // Export frame demo juga, untuk dibandingkan dengan tampilan canvas.
                     if std::env::var("KANVAS_BENCH_BLUR").is_ok() {
                         if let Some(id) = self.doc.nodes.iter().find(|n| n.name == "Feature demo").map(|n| n.id) {
@@ -2936,6 +3057,70 @@ fn align_icon(p: &egui::Painter, c: Pos2, mode: u8, color: Color32) {
         let b0 = if i == 0 { -5.0 } else { 1.5 };
         p.rect_filled(Rect::from_two_pos(at(*a0, b0), at(*a1, b0 + 3.5)), CornerRadius::same(1), color);
     }
+}
+
+/// The buttons beside the alignment ones: distribute spacing (needs three units) and tidy up
+/// (two). Result: the mode for `App::align`.
+fn distribute_buttons(ui: &mut egui::Ui, units: usize) -> Option<u8> {
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (mode, need, tip) in [
+            (6u8, 3, "Distribute horizontal spacing  (Alt+Shift+H)"),
+            (7, 3, "Distribute vertical spacing  (Alt+Shift+V)"),
+            (8, 2, "Tidy up  (Ctrl+Alt+T)"),
+        ] {
+            if mode == 8 {
+                ui.add_space(8.0);
+            }
+            ui.add_enabled_ui(units >= need, |ui| {
+                if icon_button(ui, false, tip, |p, c, color| distribute_icon(p, c, mode, color)) {
+                    picked = Some(mode);
+                }
+            });
+        }
+    });
+    picked
+}
+
+fn distribute_icon(p: &egui::Painter, c: Pos2, mode: u8, color: Color32) {
+    if mode == 8 {
+        // Tidy up: a small grid.
+        for (ix, iy) in [(-1.0_f32, -1.0_f32), (0.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+            p.rect_filled(Rect::from_center_size(c + vec2(ix * 5.5, iy * 3.5), vec2(3.5, 3.5)), CornerRadius::same(1), color);
+        }
+        return;
+    }
+    // Two walls with a bar held halfway between them.
+    let at = |a: f32, b: f32| if mode == 7 { pos2(c.x + b, c.y + a) } else { pos2(c.x + a, c.y + b) };
+    for wall in [-7.0, 7.0] {
+        p.line_segment([at(wall, -7.0), at(wall, 7.0)], Stroke::new(1.2_f32, color));
+    }
+    p.rect_filled(Rect::from_two_pos(at(-2.0, -4.5), at(2.0, 4.5)), CornerRadius::same(1), color);
+}
+
+/// Flip buttons. Result: `true` for left-right, `false` for top-bottom.
+fn flip_buttons(ui: &mut egui::Ui) -> Option<bool> {
+    let mut picked = None;
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (horizontal, tip) in [(true, "Flip horizontal  (Shift+H)"), (false, "Flip vertical  (Shift+V)")] {
+        if icon_button(ui, false, tip, |p, c, color| flip_icon(p, c, horizontal, color)) {
+            picked = Some(horizontal);
+        }
+    }
+    picked
+}
+
+/// A triangle and its mirror image on either side of a dashed axis.
+fn flip_icon(p: &egui::Painter, c: Pos2, horizontal: bool, color: Color32) {
+    let at = |a: f32, b: f32| if horizontal { pos2(c.x + a, c.y + b) } else { pos2(c.x + b, c.y + a) };
+    for i in 0..4 {
+        let b = -7.0 + i as f32 * 4.0;
+        p.line_segment([at(0.0, b), at(0.0, b + 2.0)], Stroke::new(1.0_f32, color));
+    }
+    let side = |s: f32| vec![at(s * 2.5, -5.0), at(s * 2.5, 5.0), at(s * 8.0, 5.0)];
+    p.add(egui::Shape::closed_line(side(-1.0), Stroke::new(1.2_f32, color)));
+    p.add(egui::Shape::convex_polygon(side(1.0), color, Stroke::NONE));
 }
 
 fn text_align_icon(p: &egui::Painter, c: Pos2, mode: u8, color: Color32) {

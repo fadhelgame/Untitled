@@ -147,7 +147,9 @@ Every screenshot here is the real app.
       <h3>Components</h3>
       Turn a frame into a <b>component</b> (<code>Ctrl+Alt+K</code>) and every copy of it is an <b>instance</b>: change the main component and all its instances follow, on every page. An instance keeps what you changed on it (a label, a color, a photo) and still takes everything else from the main; it can be resized, and components can hold instances of other components. The <i>Components</i> button in the toolbar lists them all, one click to place.
       <h3>Select smarter</h3>
-      The <b>Magic wand</b> selects every object that shares a property with the one you click, with a tolerance for near-matching colors. Objects snap to edges and centers of their neighbors with guide lines as you move them. Turn on <b>rulers</b> with <code>Shift+R</code> and drag <b>guides</b> out of them; objects snap to guides too.
+      The <b>Magic wand</b> selects every object that shares a property with the one you click, with a tolerance for near-matching colors. Objects snap to edges and centers of their neighbors with guide lines as you move them, and to their <b>spacing</b>: when the gap to a neighbor matches the gap between two others, the object snaps there and the equal gaps are marked with their size. Turn on <b>rulers</b> with <code>Shift+R</code> and drag <b>guides</b> out of them; objects snap to guides too.
+      <h3>Arrange in one step</h3>
+      <b>Distribute spacing</b> (<code>Alt+Shift+H</code> / <code>Alt+Shift+V</code>) keeps the two outermost objects where they are and makes the gaps between the rest equal. <b>Tidy up</b> (<code>Ctrl+Alt+T</code>) straightens a row or a column, or snaps a loose bunch of objects into a clean grid. <b>Flip</b> (<code>Shift+H</code> / <code>Shift+V</code>) mirrors anything: photos, text, gradients, vectors, a group, or a frame with everything in it. A group counts as one object in all three.
       <h3>Images</h3>
       Drop or paste PNG, JPEG, WebP, GIF, BMP and SVG. Round the corners, tint an icon with a color overlay, or use a clipping mask. Double-click an image to <b>crop</b> it: drag the crop handles, drag the image to reposition it under the crop, scale it from its corners, or pick an aspect ratio; the original image is kept, so the crop can be changed any time. The <i>Icons</i> button in the toolbar searches 200,000+ open-source icons (Iconify) and drops them in as recolorable SVGs; <i>Photos</i> searches free-to-use stock photos (Openverse) and keeps the author credit in the layer name. The <b>Library</b> keeps your own logos, photos and graphics one click away in every document: add files once (or drop them onto the Library window, or save an image straight from the canvas), then drag them onto any design instead of digging through folders. <i>Remove background</i> runs on your computer in a couple of seconds; the first use downloads a 170 MB model.
       <h3>Export exactly what you see</h3>
@@ -168,7 +170,7 @@ Every screenshot here is the real app.
     </td>
     <td width="33%" valign="top">
       <h4>🗃️ Layers</h4>
-      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree that follows nested frames to any depth, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, components and instances, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment of several objects, duplicate with Alt+drag, rotation, and precise position and size fields.
+      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree that follows nested frames to any depth, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, components and instances, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment, equal spacing and tidy up of several objects, duplicate with Alt+drag, rotation, flip, and precise position and size fields.
     </td>
     <td width="33%" valign="top">
       <h4>💾 Files</h4>
@@ -210,6 +212,9 @@ Every screenshot here is the real app.
 | `Shift+M` | Shape builder | `Ctrl+Alt+G` | Clipping mask |
 | `T` | Text | `Alt+A` `D` `W` `S` | Align left / right / top / bottom |
 | `I` | Eyedropper | `Alt+H` `V` | Align centers |
+| | | `Alt+Shift+H` / `V` | Distribute horizontal / vertical spacing |
+| | | `Ctrl+Alt+T` | Tidy up (row, column or grid) |
+| | | `Shift+H` / `V` | Flip horizontal / vertical |
 | | | `Enter` / `Shift+Enter` | Select what is inside a frame / the frame around the selection |
 | | | `Ctrl` + click | Select the deepest object under the pointer |
 | | | `Ctrl+Alt+K` | Create a component from the selection |

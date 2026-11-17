@@ -496,6 +496,7 @@ impl App {
                 if tpl.kind != Kind::Path {
                     n.name = format!("Vector {}", n.id);
                 }
+                n.settle_flip();
                 n.kind = Kind::Path;
                 n.radius = 0.0;
                 n.children.clear();

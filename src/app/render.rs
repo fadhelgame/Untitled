@@ -51,6 +51,19 @@ pub struct Snap {
     pub orig: (f32, f32, f32, f32),
     pub xs: Vec<(f32, f32, f32)>,
     pub ys: Vec<(f32, f32, f32)>,
+    /// Boxes of the neighbours, for equal-spacing snapping, and for each axis (x, then y) the
+    /// pairs (a, b) of them where b is the next one after a along that axis.
+    pub boxes: Vec<(f32, f32, f32, f32)>,
+    pub pairs: [Vec<(usize, usize)>; 2],
+}
+
+/// An equal-spacing marker (world coordinates): the gap `lo`..`hi` along x, or along y when
+/// `vertical`, drawn at `at` on the other axis.
+pub struct GapMark {
+    pub vertical: bool,
+    pub lo: f32,
+    pub hi: f32,
+    pub at: f32,
 }
 
 /// Garis bantu yang sedang aktif (koordinat dunia).
@@ -152,6 +165,7 @@ pub struct Ext {
     pub rev: u64,
     pub snap: Option<Snap>,
     pub guides: Vec<Guide>,
+    pub gaps: Vec<GapMark>,
     /// Seleksi karakter terakhir di editor teks (indeks karakter).
     pub edit_sel: Option<(usize, usize)>,
     pub edit_refocus: bool,
@@ -251,6 +265,7 @@ impl Default for Ext {
             rev: 0,
             snap: None,
             guides: Vec::new(),
+            gaps: Vec::new(),
             edit_sel: None,
             edit_refocus: false,
             edit_anchor: 0,
@@ -731,6 +746,7 @@ pub fn paint_crop_ghost(pc: &mut PaintCx, painter: &egui::Painter, n: &Node) {
     let mut mesh = egui::Mesh::with_texture(tex);
     mesh.add_rect_with_uv(full, UV_FULL, tint.gamma_multiply(0.35));
     mesh.add_rect_with_uv(r, uv, tint);
+    mirror_meshes(std::slice::from_mut(&mut mesh), n.flips(), r.center());
     if n.rotation != 0.0 {
         mesh.rotate(egui::emath::Rot2::from_angle(n.rotation.to_radians()), r.center());
     }
@@ -1656,12 +1672,29 @@ impl Sink<'_> {
     }
 }
 
+/// A flipped node is drawn as if it were not, then its triangles are mirrored about the centre
+/// of its box: image, glyphs, gradient and dashes all come out mirrored.
+fn mirror_meshes(meshes: &mut [egui::Mesh], (h, v): (bool, bool), pivot: Pos2) {
+    if !h && !v {
+        return;
+    }
+    for p in meshes.iter_mut().flat_map(|m| m.vertices.iter_mut()).map(|vertex| &mut vertex.pos) {
+        if h {
+            p.x = 2.0 * pivot.x - p.x;
+        }
+        if v {
+            p.y = 2.0 * pivot.y - p.y;
+        }
+    }
+}
+
 fn flush(pc: &mut PaintCx, sink: &mut Sink, n: &Node, pivot: Pos2) {
     let Some(buf) = sink.buf.as_mut() else { return };
     if buf.is_empty() {
         return;
     }
     let mut meshes = tessellate(pc.ctx, std::mem::take(buf));
+    mirror_meshes(&mut meshes, n.flips(), pivot);
     if n.rotation != 0.0 {
         let rot = egui::emath::Rot2::from_angle(n.rotation.to_radians());
         for m in &mut meshes {
@@ -1730,7 +1763,8 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
         .filter(|_| n.stroke_w > 0.0)
         .map(|c| Stroke::new(n.stroke_w * z, col(c).gamma_multiply(alpha)));
     pc.drawn += 1;
-    let special = n.rotation != 0.0 || n.blend != 0 || pc.capture.is_some();
+    let flipped = n.flips() != (false, false);
+    let special = n.rotation != 0.0 || n.blend != 0 || pc.capture.is_some() || flipped;
     let mut sink = Sink { painter, buf: special.then(Vec::new) };
     match n.kind {
         Kind::Frame | Kind::Rect | Kind::Image => {
@@ -1748,7 +1782,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 Source::None => {}
                 Source::Solid(c) => sink.add(Shape::rect_filled(r, rad, c)),
                 Source::Texture(t, tint) => {
-                    let whole = n.rotation != 0.0 || rad != CornerRadius::ZERO;
+                    let whole = n.rotation != 0.0 || flipped || rad != CornerRadius::ZERO;
                     // Gambar yang di-crop: kotak node hanya menampilkan sebagian dari gambar utuh (`full`).
                     let (full, uv) = match n.crop.filter(|_| n.kind == Kind::Image) {
                         Some([u0, v0, u1, v1]) => {
@@ -1920,7 +1954,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
             pc.measures.push((n.id, width, layout.height * k / z));
             if px > GLYPH_ATLAS_MAX {
                 // Teks besar: gambar outline glyph sebagai mesh vector supaya tetap tajam.
-                let clip = (n.rotation == 0.0).then(|| painter.clip_rect());
+                let clip = (n.rotation == 0.0 && !flipped).then(|| painter.clip_rect());
                 let ppp = pc.ctx.pixels_per_point();
                 if let Some(mesh) = vtext::mesh(&mut pc.ext.glyphs, pc.fonts, &layout.galley, r.min - off * k, k, clip, ppp) {
                     if !mesh.indices.is_empty() {

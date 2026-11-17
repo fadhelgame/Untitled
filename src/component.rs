@@ -48,7 +48,7 @@ macro_rules! node_fields {
 node_fields! {
     follow: [
         fill, gradient, stroke, stroke_w, radius, font, weight, italic, font_size, line_height, letter_spacing, align,
-        image, crop, blend, opacity, visible, locked, tag, dash, gap, stroke_align, shadow, blur,
+        image, crop, flip_h, flip_v, blend, opacity, visible, locked, tag, dash, gap, stroke_align, shadow, blur,
         fill_style, stroke_style, type_style,
     ],
     by_hand: [text, spans],
@@ -104,6 +104,9 @@ fn index(n: &Node) -> HashMap<u64, &Node> {
 struct Fit {
     from: (f32, f32, f32, f32),
     to: (f32, f32, f32, f32),
+    /// The instance is flipped against its main (left-right, top-bottom): the parts are laid
+    /// out mirrored, and what they show is mirrored too.
+    flip: (bool, bool),
 }
 
 impl Fit {
@@ -135,6 +138,18 @@ impl Fit {
         }
         part.rotation = main.rotation;
     }
+
+    /// Mirror a part (its children are not in it yet) the way the instance is flipped. Doing
+    /// it twice undoes it, which is also how a part is read back in the terms of the main.
+    fn mirror(&self, part: &mut Node) {
+        let t = self.to;
+        if self.flip.0 {
+            part.mirror(t.0 + t.2 * 0.5, true);
+        }
+        if self.flip.1 {
+            part.mirror(t.1 + t.3 * 0.5, false);
+        }
+    }
 }
 
 /// What rebuilding an instance needs besides the two states of its main.
@@ -153,6 +168,8 @@ impl Rebuild<'_> {
     fn part(&mut self, main: &Node) -> Node {
         let mut part = match self.pool.remove(&main.id) {
             Some(mut part) => {
+                // Compare with the main as the main has it: unmirrored.
+                self.fit.mirror(&mut part);
                 if let Some(old) = self.old.get(&main.id) {
                     part.follow(old, main);
                 }
@@ -189,6 +206,7 @@ impl Rebuild<'_> {
             },
         };
         self.fit.place(&mut part, main);
+        self.fit.mirror(&mut part);
         part.children = main.children.iter().map(|c| self.part(c)).collect();
         part
     }
@@ -224,7 +242,8 @@ fn sync_instance(inst: &mut Node, old: &HashMap<u64, &Node>, new: &Node, next_id
             groups.entry(m.group).or_insert(part.group);
         }
     }
-    let fit = Fit { from: (new.x, new.y, new.w, new.h), to: (inst.x, inst.y, inst.w, inst.h) };
+    let flip = (inst.flip_h != new.flip_h, inst.flip_v != new.flip_v);
+    let fit = Fit { from: (new.x, new.y, new.w, new.h), to: (inst.x, inst.y, inst.w, inst.h), flip };
     let mut rebuild = Rebuild { old, pool, fit, groups, next_id, names };
     inst.children = new.children.iter().map(|c| rebuild.part(c)).collect();
 }
@@ -440,8 +459,19 @@ impl Doc {
         let ix = index(&main);
         if id == inst.id {
             reset(&mut inst, &ix, Some(main.id));
-        } else if let Some(part) = inst.find_mut(id) {
-            reset(part, &ix, None);
+        } else {
+            let flip = (inst.flip_h != main.flip_h, inst.flip_v != main.flip_v);
+            if let Some(part) = inst.find_mut(id) {
+                reset(part, &ix, None);
+                // The look of the main, as a flipped instance shows it.
+                part.walk_mut(&mut |c| {
+                    for horizontal in [true, false] {
+                        if if horizontal { flip.0 } else { flip.1 } {
+                            c.mirror_look(horizontal);
+                        }
+                    }
+                });
+            }
         }
         sync_instance(&mut inst, &ix, &main, &mut self.next_id, &mut self.group_names);
         let root = inst.id;
@@ -844,6 +874,50 @@ mod tests {
         assert!(edit(&mut doc, |d| d.find_mut(3).unwrap().translate(5.0, 5.0)));
         let t = doc.find(label).unwrap();
         assert_eq!((t.x, t.y, t.w, t.text.as_str()), (25.0, 635.0, 180.0, "A much longer label"));
+    }
+
+    #[test]
+    fn a_flipped_instance_stays_the_mirror_image_of_its_main() {
+        let mut doc = button();
+        // An arrow in the main, pointing right, near its right edge.
+        let arrow = add(&mut doc, Kind::Path, Some(1), (260.0, 130.0, 20.0, 20.0));
+        let p = |x: f32, y: f32| crate::doc::PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2], r: None };
+        doc.find_mut(arrow).unwrap().points = vec![p(0.0, 0.0), p(1.0, 0.5), p(0.0, 1.0)];
+        let i = place(&mut doc, 1, 400.0, 300.0, None);
+        assert!(!edit(&mut doc, |d| assert!(d.flip(&[i], true))), "flipping an instance asks nothing of the others");
+        let at = |d: &Doc, s: u64| part(d, i, s).clone();
+        let tips = |n: &Node| n.points.iter().map(|q| q.x).collect::<Vec<_>>();
+        // Text at 20 from the left in the main: 20 from the right here, and mirrored.
+        assert_eq!((at(&doc, 3).x, at(&doc, 3).flip_h, doc.find(i).unwrap().flip_h), (520.0, true, true));
+        assert_eq!((at(&doc, arrow).x, tips(&at(&doc, arrow))), (420.0, vec![1.0, 0.0, 1.0]));
+        // An override on the mirrored text, then changes in the main: the layout stays mirrored,
+        // the override stays, and everything else follows.
+        let text = at(&doc, 3).id;
+        assert!(edit(&mut doc, |d| {
+            d.find_mut(text).unwrap().fill = GREEN;
+            let m = d.find_mut(3).unwrap();
+            (m.x, m.font_size, m.fill) = (110.0, 24.0, BLUE);
+            d.find_mut(arrow).unwrap().points[1].y = 0.25;
+            d.find_mut(2).unwrap().flip_v = true;
+        }));
+        let t = at(&doc, 3);
+        assert_eq!((t.x, t.font_size, t.fill, t.flip_h, t.flip_v), (530.0, 24.0, GREEN, true, false));
+        let a = at(&doc, arrow);
+        assert_eq!((a.x, tips(&a), a.points[1].y, a.flip_h), (420.0, vec![1.0, 0.0, 1.0], 0.25, false));
+        assert_eq!((at(&doc, 2).flip_h, at(&doc, 2).flip_v), (true, true));
+        // Resizing lays it out again, still mirrored.
+        assert!(edit(&mut doc, |d| d.find_mut(i).unwrap().w = 400.0));
+        // (The text keeps its size and has its centre at 40 of 200, so at 80 of 400 from the right.)
+        assert_eq!((at(&doc, 3).x, at(&doc, 3).w, at(&doc, arrow).x), (690.0, 60.0, 440.0));
+        // Flipped back, it is laid out like the main again; the override is still there.
+        doc.find_mut(i).unwrap().w = 200.0;
+        assert!(doc.flip(&[i], true) && doc.relayout(i));
+        let t = at(&doc, 3);
+        assert_eq!((t.x, t.flip_h, t.fill, tips(&at(&doc, arrow))), (410.0, false, GREEN, vec![0.0, 1.0, 0.0]));
+        // Dropping the overrides of a flipped instance makes it plain again.
+        assert!(doc.flip(&[i], false));
+        assert!(doc.reset_overrides(i));
+        assert_eq!((doc.find(i).unwrap().flip_v, at(&doc, 3).flip_v, at(&doc, 3).y, at(&doc, 3).fill), (false, false, 330.0, BLUE));
     }
 
     #[test]

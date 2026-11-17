@@ -471,18 +471,42 @@ pub fn shadow_svg<T: AsRef<Node>>(nodes: &[T], assets: &Assets, fonts: &mut Font
     Some((out, region))
 }
 
+/// Opens the group that mirrors a flipped node about the centre of its box (`Node::flips`).
+/// It sits inside the rotation, and inside the drop shadow, which keeps its direction.
+/// Result: whether a group was opened.
+fn flip_open(out: &mut String, n: &Node) -> bool {
+    let (h, v) = n.flips();
+    if h || v {
+        let (cx, cy) = n.center();
+        let (tx, sx) = if h { (cx * 2.0, -1) } else { (0.0, 1) };
+        let (ty, sy) = if v { (cy * 2.0, -1) } else { (0.0, 1) };
+        let _ = write!(out, r#"<g transform="translate({tx} {ty}) scale({sx} {sy})">"#);
+    }
+    h || v
+}
+
 fn node_inner(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) {
+    // What a frame holds has places and flips of its own: only the frame's own paint is mirrored.
+    let flipped = n.kind != Kind::Frame && flip_open(out, n);
+    node_body(out, n, assets, fonts, ctx);
+    if flipped {
+        out.push_str("</g>");
+    }
+}
+
+fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) {
     let (x0, y0, x1, y1) = n.bounds();
     let (w, h) = (x1 - x0, y1 - y0);
     let r = n.radius.min(w * 0.5).min(h * 0.5).max(0.0);
     match n.kind {
         Kind::Frame => {
             let fill = fill(out, n);
-            let _ = write!(
-                out,
-                r#"<clipPath id="c{id}"><rect x="{x0}" y="{y0}" width="{w}" height="{h}"/></clipPath><rect x="{x0}" y="{y0}" width="{w}" height="{h}" {fill}/><g clip-path="url(#c{id})">"#,
-                id = n.id
-            );
+            let flipped = flip_open(out, n);
+            let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{w}" height="{h}" {fill}/>"#);
+            if flipped {
+                out.push_str("</g>");
+            }
+            let _ = write!(out, r#"<clipPath id="c{id}"><rect x="{x0}" y="{y0}" width="{w}" height="{h}"/></clipPath><g clip-path="url(#c{id})">"#, id = n.id);
             list_svg(out, &n.children, assets, fonts, ctx);
             out.push_str("</g>");
             stroke_rect(out, n, 0.0);
@@ -878,6 +902,74 @@ mod tests {
             .count();
         assert!(dark > 50, "text outlines should be visible, got {dark} dark pixels");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn flipped_images_and_text_export_mirrored() {
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        // An 80×40 image: the left half red, the right half blue, the top-right corner green.
+        let mut pm = resvg::tiny_skia::Pixmap::new(80, 40).unwrap();
+        for (i, px) in pm.pixels_mut().iter_mut().enumerate() {
+            let (x, y) = (i % 80, i / 80);
+            let c = if x >= 60 && y < 20 { (0, 255, 0) } else if x < 40 { (255, 0, 0) } else { (0, 0, 255) };
+            *px = resvg::tiny_skia::PremultipliedColorU8::from_rgba(c.0, c.1, c.2, 255).unwrap();
+        }
+        let mut doc = Doc::default();
+        let asset = doc.add_asset(pm.encode_png().unwrap());
+        let mut img = Node::new(doc.alloc_id(), Kind::Image, 0.0, 0.0);
+        (img.w, img.h, img.image) = (80.0, 40.0, Some(asset));
+        let id = img.id;
+        doc.insert(img, None);
+        let rgb = |doc: &Doc, fonts: &mut FontManager, x: u32, y: u32| {
+            let (svg, w, h) = to_svg(doc, None, fonts, &ctx).unwrap();
+            let px = rasterize(&svg, w, h, 1.0).unwrap().pixel(x, y).unwrap();
+            (px.red(), px.green(), px.blue())
+        };
+        const RED: (u8, u8, u8) = (255, 0, 0);
+        const GREEN: (u8, u8, u8) = (0, 255, 0);
+        const BLUE: (u8, u8, u8) = (0, 0, 255);
+        assert_eq!((rgb(&doc, &mut fonts, 10, 30), rgb(&doc, &mut fonts, 50, 30), rgb(&doc, &mut fonts, 70, 10)), (RED, BLUE, GREEN));
+        assert!(doc.flip(&[id], true));
+        assert_eq!((rgb(&doc, &mut fonts, 10, 30), rgb(&doc, &mut fonts, 70, 30), rgb(&doc, &mut fonts, 10, 10)), (BLUE, RED, GREEN));
+        assert!(doc.flip(&[id], false));
+        assert_eq!((rgb(&doc, &mut fonts, 10, 10), rgb(&doc, &mut fonts, 10, 30), rgb(&doc, &mut fonts, 70, 10)), (BLUE, GREEN, RED));
+        // Cropped to the right half of the picture, in a box of 40×40: the crop is mirrored in place.
+        {
+            let n = doc.find_mut(id).unwrap();
+            (n.flip_v, n.w, n.crop) = (false, 40.0, Some([0.5, 0.0, 1.0, 1.0]));
+        }
+        assert_eq!((rgb(&doc, &mut fonts, 10, 10), rgb(&doc, &mut fonts, 30, 10), rgb(&doc, &mut fonts, 30, 30)), (GREEN, BLUE, BLUE));
+        // A colour overlay and round corners go through the same mirror.
+        {
+            let n = doc.find_mut(id).unwrap();
+            (n.fill, n.radius) = (Some([255, 255, 0, 255]), 6.0);
+        }
+        let (svg, ..) = to_svg(&doc, None, &mut fonts, &ctx).unwrap();
+        assert!(svg.contains(r#"<g transform="translate(40 0) scale(-1 1)">"#), "{}", &svg[..svg.len().min(300)]);
+        assert_eq!(rgb(&doc, &mut fonts, 20, 20), (255, 255, 0));
+
+        // Text: an "L" has its foot on the right; mirrored, the foot is on the left.
+        let mut doc = Doc::default();
+        let mut bg = Node::new(doc.alloc_id(), Kind::Rect, 0.0, 0.0);
+        (bg.w, bg.h, bg.fill) = (100.0, 100.0, Some([255, 255, 255, 255]));
+        doc.insert(bg, None);
+        let mut t = Node::new(doc.alloc_id(), Kind::Text, 10.0, 10.0);
+        (t.text, t.font_size, t.weight, t.fill, t.w, t.h) = ("L".into(), 80.0, 700, Some([0, 0, 0, 255]), 60.0, 80.0);
+        let tid = t.id;
+        doc.insert(t, None);
+        // Dark pixels left and right of the middle of the text box, in its lower half.
+        let ink = |doc: &Doc, fonts: &mut FontManager| {
+            let (svg, w, h) = to_svg(doc, None, fonts, &ctx).unwrap();
+            let pm = rasterize(&svg, w, h, 1.0).unwrap();
+            let count = |xs: std::ops::Range<u32>| xs.flat_map(|x| (50..100u32).map(move |y| (x, y))).filter(|&(x, y)| pm.pixel(x, y).unwrap().red() < 80).count();
+            (count(10..40), count(40..70))
+        };
+        let (left, right) = ink(&doc, &mut fonts);
+        assert!(left > 0 && right > 0, "the letter should be there: {left} / {right}");
+        assert!(doc.flip(&[tid], true));
+        assert_eq!(ink(&doc, &mut fonts), (right, left), "was {left} / {right}");
+        assert!(left != right, "an L is not symmetric");
     }
 
     #[test]

@@ -284,6 +284,12 @@ pub struct Node {
     /// Derajat, searah jarum jam, terhadap pusat kotak pembatas.
     #[serde(default)]
     pub rotation: f32,
+    /// Mirrored left-right / top-bottom about the centre of the box, before `rotation` applies.
+    /// Paths and lines never carry these: flipping one mirrors its points instead (`Node::mirror`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flip_h: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flip_v: bool,
     /// Indeks ke daftar blend mode (0 = Normal).
     #[serde(default)]
     pub blend: u8,
@@ -670,6 +676,8 @@ impl Node {
             image: None,
             crop: None,
             rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
             blend: 0,
             opacity: 1.0,
             visible: true,

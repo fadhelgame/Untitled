@@ -476,6 +476,10 @@ impl App {
             match self.ext.edit_pending.take() {
                 Some(render::EditPending::All) => set_range = Some((0, len)),
                 Some(render::EditPending::CaretAt(p)) => {
+                    // The click was on the mirrored text; it is edited unmirrored.
+                    let c = self.view.to_screen(o, style.x + style.w * 0.5, style.y + style.h * 0.5);
+                    let (fh, fv) = style.flips();
+                    let p = pos2(if fh { 2.0 * c.x - p.x } else { p.x }, if fv { 2.0 * c.y - p.y } else { p.y });
                     let at = char_at(p);
                     self.ext.edit_anchor = at;
                     set_range = Some((at, at));
@@ -676,6 +680,7 @@ impl App {
                     // Snapping ke objek lain / frame, dengan garis bantu (tahan Ctrl untuk mematikan).
                     if inp.mods.command {
                         self.ext.guides.clear();
+                        self.ext.gaps.clear();
                     } else {
                         total = self.snap_move(total);
                     }

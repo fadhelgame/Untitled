@@ -65,6 +65,9 @@ impl App {
                     "] and [        bring front / send back",
                     "Alt+A D W S    align left/right/top/bottom",
                     "Alt+H V        align centers",
+                    "Alt+Shift+H V  distribute spacing",
+                    "Ctrl+Alt+T     tidy up",
+                    "Shift+H V      flip horizontal / vertical",
                     "1 … 9, 0       opacity 10% … 100%",
                     "Shift+X        swap fill/stroke",
                     "Ctrl+V         paste at the pointer",
@@ -98,6 +101,7 @@ impl App {
         }
         let before = n.clone();
         let mut align: Option<u8> = None;
+        let mut flip: Option<bool> = None;
         let mut remove_bg = false;
         let mut crop_image = false;
         let mut style_action: Option<super::styles::StyleAction> = None;
@@ -129,14 +133,19 @@ impl App {
                     field(ui, half, "X", &mut n.x);
                     field(ui, half, "Y", &mut n.y);
                 });
-                if !matches!(n.kind, Kind::Frame | Kind::Line) {
-                    sub(ui, "Rotation");
-                    ui.add_sized(
-                        [half, 28.0],
-                        egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
-                    )
-                    .on_hover_text("Or drag just outside a corner of the selection (Shift = 15° steps)");
-                }
+                let spins = !matches!(n.kind, Kind::Frame | Kind::Line);
+                sub(ui, if spins { "Rotation" } else { "Flip" });
+                ui.horizontal(|ui| {
+                    if spins {
+                        ui.add_sized(
+                            [half, 28.0],
+                            egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
+                        )
+                        .on_hover_text("Or drag just outside a corner of the selection (Shift = 15° steps)");
+                        ui.add_space(6.0);
+                    }
+                    flip = flip_buttons(ui);
+                });
 
                 if n.kind != Kind::Text || n.wrap {
                     section(ui, "Layout");
@@ -302,6 +311,10 @@ impl App {
             self.align(mode);
             return;
         }
+        if let Some(horizontal) = flip {
+            self.flip(horizontal);
+            return;
+        }
         if remove_bg {
             self.rembg_start(id, &ctx);
             return;
@@ -411,6 +424,8 @@ impl App {
         let pinned = self.sel_pinned();
         let mut comp_act: Option<super::components::Act> = None;
         let mut align: Option<u8> = None;
+        let mut flip: Option<bool> = None;
+        let units = self.doc.unit_count(&ids);
         const MIXED: &str = "Mixed — showing the first layer; a change applies to all.";
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -431,15 +446,25 @@ impl App {
             if let Some(mode) = align_buttons(ui) {
                 align = Some(mode);
             }
+            ui.add_enabled_ui(!pinned, |ui| {
+                if let Some(mode) = distribute_buttons(ui, units) {
+                    align = Some(mode);
+                }
+            });
             let half = (ui.available_width() - 8.0) / 2.0;
-            if spinnable && !pinned {
-                sub(ui, "Rotation");
-                ui.add_sized(
-                    [half, 28.0],
-                    egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
-                )
-                .on_hover_text("Rotates the selection together around its center. Or drag just outside a corner of the selection box (Shift = 15° steps)");
-            }
+            let spins = spinnable && !pinned;
+            sub(ui, if spins { "Rotation" } else { "Flip" });
+            ui.horizontal(|ui| {
+                if spins {
+                    ui.add_sized(
+                        [half, 28.0],
+                        egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
+                    )
+                    .on_hover_text("Rotates the selection together around its center. Or drag just outside a corner of the selection box (Shift = 15° steps)");
+                    ui.add_space(6.0);
+                }
+                flip = flip_buttons(ui);
+            });
 
             section(ui, "Appearance");
             if mixed_look {
@@ -519,6 +544,10 @@ impl App {
 
         if let Some(mode) = align {
             self.align(mode);
+            return;
+        }
+        if let Some(horizontal) = flip {
+            self.flip(horizontal);
             return;
         }
         if let Some(act) = comp_act {
