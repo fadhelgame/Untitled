@@ -75,6 +75,8 @@ impl App {
                     "Ctrl+V         paste at the pointer",
                     "Ctrl+Shift+V   paste in place",
                     "Ctrl+Shift+H   show/hide",
+                    "Ctrl+U         underline text",
+                    "Ctrl+Shift+X   strikethrough text",
                     "Ctrl+Alt+G     clipping mask",
                     "Ctrl+Alt+K     create component",
                     "Ctrl+Alt+B     detach instance",
@@ -168,12 +170,13 @@ impl App {
                     flip = flip_buttons(ui);
                 });
 
-                if n.kind != Kind::Text || n.wrap {
+                if n.kind != Kind::Text || n.wrap || n.fixed_h {
                     section(ui, "Layout");
                     sub(ui, "Dimensions");
                     ui.horizontal(|ui| {
-                        field(ui, half, "W", &mut n.w);
-                        ui.add_enabled_ui(n.kind != Kind::Text, |ui| field(ui, half, "H", &mut n.h));
+                        // Of a text: the width of a paragraph, and a height that was set by hand.
+                        ui.add_enabled_ui(n.kind != Kind::Text || n.wrap, |ui| field(ui, half, "W", &mut n.w));
+                        ui.add_enabled_ui(n.kind != Kind::Text || n.fixed_h, |ui| field(ui, half, "H", &mut n.h));
                     });
                     if n.kind != Kind::Line {
                         n.w = n.w.max(1.0);
@@ -374,6 +377,7 @@ impl App {
         }
         if pinned {
             (n.x, n.y, n.w, n.h, n.rotation, n.wrap) = (before.x, before.y, before.w, before.h, before.rotation, before.wrap);
+            n.fixed_h = before.fixed_h;
             n.layout.clone_from(&before.layout);
             (n.size_h, n.size_v, n.absolute) = (before.size_h, before.size_v, before.absolute);
         } else {
@@ -420,9 +424,23 @@ impl App {
                 if new.fill != shown.fill {
                     st.fill = new.fill;
                 }
+                if new.underline != shown.underline {
+                    st.underline = new.underline;
+                }
+                if new.strike != shown.strike {
+                    st.strike = new.strike;
+                }
             });
             if changed {
                 self.ext.edit_refocus = true;
+            }
+        } else {
+            // Underline and strikethrough of the whole text reach its styled ranges too.
+            if n.underline != before.underline {
+                n.set_decoration(false, n.underline);
+            }
+            if n.strike != before.strike {
+                n.set_decoration(true, n.strike);
             }
         }
         if n.text != orig.text {
@@ -777,6 +795,21 @@ impl App {
             if n.align != before.align {
                 t.align = n.align;
             }
+            if n.underline != before.underline {
+                t.set_decoration(false, n.underline);
+            }
+            if n.strike != before.strike {
+                t.set_decoration(true, n.strike);
+            }
+            if n.list != before.list {
+                t.list = n.list;
+            }
+            if n.valign != before.valign {
+                t.valign = n.valign;
+            }
+            if n.fixed_h != before.fixed_h {
+                t.fixed_h = n.fixed_h;
+            }
             if n.wrap != before.wrap {
                 t.wrap = n.wrap;
                 if t.wrap {
@@ -936,6 +969,17 @@ impl App {
             if catalog_ready && !has_italic {
                 n.italic = false;
             }
+            // Underline and strikethrough: like the rest here, for the selected characters only
+            // while some are selected in the editor.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if icon_button(ui, n.strike, "Strikethrough  (Ctrl+Shift+X)", |p, c, color| decoration_icon(p, c, true, color)) {
+                    n.strike = !n.strike;
+                }
+                if icon_button(ui, n.underline, "Underline  (Ctrl+U)", |p, c, color| decoration_icon(p, c, false, color)) {
+                    n.underline = !n.underline;
+                }
+            });
         });
 
         // Line height + letter spacing (persen dari ukuran font) berlaku untuk seluruh teks.
@@ -971,11 +1015,41 @@ impl App {
         sub(ui, "Alignment");
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            for (mode, tip) in [(0u8, "Align left"), (1, "Align center"), (2, "Align right")] {
+            for (mode, tip) in [(0u8, "Align left"), (1, "Align center"), (2, "Align right"), (3, "Justify (fixed width: every line but the last of a paragraph fills the box)")] {
                 if icon_button(ui, n.align == mode, tip, |p, c, color| text_align_icon(p, c, mode, color)) {
                     n.align = mode;
                 }
             }
+        });
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(half);
+                sub(ui, "List");
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (mode, tip) in [(0u8, "No list"), (1, "Bulleted list: a bullet before every paragraph"), (2, "Numbered list: a number before every paragraph")] {
+                        if icon_button(ui, n.list == mode, tip, |p, c, color| list_icon(p, c, mode, color)) {
+                            n.list = mode;
+                        }
+                    }
+                });
+            });
+            ui.vertical(|ui| {
+                sub(ui, "Vertical");
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    // Only seen in a box that is higher (or lower) than its lines.
+                    ui.add_enabled_ui(n.fixed_h, |ui| {
+                        for (mode, tip) in [(0u8, "Align top"), (1, "Align middle"), (2, "Align bottom")] {
+                            let tip = if n.fixed_h { tip.to_owned() } else { format!("{tip} (needs a fixed height)") };
+                            if icon_button(ui, n.fixed_h && n.valign == mode, &tip, |p, c, color| valign_icon(p, c, mode, color)) {
+                                n.valign = mode;
+                            }
+                        }
+                    });
+                });
+            });
         });
 
         sub(ui, "Resizing");
@@ -986,6 +1060,15 @@ impl App {
             if ui.selectable_label(n.wrap, "Fixed width").on_hover_text("Paragraph: lines wrap inside the box").clicked() && !n.wrap {
                 n.wrap = true;
                 n.w = n.w.max(20.0);
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.selectable_label(!n.fixed_h, "Auto height").on_hover_text("The box is as high as its lines").clicked() {
+                n.fixed_h = false;
+            }
+            let tip = "The box keeps its height (drag its top or bottom handle); the lines are aligned in it top, middle or bottom";
+            if ui.selectable_label(n.fixed_h, "Fixed height").on_hover_text(tip).clicked() {
+                n.fixed_h = true;
             }
         });
 

@@ -415,7 +415,9 @@ fn handles_local(n: &Node, scale: bool) -> Vec<(u8, f32, f32)> {
     };
     match n.kind {
         _ if scale => boxed(n),
-        // Teks: tinggi mengikuti isi, jadi tanpa pegangan tengah-atas/bawah.
+        // Teks: tinggi mengikuti isi, jadi tanpa pegangan tengah-atas/bawah. A paragraph has
+        // them: dragging one gives it a height of its own (`Node::fixed_h`).
+        Kind::Text if n.wrap || n.fixed_h => boxed(n),
         Kind::Text => {
             let all: Vec<(u8, f32, f32)> = boxed(n);
             all.into_iter().filter(|h| h.0 != 1 && h.0 != 5).collect()
@@ -697,6 +699,35 @@ impl App {
             }
         }
         self.push_undo(pre);
+    }
+
+    /// Underline (`strike`: strikethrough) on or off: for the characters selected in the text
+    /// editor, or else for every selected text as a whole. It goes on unless all of it has it.
+    fn toggle_decoration(&mut self, strike: bool) {
+        let range = self.ext.edit_sel.filter(|(a, b)| a != b && self.editing.is_some());
+        let ids: Vec<u64> = match self.editing {
+            Some(id) => vec![id],
+            None => self.sel.clone(),
+        };
+        let texts: Vec<u64> = ids.into_iter().filter(|id| self.doc.find(*id).is_some_and(|n| n.kind == Kind::Text)).collect();
+        if texts.is_empty() {
+            return;
+        }
+        let (a, b) = range.unwrap_or((0, 0));
+        let on = !texts.iter().filter_map(|id| self.doc.find(*id)).all(|n| n.decorated(a, b, strike));
+        let pre = self.doc.clone();
+        for id in texts {
+            if let Some(n) = self.doc.find_mut(id) {
+                if n.decorated(a, b, strike) != on {
+                    n.toggle_decoration(a, b, strike);
+                }
+            }
+        }
+        self.push_undo(pre);
+        self.touch();
+        if self.editing.is_some() {
+            self.ext.edit_refocus = true;
+        }
     }
 
     fn zoom_100(&mut self) {
@@ -1350,6 +1381,27 @@ impl App {
                 self.ext.picker.eyedrop = None;
             }
             return;
+        }
+
+        // Ctrl+U underline, Ctrl+Shift+X strikethrough: also while a text is being edited (then
+        // for the selected characters), so they are taken before the editor sees them (where
+        // Ctrl+U would delete to the start of the line). Ctrl+Shift+X arrives as a cut event.
+        if self.editing.is_some() || !ctx.wants_keyboard_input() {
+            let (underline, strike) = ctx.input_mut(|i| {
+                let underline = i.consume_key(cmd, Key::U);
+                let cut_keys = i.modifiers.command && i.modifiers.shift && !i.modifiers.alt;
+                let before = i.events.len();
+                if cut_keys {
+                    i.events.retain(|e| !matches!(e, egui::Event::Cut));
+                }
+                (underline, i.events.len() != before || i.consume_key(cmd | Modifiers::SHIFT, Key::X))
+            });
+            if underline {
+                self.toggle_decoration(false);
+            }
+            if strike {
+                self.toggle_decoration(true);
+            }
         }
 
         // Sisanya hanya berlaku kalau tidak sedang mengetik.
@@ -2413,6 +2465,52 @@ impl App {
                 if std::env::var("KANVAS_BENCH_AUTOLAYOUT").is_ok() {
                     b.ids = self.bench_autolayout();
                 }
+                // `KANVAS_BENCH_TYPO=1`: underline, strikethrough, justified text, lists and boxes
+                // of fixed height (see `bench_typo`). The frame is also exported, to compare.
+                // `=edit` / `=edit-list`: the justified paragraph / the numbered list is opened in
+                // the text editor with a click in its third line and a drag to its fourth, so the
+                // caret and the selection are in the screenshot. `=keys`: Ctrl+U on the selected list;
+                // `=edit-keys`: on the characters selected in the editor (more modes further down).
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_TYPO") {
+                    let ids = self.bench_typo();
+                    b.ids.clone_from(&ids);
+                    let id = if mode == "edit-list" { ids[3] } else { ids[1] };
+                    if mode.starts_with("edit") {
+                        self.sel = vec![id];
+                        let pre = self.doc.clone();
+                        self.start_text_edit(id, pre);
+                        if let Some(n) = self.doc.find(id) {
+                            let o = self.canvas_rect.min;
+                            let (from, to) = (self.view.to_screen(o, n.x + n.w * 0.62, n.y + 52.0), self.view.to_screen(o, n.x + n.w * 0.3, n.y + 74.0));
+                            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                            let mv = egui::Event::PointerMoved;
+                            b.inject.extend([(215, mv(from)), (218, button(from, true)), (222, mv(from + (to - from) * 0.5)), (226, mv(to)), (230, button(to, false))]);
+                        }
+                    }
+                    // `=zoom`: close to the large line, where it is drawn from outlines. `=panel`: the
+                    // numbered list selected and the panel scrolled down to its Typography section.
+                    if mode == "zoom" {
+                        if let Some(b) = self.doc.find(ids[4]).map(|n| n.bounds()) {
+                            self.zoom_to((b.0 - 120.0, b.1 - 20.0, b.2 + 20.0, b.3 + 20.0), 8.0);
+                        }
+                        self.sel.clear();
+                    }
+                    if mode == "panel" {
+                        self.sel = vec![ids[3]];
+                        let p = pos2(self.canvas_rect.right() + 170.0, self.canvas_rect.center().y);
+                        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -640.0), modifiers: Default::default() };
+                        b.inject.extend([(215, egui::Event::PointerMoved(p)), (218, wheel)]);
+                    }
+                    if mode == "edit-keys" {
+                        let key = |pressed| egui::Event::Key { key: Key::U, physical_key: None, pressed, repeat: false, modifiers: Modifiers::COMMAND };
+                        b.inject.extend([(238, key(true)), (240, key(false))]);
+                    }
+                    if mode == "keys" {
+                        self.sel = vec![ids[2]];
+                        let key = |pressed| egui::Event::Key { key: Key::U, physical_key: None, pressed, repeat: false, modifiers: Modifiers::COMMAND };
+                        b.inject.extend([(220, key(true)), (222, key(false))]);
+                    }
+                }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
                     let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
@@ -3017,6 +3115,31 @@ impl App {
                         _ => {}
                     }
                 }
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_TYPO") {
+                    if (250..=255).contains(&b.frame) {
+                        eprintln!("TYPO frame {}: {:.2} ms", b.frame, self.frame_ms);
+                    }
+                    let paragraph = b.ids.get(1).and_then(|id| self.doc.find(*id)).map(|n| (n.x, n.y, n.w, n.h, n.fixed_h));
+                    match (mode.as_str(), b.frame, paragraph) {
+                        // `=edit-keys`: after Ctrl+U the selected characters are struck through too.
+                        ("edit-keys", 245, _) => self.toggle_decoration(true),
+                        // `=resize`: the bottom handle of the justified paragraph is dragged down by
+                        // 60, which gives it a fixed height; then its lines go to the bottom.
+                        ("resize", 215, Some((x, y, w, h, _))) => {
+                            let o = self.canvas_rect.min;
+                            let (from, to) = (self.view.to_screen(o, x + w * 0.5, y + h), self.view.to_screen(o, x + w * 0.5, y + h + 60.0));
+                            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                            let mv = egui::Event::PointerMoved;
+                            b.inject.extend([(218, mv(from)), (220, button(from, true)), (223, mv(from + (to - from) * 0.5)), (226, mv(to)), (230, button(to, false))]);
+                            eprintln!("TYPO paragraph before the drag: h {h:.1}");
+                        }
+                        ("resize", 240, Some((_, _, _, h, fixed))) => {
+                            eprintln!("TYPO paragraph after the drag: h {h:.1}, fixed height {fixed} (want 60 more, true)");
+                            self.edit_selected(|n| n.valign = 2);
+                        }
+                        _ => {}
+                    }
+                }
                 let settled = b.frame > if nested { 760 } else if component { 640 } else if auto { 356 } else { 260 };
                 let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && settled && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
@@ -3025,6 +3148,11 @@ impl App {
                     if let Some(id) = self.doc.nodes.iter().find(|n| n.name == "Flip demo").map(|n| n.id) {
                         if let Some((svg, w, h)) = export::to_svg(&self.doc, Some(id), &mut self.fonts, ctx) {
                             let _ = export::save_raster(&svg, w, h, 1.0, false, &b.out.with_file_name("bench-flip-export.png"));
+                        }
+                    }
+                    if let Some(id) = self.doc.nodes.iter().find(|n| n.name == "Typography demo").map(|n| n.id) {
+                        if let Some((svg, w, h)) = export::to_svg(&self.doc, Some(id), &mut self.fonts, ctx) {
+                            let _ = export::save_raster(&svg, w, h, 1.0, false, &b.out.with_file_name("bench-typo-export.png"));
                         }
                     }
                     // Export frame demo juga, untuk dibandingkan dengan tampilan canvas.
@@ -3361,8 +3489,51 @@ fn flip_icon(p: &egui::Painter, c: Pos2, horizontal: bool, color: Color32) {
     p.add(egui::Shape::convex_polygon(side(1.0), color, Stroke::NONE));
 }
 
+/// A letter with a line under it, or through it.
+fn decoration_icon(p: &egui::Painter, c: Pos2, strike: bool, color: Color32) {
+    p.text(c - vec2(0.0, 1.0), Align2::CENTER_CENTER, if strike { "S" } else { "U" }, FontId::proportional(13.0), color);
+    let y = if strike { c.y - 0.5 } else { c.y + 7.5 };
+    p.line_segment([pos2(c.x - 6.0, y), pos2(c.x + 6.0, y)], Stroke::new(1.2_f32, color));
+}
+
+/// Lines of text as a list: plain, with bullets, or with numbers.
+fn list_icon(p: &egui::Painter, c: Pos2, mode: u8, color: Color32) {
+    let rows: &[f32] = if mode == 2 { &[-4.0, 4.0] } else { &[-5.0, 0.0, 5.0] };
+    for (i, dy) in rows.iter().enumerate() {
+        let y = c.y + dy;
+        match mode {
+            1 => {
+                p.circle_filled(pos2(c.x - 6.0, y), 1.4, color);
+            }
+            2 => {
+                p.text(pos2(c.x - 6.0, y), Align2::CENTER_CENTER, format!("{}", i + 1), FontId::proportional(8.0), color);
+            }
+            _ => {}
+        }
+        let x0 = if mode == 0 { c.x - 7.0 } else { c.x - 2.0 };
+        p.line_segment([pos2(x0, y), pos2(c.x + 7.0, y)], Stroke::new(1.4_f32, color));
+    }
+}
+
+/// Two lines of text at the top, in the middle or at the bottom of their box.
+fn valign_icon(p: &egui::Painter, c: Pos2, mode: u8, color: Color32) {
+    let (edges, lines): (&[f32], [f32; 2]) = match mode {
+        0 => (&[-7.0], [-3.0, 1.0]),
+        1 => (&[-7.0, 7.0], [-2.0, 2.0]),
+        _ => (&[7.0], [-1.0, 3.0]),
+    };
+    for dy in edges {
+        p.line_segment([pos2(c.x - 8.0, c.y + dy), pos2(c.x + 8.0, c.y + dy)], Stroke::new(1.0_f32, color.gamma_multiply(0.6)));
+    }
+    for (dy, w) in lines.into_iter().zip([10.0_f32, 6.0]) {
+        p.line_segment([pos2(c.x - 5.0, c.y + dy), pos2(c.x - 5.0 + w, c.y + dy)], Stroke::new(1.4_f32, color));
+    }
+}
+
 fn text_align_icon(p: &egui::Painter, c: Pos2, mode: u8, color: Color32) {
-    for (i, w) in [14.0_f32, 9.0, 14.0, 7.0].into_iter().enumerate() {
+    // Justified: every line as wide as the box.
+    let widths = if mode == 3 { [14.0_f32; 4] } else { [14.0, 9.0, 14.0, 7.0] };
+    for (i, w) in widths.into_iter().enumerate() {
         let y = c.y - 6.0 + i as f32 * 4.0;
         let x0 = match mode {
             1 => c.x - w * 0.5,

@@ -3,7 +3,7 @@
 //! (paragraf, gaya per-huruf, spasi) dan tidak bergantung pada font di komputer lain.
 
 use crate::app::blend;
-use crate::app::render::{is_svg, layout_text, text_left};
+use crate::app::render::{is_svg, layout_text, text_offset};
 use crate::doc::{b64, Asset, Doc, Kind, Node, Shadow};
 use crate::fonts::FontManager;
 use eframe::egui;
@@ -141,12 +141,14 @@ fn text_svg(out: &mut String, n: &Node, fonts: &mut FontManager, ctx: &egui::Con
     // Layout di ukuran dunia (dibatasi supaya atlas glyph tidak membengkak), lalu diskalakan balik.
     let f = (200.0 / n.max_size()).min(1.0);
     let layout = layout_text(ctx, n, &n.text, fonts, f, 1.0, true);
-    let galley = &layout.galley;
-    let off_x = text_left(n.wrap, n.align, n.w, galley, f);
+    // Where the galley's origin is in the document (a box of fixed height: by its vertical alignment).
+    let off = text_offset(n, &layout, f) / f;
+    let (ox, oy) = (n.x + off.x, n.y + off.y);
     // Satu <path> per warna berurutan.
     let mut runs: Vec<(egui::Color32, String)> = Vec::new();
-    for row in &galley.rows {
-        for g in &row.glyphs {
+    // The text, then the markers of its list (a galley of their own in the same space).
+    for galley in std::iter::once(&layout.galley).chain(&layout.markers) {
+        for g in galley.rows.iter().flat_map(|row| &row.glyphs) {
             let Some(section) = galley.job.sections.get(g.section_index as usize) else { continue };
             let format = &section.format;
             let face_of = |family: &egui::FontFamily| {
@@ -160,7 +162,7 @@ fn text_svg(out: &mut String, n: &Node, fonts: &mut FontManager, ctx: &egui::Con
             };
             let scale = format.font_id.size / face.units_per_em() as f32 / f;
             let mut d = String::new();
-            let mut builder = Outline { d: &mut d, x: n.x + (g.pos.x - off_x) / f, y: n.y + (g.pos.y - layout.pad_top) / f, s: scale };
+            let mut builder = Outline { d: &mut d, x: ox + g.pos.x / f, y: oy + g.pos.y / f, s: scale };
             if face.outline_glyph(gid, &mut builder).is_none() || d.is_empty() {
                 continue;
             }
@@ -168,6 +170,15 @@ fn text_svg(out: &mut String, n: &Node, fonts: &mut FontManager, ctx: &egui::Con
                 Some((color, path)) if *color == format.color => path.push_str(&d),
                 _ => runs.push((format.color, d)),
             }
+        }
+    }
+    // Underlines and strikethroughs: the same rectangles the canvas draws.
+    for line in layout.deco.iter() {
+        let (r, color) = (line.rect, line.color);
+        let d = format!("M{:.2} {:.2}H{:.2}V{:.2}H{:.2}Z", ox + r.min.x / f, oy + r.min.y / f, ox + r.max.x / f, oy + r.max.y / f, ox + r.min.x / f);
+        match runs.iter_mut().rev().find(|run| run.0 == color) {
+            Some((_, path)) => path.push_str(&d),
+            None => runs.push((color, d)),
         }
     }
     for (color, d) in runs {

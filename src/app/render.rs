@@ -312,11 +312,11 @@ impl Ext {
 
     /// Mesh vector untuk teks yang di layar lebih besar dari batas atlas glyph (`px` = tinggi
     /// huruf terbesar di layar). `None`: pakai jalur bitmap biasa.
-    pub fn vector_text(&mut self, ctx: &egui::Context, fonts: &FontManager, galley: &egui::Galley, origin: Pos2, k: f32, px: f32, clip: Rect) -> Option<egui::Mesh> {
+    pub fn vector_text(&mut self, ctx: &egui::Context, fonts: &FontManager, layout: &TextLayout, origin: Pos2, k: f32, px: f32, clip: Rect) -> Option<egui::Mesh> {
         if px <= GLYPH_ATLAS_MAX {
             return None;
         }
-        vtext::mesh(&mut self.glyphs, fonts, galley, origin, k, Some(clip), ctx.pixels_per_point())
+        vector_layout(&mut self.glyphs, fonts, layout, origin, k, Some(clip), ctx.pixels_per_point())
     }
 
     /// Awal tiap frame: terima gambar yang selesai di-decode, buang tekstur yang lama tak terpakai.
@@ -850,7 +850,8 @@ fn textured(pc: &PaintCx, shape: Shape, r: Rect, tex: TextureId) -> Vec<Shape> {
 /// LayoutJob untuk node teks: satu bagian per rentang gaya. `f` = piksel layout per satuan dunia.
 pub fn text_job(n: &Node, text: &str, fonts: &mut FontManager, f: f32, alpha: f32, aligned: bool) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = if n.wrap { (n.w * f).max(1.0) } else { f32::INFINITY };
+    // A list leaves room for its markers: the lines wrap in what is left of the box.
+    job.wrap.max_width = if n.wrap { ((n.w - n.list_indent(text)) * f).max(1.0) } else { f32::INFINITY };
     if aligned {
         job.halign = match n.align {
             1 => egui::Align::Center,
@@ -862,9 +863,15 @@ pub fn text_job(n: &Node, text: &str, fonts: &mut FontManager, f: f32, alpha: f3
     let len = offsets.len() - 1;
     let mut format = |st: &crate::doc::Style| {
         let size = (st.size * f).max(0.5);
+        let color = col(st.fill).gamma_multiply(alpha);
+        // Only a mark for `decorate`, which draws the lines itself: what egui would draw is
+        // dropped when the glyph meshes are rebuilt (`stable_galley`).
+        let mark = |on: bool| if on { Stroke::new(1.0_f32, color) } else { Stroke::NONE };
         egui::TextFormat {
             font_id: FontId::new(size, fonts.resolve(&st.font, st.weight, st.italic)),
-            color: col(st.fill).gamma_multiply(alpha),
+            color,
+            underline: mark(st.underline),
+            strikethrough: mark(st.strike),
             extra_letter_spacing: n.letter_spacing / 100.0 * size,
             line_height: (n.line_height > 0.0).then(|| n.line_height / 100.0 * size),
             ..Default::default()
@@ -891,6 +898,8 @@ pub fn text_job(n: &Node, text: &str, fonts: &mut FontManager, f: f32, alpha: f3
 
 #[derive(Clone)]
 pub struct TextLayout {
+    /// For drawing as it is (`Shape::galley`): the meshes of its rows also hold the list
+    /// markers and the underlines and strikethroughs.
     pub galley: Arc<egui::Galley>,
     /// Ruang di atas baris pertama untuk glyph yang menjulang keluar kotak baris.
     /// Galley harus digambar di (posisi node − pad_top).
@@ -898,6 +907,27 @@ pub struct TextLayout {
     /// Ukuran logis (baris × line height), tanpa pad.
     pub width: f32,
     pub height: f32,
+    /// Underlines and strikethroughs, in the space of the galley (layout pixels). For what
+    /// draws the glyphs itself from their outlines: large text on the canvas, and export.
+    pub deco: Arc<[Deco]>,
+    /// The list markers as a galley of their own in the space of `galley`, for the same.
+    pub markers: Option<Arc<egui::Galley>>,
+    /// What the layout depends on besides its `LayoutJob` (see `layout_tag`).
+    tag: u64,
+}
+
+/// A line under or through a run of text.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Deco {
+    pub rect: Rect,
+    pub color: Color32,
+}
+
+/// Where the galley of a text is drawn: how far its origin is to the right of and below the
+/// top left of the node's box, in layout pixels (`f` = layout pixels per document unit).
+pub fn text_offset(n: &Node, layout: &TextLayout, f: f32) -> egui::Vec2 {
+    let dy = n.text_dy(layout.height / f) * f;
+    vec2(-text_left(n.wrap, n.align, n.w, &layout.galley, f), dy - layout.pad_top)
 }
 
 /// Posisi x tepi kiri kotak teks di ruang galley (piksel layout; `f` = piksel layout per satuan dunia).
@@ -910,6 +940,17 @@ pub fn text_left(wrap: bool, align: u8, w: f32, galley: &egui::Galley, f: f32) -
         (true, 2) => -w * f,
         (true, _) => 0.0,
     }
+}
+
+/// Vector mesh of a whole text: its glyphs, the list markers, underlines and strikethroughs.
+/// `None` as for `vtext::mesh`.
+fn vector_layout(cache: &mut vtext::Cache, fonts: &FontManager, layout: &TextLayout, origin: Pos2, k: f32, clip: Option<Rect>, ppp: f32) -> Option<egui::Mesh> {
+    let mut mesh = vtext::mesh(cache, fonts, &layout.galley, origin, k, clip, ppp)?;
+    if let Some(markers) = &layout.markers {
+        mesh.append(vtext::mesh(cache, fonts, markers, origin, k, clip, ppp)?);
+    }
+    add_deco(&mut mesh, &layout.deco, origin, k, ppp);
+    Some(mesh)
 }
 
 /// Ukuran font terbesar node (piksel layout) pada layout acuan.
@@ -947,7 +988,18 @@ fn stable_galley(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontMana
     }
     let same = reference.rows.iter().flat_map(|r| &r.glyphs).map(|g| g.chr).eq(src.iter().map(|(g, _)| g.chr));
     if !same {
-        return ctx.fonts(|ft| ft.layout_job(job));
+        // Laid out by egui as it is. Without the marks for underline and strikethrough, which
+        // egui would draw itself here.
+        let mut plain = job.clone();
+        for s in &mut plain.sections {
+            (s.format.underline, s.format.strikethrough) = (Stroke::NONE, Stroke::NONE);
+        }
+        if plain == job {
+            return ctx.fonts(|ft| ft.layout_job(job));
+        }
+        let mut g = (*ctx.fonts(|ft| ft.layout_job(plain))).clone();
+        g.job = Arc::new(job);
+        return Arc::new(g);
     }
 
     let s = f / f_ref;
@@ -1013,10 +1065,10 @@ impl TextCache {
         self.generation
     }
 
-    fn key(job: &egui::text::LayoutJob, f: f32) -> u64 {
+    fn key(job: &egui::text::LayoutJob, f: f32, tag: u64) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (job, f.to_bits()).hash(&mut h);
+        (job, f.to_bits(), tag).hash(&mut h);
         h.finish()
     }
 
@@ -1037,9 +1089,9 @@ impl TextCache {
         self.map.retain(|_, e| e.2 + Self::KEEP >= pass);
     }
 
-    fn get(&mut self, key: u64, job: &egui::text::LayoutJob, f: f32) -> Option<TextLayout> {
+    fn get(&mut self, key: u64, job: &egui::text::LayoutJob, f: f32, tag: u64) -> Option<TextLayout> {
         let (at, layout, used) = self.map.get_mut(&key)?;
-        if *at != f || *layout.galley.job != *job {
+        if *at != f || layout.tag != tag || *layout.galley.job != *job {
             return None;
         }
         *used = self.pass;
@@ -1058,12 +1110,14 @@ pub fn layout_text(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontMa
     let _span = super::perf::span(3);
     let job = text_job(n, text, fonts, f, alpha, aligned);
     fonts.layouts.begin(ctx);
-    let key = TextCache::key(&job, f);
-    if let Some(layout) = fonts.layouts.get(key, &job, f) {
+    let tag = layout_tag(n, alpha);
+    let key = TextCache::key(&job, f, tag);
+    if let Some(layout) = fonts.layouts.get(key, &job, f, tag) {
         return layout;
     }
     super::perf::count(0);
     let layout = build_layout(ctx, n, text, fonts, job, f, alpha, aligned);
+    let layout = finish_layout(ctx, n, text, fonts, layout, f, alpha, tag);
     let pass = fonts.layouts.pass;
     fonts.layouts.map.insert(key, (f, layout.clone(), pass));
     layout
@@ -1074,8 +1128,9 @@ fn build_layout(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManag
     let galley = stable_galley(ctx, n, text, fonts, job, f, alpha, aligned);
     let uniform = n.line_height <= 0.0 && galley.job.sections.windows(2).all(|w| w[0].format.font_id == w[1].format.font_id);
     let (width, height) = (galley.rect.width(), galley.rect.height());
+    let (deco, markers, tag) = (Arc::from(Vec::new()), None, 0);
     if uniform {
-        return TextLayout { galley, pad_top: 0.0, width, height };
+        return TextLayout { galley, pad_top: 0.0, width, height, deco, markers, tag };
     }
     let ppp = ctx.pixels_per_point();
     let snap = |v: f32| (v * ppp).round() / ppp;
@@ -1138,7 +1193,256 @@ fn build_layout(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManag
     }
     g.rect.max.y = ink_bottom + pad;
     g.mesh_bounds = bounds;
-    TextLayout { galley: Arc::new(g), pad_top: pad, width, height }
+    TextLayout { galley: Arc::new(g), pad_top: pad, width, height, deco, markers, tag }
+}
+
+/// What a text layout depends on that its `LayoutJob` does not say: justified or not, and the
+/// list with the style its markers are drawn in.
+fn layout_tag(n: &Node, alpha: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if n.list == 0 && !n.justified() {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (n.list, n.justified()).hash(&mut h);
+    if n.list != 0 {
+        (&n.font, n.weight, n.italic, n.font_size.to_bits(), n.fill, n.wrap, n.align, alpha.to_bits()).hash(&mut h);
+    }
+    h.finish().max(1)
+}
+
+/// Justify one row: how far each of its glyphs moves to the right so that the row ends at
+/// `right`, and how much every space grows. `cells`: (x, advance, is a space) of the glyphs in
+/// order. The room is shared by the spaces between the words; spaces at the start of the row and
+/// at its end (where it was wrapped) are not counted, and a row without a space between words
+/// stays as it is.
+pub fn justify_shifts(cells: &[(f32, f32, bool)], right: f32) -> (Vec<f32>, f32) {
+    let mut shifts = vec![0.0; cells.len()];
+    let Some(last) = cells.iter().rposition(|c| !c.2) else { return (shifts, 0.0) };
+    let first = cells.iter().position(|c| !c.2).unwrap_or(0);
+    let gaps = cells[first..=last].iter().filter(|c| c.2).count();
+    let extra = right - (cells[last].0 + cells[last].1);
+    if gaps == 0 || extra <= 0.0 {
+        return (shifts, 0.0);
+    }
+    let each = extra / gaps as f32;
+    let mut seen = 0;
+    for (i, c) in cells.iter().enumerate() {
+        shifts[i] = each * seen as f32;
+        if c.2 && i >= first && i < last {
+            seen += 1;
+        }
+    }
+    (shifts, each)
+}
+
+/// Move the glyphs of a row to the right, each by its own amount, with their part of the mesh.
+fn shift_row(row: &mut egui::epaint::text::Row, by: impl Fn(usize, f32) -> f32) {
+    let mut vi = row.visuals.glyph_vertex_range.start;
+    for (i, glyph) in row.glyphs.iter_mut().enumerate() {
+        let dx = by(i, glyph.pos.x);
+        glyph.pos.x += dx;
+        if !glyph.uv_rect.is_nothing() {
+            // Every visible glyph = 4 vertices in a row in the mesh.
+            if let Some(quad) = row.visuals.mesh.vertices.get_mut(vi..vi + 4) {
+                for v in quad {
+                    v.pos.x += dx;
+                }
+            }
+            vi += 4;
+        }
+    }
+}
+
+/// A filled rectangle with soft edges (`feather` wide), as egui draws its own lines.
+fn add_soft_rect(mesh: &mut egui::Mesh, r: Rect, color: Color32, feather: f32) {
+    // Thinner than the soft edge: fainter instead.
+    let color = color.gamma_multiply((r.height() / feather).min(r.width() / feather).clamp(0.0, 1.0));
+    let inner = Rect::from_center_size(r.center(), vec2((r.width() - feather).max(0.0), (r.height() - feather).max(0.0)));
+    let outer = r.expand(feather * 0.5);
+    let base = mesh.vertices.len() as u32;
+    let corners = |q: Rect| [q.left_top(), q.right_top(), q.right_bottom(), q.left_bottom()];
+    for (q, c) in [(inner, color), (outer, Color32::TRANSPARENT)] {
+        mesh.vertices.extend(corners(q).map(|pos| egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color: c }));
+    }
+    mesh.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    for i in 0..4 {
+        let (a, b) = (base + i, base + (i + 1) % 4);
+        mesh.indices.extend([a, b, b + 4, a, b + 4, a + 4]);
+    }
+}
+
+/// Add underlines and strikethroughs to a mesh that is drawn at `origin`, scaled by `k`.
+pub fn add_deco(mesh: &mut egui::Mesh, deco: &[Deco], origin: Pos2, k: f32, pixels_per_point: f32) {
+    let at = |p: Pos2| origin + p.to_vec2() * k;
+    for d in deco {
+        add_soft_rect(mesh, Rect::from_min_max(at(d.rect.min), at(d.rect.max)), d.color, 1.0 / pixels_per_point.max(0.1));
+    }
+}
+
+/// The lines under and through the text of a finished galley, each with the row it is in: one
+/// per run of glyphs that share size, colour and baseline, so neighbouring ranges and fonts
+/// give one unbroken line. The spaces at the end of a row (where it was wrapped) get none.
+fn decorate(galley: &egui::Galley, snap: impl Fn(f32) -> f32) -> Vec<(usize, Deco)> {
+    let mut out: Vec<(usize, Deco)> = Vec::new();
+    for (r, row) in galley.rows.iter().enumerate() {
+        let end = row.glyphs.iter().rposition(|g| !g.chr.is_whitespace()).map_or(0, |i| i + 1);
+        for strike in [false, true] {
+            // The run being drawn: (size, colour, baseline) and its place in `out`.
+            let mut open: Option<((u32, Color32, u32), usize)> = None;
+            for g in &row.glyphs[..end] {
+                let Some(format) = galley.job.sections.get(g.section_index as usize).map(|s| &s.format) else { continue };
+                let on = if strike { format.strikethrough != Stroke::NONE } else { format.underline != Stroke::NONE };
+                if !on {
+                    open = None;
+                    continue;
+                }
+                let size = format.font_id.size;
+                let key = (size.to_bits(), format.color, g.pos.y.to_bits());
+                let right = g.pos.x + g.advance_width;
+                match open {
+                    Some((k, i)) if k == key => out[i].1.rect.max.x = right,
+                    _ => {
+                        let thick = size / 14.0;
+                        // Under: a little below the baseline. Through: about half the height of
+                        // a small letter above it.
+                        let top = snap(if strike { g.pos.y - size * 0.27 - thick * 0.5 } else { g.pos.y + size * 0.09 });
+                        out.push((r, Deco { rect: Rect::from_min_max(pos2(g.pos.x, top), pos2(right, top + thick)), color: format.color }));
+                        open = Some((key, out.len() - 1));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The markers of a list as a galley in the space of `g`: each one ends a little before the
+/// first glyph of its paragraph, on the baseline of that glyph. Result: the galley, and for
+/// each of its rows the row of `g` it belongs to.
+fn list_markers(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManager, g: &egui::Galley, f: f32, alpha: f32) -> Option<(egui::Galley, Vec<usize>)> {
+    let labels = n.list_labels(text);
+    let size = (n.font_size * f).max(0.5);
+    let format = egui::TextFormat {
+        font_id: FontId::new(size, fonts.resolve(&n.font, n.weight, n.italic)),
+        color: col(n.fill.unwrap_or([0, 0, 0, 255])).gamma_multiply(alpha),
+        ..Default::default()
+    };
+    let gap = size * 0.4;
+    let mut out: Option<egui::Galley> = None;
+    let mut owners = Vec::new();
+    let (mut paragraph, mut first) = (0, true);
+    for (r, row) in g.rows.iter().enumerate() {
+        let label = labels.get(paragraph).and_then(|l| l.as_ref()).filter(|_| first);
+        first = row.ends_with_newline;
+        paragraph += row.ends_with_newline as usize;
+        let (Some(label), Some(start)) = (label, row.glyphs.first()) else { continue };
+        let job = egui::text::LayoutJob::single_section(label.clone(), format.clone());
+        let made = ctx.fonts(|ft| ft.layout_job(job));
+        let Some(mut marker) = made.rows.first().cloned() else { continue };
+        let Some(end) = marker.glyphs.last() else { continue };
+        let d = vec2(start.pos.x - gap - (end.pos.x + end.advance_width), start.pos.y - end.pos.y);
+        for glyph in &mut marker.glyphs {
+            glyph.pos += d;
+        }
+        marker.visuals.mesh.translate(d);
+        marker.visuals.mesh_bounds = marker.visuals.mesh_bounds.translate(d);
+        marker.rect = marker.rect.translate(d);
+        let all = out.get_or_insert_with(|| egui::Galley { rows: Vec::new(), rect: Rect::NOTHING, mesh_bounds: Rect::NOTHING, num_vertices: 0, num_indices: 0, ..(*made).clone() });
+        all.rect = all.rect.union(marker.rect);
+        all.mesh_bounds = all.mesh_bounds.union(marker.visuals.mesh_bounds);
+        all.num_vertices += marker.visuals.mesh.vertices.len();
+        all.num_indices += marker.visuals.mesh.indices.len();
+        all.rows.push(marker);
+        owners.push(r);
+    }
+    out.map(|g| (g, owners))
+}
+
+/// The parts of a layout that egui knows nothing about: justified rows, the indent and the
+/// markers of a list, underlines and strikethroughs. All of it ends up in the galley itself
+/// (glyph positions, row rectangles, meshes), so the caret, the selection and a click find
+/// every character where it is drawn.
+#[allow(clippy::too_many_arguments)]
+fn finish_layout(ctx: &egui::Context, n: &Node, text: &str, fonts: &mut FontManager, mut layout: TextLayout, f: f32, alpha: f32, tag: u64) -> TextLayout {
+    layout.tag = tag;
+    let marked = layout.galley.job.sections.iter().any(|s| s.format.underline != Stroke::NONE || s.format.strikethrough != Stroke::NONE);
+    if !marked && tag == 0 {
+        return layout;
+    }
+    let ppp = ctx.pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let mut g = (*layout.galley).clone();
+
+    if n.justified() {
+        let right = g.job.wrap.max_width;
+        let last = g.rows.len().saturating_sub(1);
+        for (i, row) in g.rows.iter_mut().enumerate() {
+            // The last line of a paragraph stays as it is.
+            if i == last || row.ends_with_newline {
+                continue;
+            }
+            let cells: Vec<(f32, f32, bool)> = row.glyphs.iter().map(|gl| (gl.pos.x, gl.advance_width, gl.chr.is_whitespace())).collect();
+            let (shifts, each) = justify_shifts(&cells, right);
+            if each <= 0.0 {
+                continue;
+            }
+            // Glyphs stay on whole pixels, as `stable_galley` put them.
+            shift_row(row, |i, x| snap(x + shifts[i]) - x);
+            for (glyph, shift) in row.glyphs.iter_mut().zip(shifts.windows(2)) {
+                glyph.advance_width += shift[1] - shift[0];
+            }
+            row.rect.max.x = row.rect.max.x.max(right);
+        }
+    }
+
+    let mut markers = None;
+    if n.list != 0 {
+        // The lines were wrapped in the box less the indent; here they move over by it. Centred
+        // lines keep to the middle of what is left, lines aligned right to the right edge.
+        let indent = n.list_indent(text) * f;
+        let dx = snap(match (n.wrap, n.align) {
+            (true, 1) => indent * 0.5,
+            (true, 2) => 0.0,
+            _ => indent,
+        });
+        for row in &mut g.rows {
+            shift_row(row, |_, _| dx);
+            row.rect = row.rect.translate(vec2(dx, 0.0));
+        }
+        if n.wrap {
+            g.rect = g.rect.translate(vec2(dx, 0.0));
+        } else {
+            // Auto width: the box grows by the indent.
+            g.rect.max.x += dx;
+            layout.width += dx;
+        }
+        markers = list_markers(ctx, n, text, fonts, &g, f, alpha);
+    }
+
+    // Into the meshes of the rows, after the glyphs (`glyph_vertex_range` stays theirs).
+    let deco = decorate(&g, snap);
+    let feather = 1.0 / ppp.max(0.1);
+    for (row, d) in &deco {
+        add_soft_rect(&mut g.rows[*row].visuals.mesh, d.rect, d.color, feather);
+    }
+    if let Some((m, owners)) = &markers {
+        for (marker, owner) in m.rows.iter().zip(owners) {
+            g.rows[*owner].visuals.mesh.append_ref(&marker.visuals.mesh);
+        }
+    }
+    let (mut bounds, mut vertices, mut indices) = (Rect::NOTHING, 0, 0);
+    for row in &mut g.rows {
+        row.visuals.mesh_bounds = row.visuals.mesh.calc_bounds();
+        bounds = bounds.union(row.visuals.mesh_bounds);
+        vertices += row.visuals.mesh.vertices.len();
+        indices += row.visuals.mesh.indices.len();
+    }
+    (g.mesh_bounds, g.num_vertices, g.num_indices) = (bounds, vertices, indices);
+    layout.galley = Arc::new(g);
+    layout.deco = deco.into_iter().map(|d| d.1).collect();
+    layout.markers = markers.map(|(m, _)| Arc::new(m));
+    layout
 }
 
 /// Ukuran layout glyph untuk teks setinggi `px` piksel di layar: (ukuran layout, faktor skala).
@@ -1949,14 +2253,15 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
             let (lay, k) = glyph_scale(px, pc.moving, pc.ctx.pixels_per_point());
             let layout = layout_text(pc.ctx, n, &n.text, pc.fonts, lay / max, alpha, true);
             // Teks lebar-otomatis rata tengah/kanan: baris galley berada di x negatif.
-            let off = vec2(text_left(n.wrap, n.align, n.w, &layout.galley, lay / max), layout.pad_top);
+            // (A box of fixed height: the lines start where the vertical alignment puts them.)
+            let off = -text_offset(n, &layout, lay / max);
             let width = if n.wrap { n.w } else { layout.width * k / z };
             pc.measures.push((n.id, width, layout.height * k / z));
             if px > GLYPH_ATLAS_MAX {
                 // Teks besar: gambar outline glyph sebagai mesh vector supaya tetap tajam.
                 let clip = (n.rotation == 0.0 && !flipped).then(|| painter.clip_rect());
                 let ppp = pc.ctx.pixels_per_point();
-                if let Some(mesh) = vtext::mesh(&mut pc.ext.glyphs, pc.fonts, &layout.galley, r.min - off * k, k, clip, ppp) {
+                if let Some(mesh) = vector_layout(&mut pc.ext.glyphs, pc.fonts, &layout, r.min - off * k, k, clip, ppp) {
                     if !mesh.indices.is_empty() {
                         sink.add(Shape::mesh(mesh));
                     }
@@ -2066,6 +2371,109 @@ mod tests {
         });
         assert_eq!(starts.len(), 3);
         assert!(starts.iter().all(|x| (x - starts[0]).abs() < 0.01), "line starts differ: {starts:?}");
+    }
+
+    #[test]
+    fn justify_shares_the_room_among_the_spaces_between_words() {
+        // "ab cd ef " : two gaps between words, one space where the row was wrapped.
+        let cells: Vec<(f32, f32, bool)> = "ab cd ef ".chars().enumerate().map(|(i, c)| (i as f32 * 10.0, 10.0, c == ' ')).collect();
+        let (shifts, each) = justify_shifts(&cells, 100.0);
+        // The last letter ends at 80: 20 to share, 10 per gap.
+        assert_eq!(each, 10.0);
+        assert_eq!(shifts, vec![0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 20.0, 20.0, 20.0]);
+        assert_eq!(cells[7].0 + cells[7].1 + shifts[7], 100.0);
+        // Spaces before the first word do not take part.
+        let lead: Vec<(f32, f32, bool)> = " ab cd".chars().enumerate().map(|(i, c)| (i as f32 * 10.0, 10.0, c == ' ')).collect();
+        assert_eq!(justify_shifts(&lead, 90.0), (vec![0.0, 0.0, 0.0, 0.0, 30.0, 30.0], 30.0));
+        // One word, a row that is full already, an empty row: nothing moves.
+        let word: Vec<(f32, f32, bool)> = (0..4).map(|i| (i as f32 * 10.0, 10.0, false)).collect();
+        assert_eq!(justify_shifts(&word, 100.0).1, 0.0);
+        assert_eq!(justify_shifts(&cells, 80.0), (vec![0.0; 9], 0.0));
+        assert_eq!(justify_shifts(&cells, 60.0).1, 0.0);
+        assert_eq!(justify_shifts(&[], 100.0), (Vec::new(), 0.0));
+    }
+
+    #[test]
+    fn justified_lists_and_decorations_end_up_in_the_galley() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            let mut fonts = FontManager::new(ctx);
+            let mut n = Node::new(1, Kind::Text, 0.0, 0.0);
+            n.text = "Pekan olahraga provinsi kedua Kalimantan Utara di Malinau tahun ini\nselesai".into();
+            (n.font_size, n.wrap, n.w) = (20.0, true, 260.0);
+            let ink_right = |row: &egui::epaint::text::Row| row.glyphs.iter().filter(|g| !g.chr.is_whitespace()).map(|g| g.pos.x + g.advance_width).fold(0.0, f32::max);
+            let left = layout_text(ctx, &n, &n.text, &mut fonts, 1.0, 1.0, true);
+            assert!(left.deco.is_empty() && left.markers.is_none());
+            let rows = left.galley.rows.len();
+            assert!(rows >= 4, "{rows} rows");
+
+            // Justified: every row ends at the box, but the last of each paragraph; the breaks stay.
+            n.align = 3;
+            let just = layout_text(ctx, &n, &n.text, &mut fonts, 1.0, 1.0, true);
+            assert_eq!(just.galley.rows.len(), rows);
+            for (i, (row, was)) in just.galley.rows.iter().zip(&left.galley.rows).enumerate() {
+                if i + 1 == rows || row.ends_with_newline {
+                    assert_eq!(ink_right(row), ink_right(was), "row {i} is the last of its paragraph");
+                } else {
+                    assert!((ink_right(row) - 260.0).abs() <= 1.0, "row {i} ends at {}", ink_right(row));
+                }
+                // The mesh went along: its right edge is where the last letter is.
+                assert!(row.visuals.mesh_bounds.right() <= ink_right(row) + 2.0);
+            }
+            // Not a paragraph: justify is align left.
+            let mut auto = n.clone();
+            auto.wrap = false;
+            let line = layout_text(ctx, &auto, "satu dua\ntiga", &mut fonts, 1.0, 1.0, true);
+            assert_eq!(line.galley.rows[0].glyphs[0].pos.x, 0.0);
+
+            // A list: wrapped in the box less the indent, moved over by it, one marker per
+            // paragraph on the baseline of its first row.
+            (n.align, n.list) = (0, 2);
+            let list = layout_text(ctx, &n, &n.text, &mut fonts, 1.0, 1.0, true);
+            let indent = n.list_indent(&n.text);
+            assert_eq!(indent, 30.0);
+            for row in &list.galley.rows {
+                assert_eq!(row.glyphs[0].pos.x, indent);
+                assert!(ink_right(row) <= 260.0 + 0.5);
+            }
+            let markers = list.markers.as_ref().expect("markers");
+            assert_eq!(markers.rows.iter().map(|r| r.text()).collect::<Vec<_>>(), ["1.", "2."]);
+            let first_rows: Vec<&egui::epaint::text::Row> = list.galley.rows.iter().enumerate().filter(|(i, _)| *i == 0 || list.galley.rows[i - 1].ends_with_newline).map(|(_, r)| r).collect();
+            for (marker, row) in markers.rows.iter().zip(first_rows) {
+                let end = marker.glyphs.last().unwrap();
+                assert_eq!(end.pos.y, row.glyphs[0].pos.y);
+                assert!(end.pos.x + end.advance_width < indent && marker.glyphs[0].pos.x >= 0.0);
+            }
+            // Auto width: the box grows by the indent.
+            let plain = layout_text(ctx, &auto, "satu dua\ntiga", &mut fonts, 1.0, 1.0, true);
+            auto.list = 1;
+            let bullets = layout_text(ctx, &auto, "satu dua\ntiga", &mut fonts, 1.0, 1.0, true);
+            assert_eq!(bullets.width, plain.width + 30.0);
+
+            // Underline over two rows of one colour and size: one line per row; a word struck
+            // through in another colour: one more.
+            n.list = 0;
+            let (a, b) = (6, 23);
+            n.toggle_decoration(a, b, false);
+            n.style_range(30, 40, |s| (s.strike, s.fill) = (true, [200, 0, 0, 255]));
+            let deco = layout_text(ctx, &n, &n.text, &mut fonts, 1.0, 1.0, true);
+            let rows_hit = {
+                let g = &deco.galley;
+                let row_of = |c: usize| g.from_ccursor(egui::text::CCursor::new(c)).rcursor.row;
+                row_of(b - 1) - row_of(a) + 1
+            };
+            assert_eq!(deco.deco.len(), rows_hit + 1, "{:?}", deco.deco);
+            let under = &deco.deco[0];
+            assert!((under.rect.height() - 20.0 / 14.0).abs() < 1e-3);
+            let baseline = deco.galley.rows[0].glyphs[0].pos.y;
+            assert!(under.rect.top() > baseline && under.rect.top() < baseline + 4.0, "{under:?} {baseline}");
+            let through = deco.deco.iter().find(|d| d.color == col([200, 0, 0, 255])).expect("strikethrough");
+            assert!(through.rect.bottom() < baseline + deco.galley.rows[1].rect.top() + 20.0);
+            // The lines are in the meshes of the rows: more vertices than the glyphs alone.
+            assert!(deco.galley.rows[0].visuals.mesh.vertices.len() > deco.galley.rows[0].visuals.glyph_vertex_range.end);
+            // Glyphs are where they were without the decoration.
+            assert_eq!(deco.galley.rows[1].glyphs[3].pos, left.galley.rows[1].glyphs[3].pos);
+        });
     }
 
     #[test]

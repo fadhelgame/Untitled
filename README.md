@@ -126,7 +126,9 @@ Every screenshot here is the real app.
       <h3>Type that stays sharp</h3>
       Text is drawn from the font's own outlines, so a huge headline is as crisp as body text at every zoom level. Click for auto-width text, or drag for a paragraph box that wraps.
       <br><br>
-      Change font, weight, size, color or italics for <b>just the selected characters</b>, and set line height, letter spacing and alignment for the whole block.
+      Change font, weight, size, color, italics, <b>underline or strikethrough</b> for <b>just the selected characters</b>, and set line height, letter spacing and alignment (left, center, right or <b>justified</b>) for the whole block.
+      <br><br>
+      Turn a text into a <b>bulleted or numbered list</b>: every paragraph gets its marker and wrapped lines hang under their own text. Drag the top or bottom handle of a paragraph to give it a <b>fixed height</b>, then align its lines to the top, middle or bottom of the box.
     </td>
   </tr>
   <tr>
@@ -227,6 +229,7 @@ Every screenshot here is the real app.
 | | | `Shift+A` / `Alt+Shift+A` | Add auto layout (to a frame, or around the selection) / remove it |
 | | | Arrow keys on an auto-layout item | Swap it with its neighbour |
 | | | `Shift+X` | Swap fill and stroke |
+| | | `Ctrl+U` / `Ctrl+Shift+X` | Underline / strikethrough (the selected characters while editing a text, otherwise the whole text) |
 | | | `Ctrl+V` | Paste at the pointer |
 | | | `Ctrl+Shift+V` | Paste in place (same position, in the frame under the pointer) |
 | | | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |

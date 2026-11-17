@@ -458,20 +458,42 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
                 put("letter_spacing", r2(n.letter_spacing));
             }
             if n.align != 0 {
-                put("align", json!(if n.align == 1 { "center" } else { "right" }));
+                put("align", json!(["left", "center", "right", "justify"][n.align.min(3) as usize]));
             }
             if n.wrap {
                 put("wrap", json!(true));
+            }
+            if n.underline {
+                put("underline", json!(true));
+            }
+            if n.strike {
+                put("strikethrough", json!(true));
+            }
+            if n.list != 0 {
+                put("list", json!(if n.list == 1 { "bullet" } else { "numbered" }));
+            }
+            if n.fixed_h {
+                put("fixed_height", json!(true));
+            }
+            if n.valign != 0 {
+                put("valign", json!(["top", "middle", "bottom"][n.valign.min(2) as usize]));
             }
             if !n.spans.is_empty() {
                 let spans: Vec<Value> = n
                     .spans
                     .iter()
                     .map(|s| {
-                        json!({
+                        let mut span = json!({
                             "start": s.start, "end": s.end, "font": s.style.font, "weight": s.style.weight,
                             "italic": s.style.italic, "size": r2(s.style.size), "fill": hex(s.style.fill),
-                        })
+                        });
+                        if s.style.underline != n.underline {
+                            span["underline"] = json!(s.style.underline);
+                        }
+                        if s.style.strike != n.strike {
+                            span["strikethrough"] = json!(s.style.strike);
+                        }
+                        span
                     })
                     .collect();
                 put("spans", json!(spans));
@@ -699,7 +721,8 @@ impl App {
         let layout = render::layout_text(ctx, &n, &n.text, &mut self.fonts, f, 1.0, true);
         let (w, h) = (if n.wrap { n.w } else { (layout.width / f).max(2.0) }, (layout.height / f).max(1.0));
         if let Some(n) = self.doc.find_mut(id) {
-            (n.w, n.h) = (w, h);
+            // (A height that was set by hand stays.)
+            (n.w, n.h) = (w, if n.fixed_h { n.h } else { h });
         }
     }
 
@@ -992,10 +1015,36 @@ impl App {
                         "left" => 0,
                         "center" => 1,
                         "right" => 2,
-                        other => return Err(format!("unknown align \"{other}\"; use left, center or right")),
+                        "justify" => 3,
+                        other => return Err(format!("unknown align \"{other}\"; use left, center, right or justify")),
                     }
                 }
                 "wrap" => n.wrap = flag(k, v)?,
+                // For the whole text; `spans` (applied after these) can differ per range.
+                "underline" => n.set_decoration(false, flag(k, v)?),
+                "strikethrough" => n.set_decoration(true, flag(k, v)?),
+                "list" => {
+                    n.list = match if v.is_null() { "none".to_owned() } else { string(k, v)? }.as_str() {
+                        "none" => 0,
+                        "bullet" => 1,
+                        "numbered" => 2,
+                        other => return Err(format!("unknown list \"{other}\"; use none, bullet or numbered")),
+                    }
+                }
+                "valign" => {
+                    n.valign = match string(k, v)?.as_str() {
+                        "top" => 0,
+                        "middle" => 1,
+                        "bottom" => 2,
+                        other => return Err(format!("unknown valign \"{other}\"; use top, middle or bottom")),
+                    }
+                }
+                "fixed_height" => {
+                    if n.kind != Kind::Text {
+                        return Err("`fixed_height` only applies to text nodes".into());
+                    }
+                    n.fixed_h = flag(k, v)?;
+                }
                 "closed" => n.closed = flag(k, v)?,
                 "image_path" | "svg" => {
                     if n.kind != Kind::Image {
@@ -1043,6 +1092,8 @@ impl App {
                 let font = s.get("font").map(|v| string("font", v)).transpose()?;
                 let weight = s.get("weight").and_then(Value::as_u64).map(|w| w.clamp(1, 1000) as u16);
                 let italic = s.get("italic").and_then(Value::as_bool);
+                let underline = s.get("underline").and_then(Value::as_bool);
+                let strike = s.get("strikethrough").and_then(Value::as_bool);
                 let size = s.get("size").map(|v| num("size", v)).transpose()?;
                 let fill = s.get("fill").filter(|v| !v.is_null()).map(color).transpose()?;
                 n.style_range(a, b, |st| {
@@ -1051,6 +1102,8 @@ impl App {
                     }
                     st.weight = weight.unwrap_or(st.weight);
                     st.italic = italic.unwrap_or(st.italic);
+                    st.underline = underline.unwrap_or(st.underline);
+                    st.strike = strike.unwrap_or(st.strike);
                     st.size = size.unwrap_or(st.size).max(1.0);
                     st.fill = fill.unwrap_or(st.fill);
                 });
@@ -1097,7 +1150,9 @@ impl App {
                 if !n.wrap {
                     n.w = n.text.lines().map(|l| l.chars().count()).max().unwrap_or(1) as f32 * n.font_size * 0.55;
                 }
-                n.h = n.text.lines().count().max(1) as f32 * n.font_size * 1.2;
+                if !n.fixed_h {
+                    n.h = n.text.lines().count().max(1) as f32 * n.font_size * 1.2;
+                }
             }
             Kind::Path => {
                 if n.points.len() < 2 {
@@ -1261,7 +1316,7 @@ impl App {
             return Err("a frame can't be moved into itself or into something inside it".into());
         }
         if n.source.is_some() {
-            let fixed = ["x", "y", "w", "h", "rotation", "name", "points", "closed", "wrap", "parent", "component", "constraints", "layout", "sizing", "absolute"];
+            let fixed = ["x", "y", "w", "h", "rotation", "name", "points", "closed", "wrap", "fixed_height", "parent", "component", "constraints", "layout", "sizing", "absolute"];
             if let Some(k) = m.keys().find(|k| fixed.contains(&k.as_str())) {
                 return Err(format!("node {id} is part of an instance: `{k}` follows the main component (only its look and text can be changed). Edit the main component, or detach the instance."));
             }

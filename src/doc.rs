@@ -198,6 +198,10 @@ pub struct Style {
     pub italic: bool,
     pub size: f32,
     pub fill: [u8; 4],
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strike: bool,
 }
 
 /// Rentang karakter [start, end) (indeks karakter, bukan byte) dengan gaya sendiri.
@@ -258,7 +262,7 @@ pub struct Node {
     /// Persen dari ukuran font.
     #[serde(default)]
     pub letter_spacing: f32,
-    /// 0 kiri, 1 tengah, 2 kanan.
+    /// 0 kiri, 1 tengah, 2 kanan, 3 justify (paragraph text only; otherwise like left).
     #[serde(default)]
     pub align: u8,
     /// Teks paragraf: lebar tetap (`w`), baris membungkus otomatis.
@@ -267,6 +271,22 @@ pub struct Node {
     /// Gaya per rentang karakter; di luar rentang berlaku gaya node.
     #[serde(default)]
     pub spans: Vec<Span>,
+    /// Underline / strikethrough of the node's own style (ranges carry theirs in `Style`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strike: bool,
+    /// List: 0 none, 1 bullets, 2 numbered. Every paragraph gets a marker and a hanging indent;
+    /// the markers are drawn, they are not part of `text`.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub list: u8,
+    /// Where the lines sit in a box of fixed height (`fixed_h`): 0 top, 1 middle, 2 bottom.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub valign: u8,
+    /// Text: the height `h` was set by hand and no longer follows the lines. Lines that do not
+    /// fit run out of the box.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fixed_h: bool,
     #[serde(default)]
     pub points: Vec<PathPoint>,
     #[serde(default)]
@@ -688,6 +708,11 @@ impl Node {
             align: 0,
             wrap: false,
             spans: Vec::new(),
+            underline: false,
+            strike: false,
+            list: 0,
+            valign: 0,
+            fixed_h: false,
             points: Vec::new(),
             closed: false,
             holes: Vec::new(),
@@ -784,8 +809,15 @@ impl Node {
             let (kw, kh) = ((sx * cos).hypot(sy * sin), (sx * sin).hypot(sy * cos));
             match self.kind {
                 // Tinggi teks mengikuti isinya; teks lebar-otomatis hanya berpindah tempat.
-                Kind::Text if self.wrap => self.w = (self.w * kw).max(1.0),
-                Kind::Text => {}
+                Kind::Text => {
+                    if self.wrap {
+                        self.w = (self.w * kw).max(1.0);
+                    }
+                    // A height set by hand is stretched like that of any other box.
+                    if self.fixed_h {
+                        self.h = (self.h * kh).max(1.0);
+                    }
+                }
                 Kind::Line => {
                     self.w *= kw;
                     self.h *= kh;
@@ -1064,6 +1096,8 @@ impl Node {
             italic: self.italic,
             size: self.font_size,
             fill: self.fill.unwrap_or([0, 0, 0, 255]),
+            underline: self.underline,
+            strike: self.strike,
         }
     }
 
@@ -1073,6 +1107,99 @@ impl Node {
         self.italic = s.italic;
         self.font_size = s.size;
         self.fill = Some(s.fill);
+        self.underline = s.underline;
+        self.strike = s.strike;
+    }
+
+    /// Underline (`strike`: strikethrough) on or off for the whole text: the node's own style
+    /// and every styled range.
+    pub fn set_decoration(&mut self, strike: bool, on: bool) {
+        if strike {
+            self.strike = on;
+        } else {
+            self.underline = on;
+        }
+        for s in &mut self.spans {
+            if strike {
+                s.style.strike = on;
+            } else {
+                s.style.underline = on;
+            }
+        }
+        let base = self.base_style();
+        self.spans.retain(|s| s.style != base);
+    }
+
+    /// Is every character of [a, b) underlined (`strike`: struck through)? An empty range asks
+    /// about the whole text.
+    pub fn decorated(&self, a: usize, b: usize, strike: bool) -> bool {
+        let len = self.text.chars().count();
+        let (a, b) = if a >= b { (0, len) } else { (a.min(len), b.min(len)) };
+        let has = |s: &Style| if strike { s.strike } else { s.underline };
+        if a >= b {
+            return has(&self.base_style());
+        }
+        self.segments(len).iter().filter(|(s, e, _)| *s < b && *e > a).all(|(_, _, st)| has(st))
+    }
+
+    /// Toggle underline (`strike`: strikethrough) for the characters [a, b), or for the whole
+    /// text when the range is empty. It goes on unless all of it had it already.
+    pub fn toggle_decoration(&mut self, a: usize, b: usize, strike: bool) {
+        let on = !self.decorated(a, b, strike);
+        if a >= b {
+            self.set_decoration(strike, on);
+        } else {
+            self.style_range(a, b, |s| if strike { s.strike = on } else { s.underline = on });
+        }
+    }
+
+    /// The list marker of every paragraph of `text` (split on `\n`): a bullet, or its number.
+    /// An empty paragraph has none and does not take a number.
+    pub fn list_labels(&self, text: &str) -> Vec<Option<String>> {
+        let mut number = 0;
+        text.split('\n')
+            .map(|p| match self.list {
+                0 => None,
+                _ if p.is_empty() => None,
+                1 => Some("\u{2022}".to_owned()),
+                _ => {
+                    number += 1;
+                    Some(format!("{number}."))
+                }
+            })
+            .collect()
+    }
+
+    /// How far the lines of a list stand in from the left of the box (document units): the room
+    /// for the marker, wider when the numbers have more digits. 0 without a list.
+    pub fn list_indent(&self, text: &str) -> f32 {
+        match self.list {
+            0 => 0.0,
+            1 => self.font_size * 1.5,
+            _ => {
+                let count = text.split('\n').filter(|p| !p.is_empty()).count().max(1);
+                let digits = count.to_string().len() as f32;
+                self.font_size * (0.9 + 0.6 * digits)
+            }
+        }
+    }
+
+    /// Justified: a paragraph whose lines are stretched to the width of the box.
+    pub fn justified(&self) -> bool {
+        self.wrap && self.align == 3
+    }
+
+    /// How far down the lines start in a box of fixed height, for lines `content` high in all.
+    /// Negative when they are higher than the box and not aligned to its top: they run out of it.
+    pub fn text_dy(&self, content: f32) -> f32 {
+        if !self.fixed_h {
+            return 0.0;
+        }
+        match self.valign {
+            1 => (self.h - content) * 0.5,
+            2 => self.h - content,
+            _ => 0.0,
+        }
     }
 
     pub fn style_at(&self, i: usize) -> Style {
@@ -1195,6 +1322,10 @@ pub struct TypeStyle {
     pub size: f32,
     pub line_height: f32,
     pub letter_spacing: f32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strike: bool,
 }
 
 impl TypeStyle {
@@ -1209,6 +1340,8 @@ impl TypeStyle {
             size: n.font_size,
             line_height: n.line_height,
             letter_spacing: n.letter_spacing,
+            underline: n.underline,
+            strike: n.strike,
         }
     }
 
@@ -1219,6 +1352,8 @@ impl TypeStyle {
             && self.size == n.font_size
             && self.line_height == n.line_height
             && self.letter_spacing == n.letter_spacing
+            && self.underline == n.underline
+            && self.strike == n.strike
     }
 
     pub fn apply(&self, n: &mut Node) {
@@ -1228,6 +1363,8 @@ impl TypeStyle {
         n.font_size = self.size;
         n.line_height = self.line_height;
         n.letter_spacing = self.letter_spacing;
+        n.underline = self.underline;
+        n.strike = self.strike;
     }
 
     /// Ringkasan satu baris, mis. "Montserrat 24 · Bold".
@@ -2118,6 +2255,107 @@ mod tests {
             s.weight = 400;
         });
         assert!(n.spans.is_empty());
+    }
+
+    #[test]
+    fn underline_and_strikethrough_toggle_per_range_and_for_the_whole_text() {
+        let mut n = text_node("Dokumentasi Kajian");
+        // A range: on, and only there.
+        n.toggle_decoration(12, 18, false);
+        assert_eq!((n.spans.len(), n.spans[0].start, n.spans[0].end), (1, 12, 18));
+        assert!(n.style_at(14).underline && !n.style_at(3).underline && !n.underline);
+        assert!(n.decorated(12, 18, false) && !n.decorated(10, 18, false) && !n.decorated(12, 18, true));
+        // Partly underlined: the whole range goes on first, then off.
+        n.toggle_decoration(10, 18, false);
+        assert!(n.decorated(10, 18, false));
+        n.toggle_decoration(10, 18, false);
+        assert!(n.spans.is_empty());
+        // Strikethrough is separate, and both can be on one range.
+        n.toggle_decoration(0, 4, true);
+        n.toggle_decoration(2, 6, false);
+        assert_eq!((n.style_at(1).strike, n.style_at(1).underline), (true, false));
+        assert_eq!((n.style_at(3).strike, n.style_at(3).underline), (true, true));
+        assert_eq!((n.style_at(5).strike, n.style_at(5).underline), (false, true));
+        // The whole text (an empty range): it goes on for every range too, which keep what
+        // else they have; then off again.
+        n.style_range(8, 11, |s| s.weight = 700);
+        n.toggle_decoration(0, 0, false);
+        assert!(n.underline && n.decorated(0, 0, false) && n.style_at(9).underline && n.style_at(9).weight == 700);
+        assert!(n.style_at(1).strike && !n.strike);
+        n.toggle_decoration(0, 0, false);
+        assert!(!n.underline && !n.style_at(3).underline && !n.style_at(9).underline);
+        // A range of an underlined text can be taken out of it.
+        let mut n = text_node("Dokumentasi Kajian");
+        n.set_decoration(false, true);
+        n.toggle_decoration(0, 11, false);
+        assert!(n.underline && !n.style_at(4).underline && n.style_at(14).underline);
+        assert!(!n.decorated(0, 0, false));
+    }
+
+    #[test]
+    fn new_text_fields_are_left_out_of_files_until_used() {
+        let n = text_node("Kanvas");
+        let plain = serde_json::to_string(&n).unwrap();
+        for key in ["underline", "strike", "\"list\"", "valign", "fixed_h"] {
+            assert!(!plain.contains(key), "{key} is written for a text that does not use it");
+        }
+        // A file from before these fields existed, also with a styled range.
+        let mut v: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        v["spans"] = serde_json::json!([{ "start": 0, "end": 2, "style": { "font": "Lora", "weight": 700, "italic": false, "size": 20.0, "fill": [0, 0, 0, 255] } }]);
+        let old: Node = serde_json::from_value(v).unwrap();
+        assert_eq!((old.underline, old.strike, old.list, old.valign, old.fixed_h), (false, false, 0, 0, false));
+        assert_eq!((old.spans[0].style.underline, old.spans[0].style.strike), (false, false));
+        assert!(!serde_json::to_string(&old).unwrap().contains("underline"));
+        // What is set is written and read back.
+        let mut n = text_node("Kanvas");
+        (n.list, n.valign, n.fixed_h, n.align, n.strike) = (2, 1, true, 3, true);
+        n.toggle_decoration(0, 3, false);
+        let back: Node = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
+        assert_eq!(back, n);
+        let style: TypeStyle = serde_json::from_str(r#"{"id":1,"name":"Body","font":"Inter","weight":400,"italic":false,"size":16.0,"line_height":0.0,"letter_spacing":0.0}"#).unwrap();
+        assert!(!style.underline && !style.strike && style.matches(&text_node("x")));
+    }
+
+    #[test]
+    fn list_markers_skip_empty_paragraphs() {
+        let mut n = text_node("");
+        let text = "one\n\ntwo\nthree\n";
+        assert_eq!(n.list_labels(text), vec![None; 5]);
+        assert_eq!(n.list_indent(text), 0.0);
+        n.list = 1;
+        let dot = Some("\u{2022}".to_owned());
+        assert_eq!(n.list_labels(text), vec![dot.clone(), None, dot.clone(), dot, None]);
+        assert_eq!(n.list_indent(text), 24.0);
+        n.list = 2;
+        let number = |i: u32| Some(format!("{i}."));
+        assert_eq!(n.list_labels(text), vec![number(1), None, number(2), number(3), None]);
+        // Two digits need more room than one.
+        let short = n.list_indent(text);
+        let long = n.list_indent(&"x\n".repeat(10));
+        assert!(short >= 16.0 * 1.5 && long > short, "{short} {long}");
+    }
+
+    #[test]
+    fn lines_are_placed_in_a_box_of_fixed_height() {
+        let mut n = text_node("Kanvas");
+        (n.h, n.valign) = (100.0, 1);
+        // The height follows the lines: nothing to place.
+        assert_eq!(n.text_dy(40.0), 0.0);
+        n.fixed_h = true;
+        assert_eq!(n.text_dy(40.0), 30.0);
+        n.valign = 2;
+        assert_eq!(n.text_dy(40.0), 60.0);
+        // Higher than the box: out at the top.
+        assert_eq!(n.text_dy(130.0), -30.0);
+        n.valign = 0;
+        assert_eq!(n.text_dy(130.0), 0.0);
+        // Stretched with a selection, such a box changes height like any other.
+        (n.wrap, n.w) = (true, 50.0);
+        n.stretch((0.0, 0.0), (0.0, 0.0), (2.0, 3.0));
+        assert_eq!((n.w, n.h), (100.0, 300.0));
+        n.fixed_h = false;
+        n.stretch((0.0, 0.0), (0.0, 0.0), (2.0, 3.0));
+        assert_eq!((n.w, n.h), (200.0, 300.0));
     }
 
     #[test]

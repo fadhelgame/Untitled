@@ -153,7 +153,13 @@ fn reflow_with(c: &mut Node, from: Rect, to: Rect, lifted: &[u64]) {
         }
         // The height of a text follows what it says. A paragraph wraps again in its new width;
         // auto-width text keeps its size, where its alignment anchors it in the new box.
-        Kind::Text if c.wrap => (c.x, c.y, c.w) = (x, y, nw),
+        // (A height that was set by hand is kept like that of any other box.)
+        Kind::Text if c.wrap => {
+            (c.x, c.y, c.w) = (x, y, nw);
+            if c.fixed_h {
+                c.h = nh;
+            }
+        }
         Kind::Text => {
             c.x = match c.align {
                 1 => x + (nw - w) * 0.5,
@@ -161,6 +167,9 @@ fn reflow_with(c: &mut Node, from: Rect, to: Rect, lifted: &[u64]) {
                 _ => x,
             };
             c.y = y;
+            if c.fixed_h {
+                c.h = nh;
+            }
         }
         _ => set_box_with(c, (x, y, nw, nh), Children::Constrain, lifted),
     }
@@ -304,7 +313,8 @@ impl Node {
         self.rotation == 0.0
             && match self.kind {
                 Kind::Line => false,
-                Kind::Text => horizontal && self.wrap,
+                Kind::Text if horizontal => self.wrap,
+                Kind::Text => self.fixed_h,
                 _ => true,
             }
     }
@@ -361,7 +371,12 @@ fn resize(c: &mut Node, w: Option<f32>, h: Option<f32>, lifted: &[u64]) {
             }
         }
         // Its height is what the renderer measures for the new width.
-        Kind::Text => c.w = to.0,
+        Kind::Text => {
+            c.w = to.0;
+            if c.fixed_h {
+                c.h = to.1;
+            }
+        }
         _ => (c.w, c.h) = to,
     }
 }

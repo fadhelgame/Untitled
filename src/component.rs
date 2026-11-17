@@ -50,11 +50,12 @@ macro_rules! node_fields {
 node_fields! {
     follow: [
         fill, gradient, stroke, stroke_w, radius, font, weight, italic, font_size, line_height, letter_spacing, align,
+        underline, strike, list, valign,
         image, crop, flip_h, flip_v, blend, opacity, visible, locked, tag, dash, gap, stroke_align, shadow, blur,
         fill_style, stroke_style, type_style,
     ],
     by_hand: [text, spans],
-    fixed: [id, name, kind, x, y, w, h, rotation, wrap, points, closed, holes, group, clip, children, component, instance_of, source, constrain_h, constrain_v, layout, size_h, size_v, absolute],
+    fixed: [id, name, kind, x, y, w, h, rotation, wrap, fixed_h, points, closed, holes, group, clip, children, component, instance_of, source, constrain_h, constrain_v, layout, size_h, size_v, absolute],
 }
 
 impl Node {
@@ -70,8 +71,8 @@ impl Node {
 
     /// Does the text differ from what `main` shows (so its measured size is its own)?
     fn own_text(&self, main: &Node) -> bool {
-        (&self.text, &self.spans, &self.font, self.weight, self.italic, self.font_size, self.line_height, self.letter_spacing)
-            != (&main.text, &main.spans, &main.font, main.weight, main.italic, main.font_size, main.line_height, main.letter_spacing)
+        (&self.text, &self.spans, &self.font, self.weight, self.italic, self.font_size, self.line_height, self.letter_spacing, self.list)
+            != (&main.text, &main.spans, &main.font, main.weight, main.italic, main.font_size, main.line_height, main.letter_spacing, main.list)
     }
 }
 
@@ -119,7 +120,7 @@ impl Fit {
     /// it has in the main; its place follows when the instance is laid out.
     fn place(part: &mut Node, main: &Node, from: Rect, to: Rect, item: bool) -> Rect {
         let mut g = Node::new(0, main.kind, main.x, main.y);
-        (g.w, g.h, g.rotation, g.wrap, g.align) = (main.w, main.h, main.rotation, main.wrap, main.align);
+        (g.w, g.h, g.rotation, g.wrap, g.align, g.fixed_h) = (main.w, main.h, main.rotation, main.wrap, main.align, main.fixed_h);
         if item {
             g.translate(to.0 - from.0, to.1 - from.1);
         } else {
@@ -138,6 +139,9 @@ impl Fit {
                 };
             }
             part.y = g.y;
+            if main.fixed_h {
+                part.h = g.h;
+            }
         } else {
             (part.x, part.y, part.w, part.h) = (g.x, g.y, g.w, g.h);
         }
@@ -193,7 +197,7 @@ impl Rebuild<'_> {
         part.kind = main.kind;
         part.name.clone_from(&main.name);
         part.clip = main.clip;
-        part.wrap = main.wrap;
+        (part.wrap, part.fixed_h) = (main.wrap, main.fixed_h);
         (part.constrain_h, part.constrain_v) = (main.constrain_h, main.constrain_v);
         part.layout.clone_from(&main.layout);
         (part.size_h, part.size_v, part.absolute) = (main.size_h, main.size_v, main.absolute);

@@ -205,11 +205,14 @@ impl App {
         self.drawn = pc.drawn;
         let measures = std::mem::take(&mut pc.measures);
         for (id, w, h) in measures {
-            let differs = self.doc.find(id).is_some_and(|n| (n.w - w).abs() > 0.5 || (n.h - h).abs() > 0.5);
+            // (A height that was set by hand stays.)
+            let differs = self.doc.find(id).is_some_and(|n| (n.w - w).abs() > 0.5 || (!n.fixed_h && (n.h - h).abs() > 0.5));
             if differs {
                 if let Some(n) = self.doc.find_mut(id) {
                     n.w = w;
-                    n.h = h;
+                    if !n.fixed_h {
+                        n.h = h;
+                    }
                 }
                 // Not an edit, but the instances of a main with this text get its size too.
                 self.components.recheck();
@@ -431,8 +434,10 @@ impl App {
         let wrap = style.wrap;
         // Titik (0,0) galley di layar. Teks lebar-otomatis rata tengah/kanan punya baris di x negatif.
         // Paragraf rata tengah/kanan: x = 0 galley ada di tengah / tepi kanan kotaknya.
-        let (align, box_w) = (style.align, style.w);
-        let origin = |l: &render::TextLayout| node_pos - vec2(render::text_left(wrap, align, box_w, &l.galley, f), l.pad_top) * k;
+        // In a box of fixed height the lines start where the vertical alignment puts them.
+        let mut frame = Node::new(0, Kind::Text, style.x, style.y);
+        (frame.w, frame.h, frame.wrap, frame.align, frame.fixed_h, frame.valign) = (style.w, style.h, style.wrap, style.align, style.fixed_h, style.valign);
+        let origin = |l: &render::TextLayout| node_pos + render::text_offset(&frame, l, f) * k;
 
         // --- mouse: klik menaruh caret, drag menyeleksi, klik dua kali = kata, tiga kali = semua ---
         let geo = render::layout_text(ctx, &style, &old_text, &mut self.fonts, f, 1.0, true);
@@ -561,6 +566,7 @@ impl App {
                 n.name = cur.name.clone();
             }
             // Kotak seleksi mengikuti ukuran teks selama mengetik.
+            let h = if n.fixed_h { n.h } else { h };
             if (n.w - w).abs() > 0.5 || (n.h - h).abs() > 0.5 {
                 n.w = w;
                 n.h = h;
@@ -586,7 +592,7 @@ impl App {
         }
         // Teks digambar setelah sorotan, jadi tidak ada huruf yang tertutup (termasuk baris di atas/bawahnya).
         // Teks besar digambar sebagai mesh vector, sama seperti di canvas, supaya tetap tajam.
-        if let Some(mesh) = self.ext.vector_text(ctx, &self.fonts, &fin.galley, fin_origin, k, max * z, painter.clip_rect()) {
+        if let Some(mesh) = self.ext.vector_text(ctx, &self.fonts, &fin, fin_origin, k, max * z, painter.clip_rect()) {
             painter.add(egui::Shape::mesh(mesh));
         } else if (k - 1.0).abs() < 0.01 {
             painter.add(egui::Shape::galley(fin_origin, fin.galley.clone(), Color32::BLACK));
@@ -832,8 +838,10 @@ impl App {
                             (l, r) = (cx - w * 0.5, cx + w * 0.5);
                             (t, b) = (cy - h * 0.5, cy + h * 0.5);
                         }
-                        if n.kind == Kind::Text {
-                            // Tinggi teks selalu mengikuti isinya; hanya lebar kotaknya yang bisa diubah.
+                        // The top and bottom handles of a text give it a height of its own.
+                        let own_height = n.fixed_h || matches!(*handle, 1 | 5);
+                        if n.kind == Kind::Text && !own_height {
+                            // Tinggi teks mengikuti isinya; hanya lebar kotaknya yang bisa diubah.
                             (t, b) = (oy, oy + oh);
                         }
                         if rot == 0.0 {
@@ -852,6 +860,11 @@ impl App {
                         // Seperti Figma: menarik pegangan teks lebar-otomatis menjadikannya lebar-tetap.
                         if n.kind == Kind::Text && (n.w - ow).abs() > 0.5 {
                             n.wrap = true;
+                        }
+                        // From then on the height no longer follows the lines ("Auto height" in
+                        // the panel gives it back).
+                        if n.kind == Kind::Text && own_height && (n.h - oh).abs() > 0.5 {
+                            n.fixed_h = true;
                         }
                         // A side that was dragged has the size it was dragged to: it no longer
                         // hugs or fills. (The other one may only have been rounded.)
@@ -1344,7 +1357,7 @@ impl App {
         (para.wrap, para.w, para.h) = (true, 520.0, 200.0);
         (para.font_size, para.font, para.line_height) = (34.0, "Montserrat".into(), 125.0);
         para.fill = Some([20, 20, 20, 255]);
-        let style = |font: &str, weight: u16, italic: bool, size: f32, fill: [u8; 4]| Style { font: font.into(), weight, italic, size, fill };
+        let style = |font: &str, weight: u16, italic: bool, size: f32, fill: [u8; 4]| Style { font: font.into(), weight, italic, size, fill, underline: false, strike: false };
         para.spans = vec![
             Span { start: 12, end: 18, style: style("Playfair Display", 700, true, 44.0, [222, 60, 75, 255]) },
             Span { start: 20, end: 29, style: style("Montserrat", 700, false, 34.0, [13, 120, 255, 255]) },
@@ -1421,6 +1434,112 @@ impl App {
         self.zoom_to(bounds, 1.0);
         let _ = rect_id;
         self.sel = vec![multiply_id];
+    }
+
+    /// `KANVAS_BENCH_TYPO`: a frame with underlined and struck ranges in mixed sizes and colours,
+    /// a justified paragraph, a bulleted and a numbered list (each with a wrapped item and an
+    /// empty paragraph), three boxes of fixed height with their lines at the top, in the middle
+    /// and at the bottom, and a line large enough to be drawn from outlines. Faint boxes show
+    /// where the text boxes are. Result: ids of [frame, justified paragraph, bulleted list,
+    /// numbered list, large line].
+    pub(super) fn bench_typo(&mut self) -> Vec<u64> {
+        let (x, y) = (-1500.0, 10000.0);
+        let (ink, blue, red) = ([30, 30, 40, 255], [13, 110, 220, 255], [220, 50, 60, 255]);
+        let stage = self.doc.alloc_id();
+        let mut n = Node::new(stage, Kind::Frame, x, y);
+        (n.name, n.w, n.h, n.fill) = ("Typography demo".into(), 1000.0, 900.0, Some([252, 252, 250, 255]));
+        self.doc.insert(n, None);
+        let ground = |app: &mut Self, (nx, ny, w, h): (f32, f32, f32, f32)| {
+            let mut n = Node::new(app.doc.alloc_id(), Kind::Rect, x + nx, y + ny);
+            (n.name, n.w, n.h, n.fill) = ("Box".into(), w, h, Some([226, 236, 250, 255]));
+            app.doc.insert(n, Some(stage));
+        };
+        // `w` 0: auto width.
+        let text = |app: &mut Self, name: &str, s: &str, (nx, ny, w): (f32, f32, f32), size: f32, edit: &dyn Fn(&mut Node)| {
+            let id = app.doc.alloc_id();
+            let mut n = Node::new(id, Kind::Text, x + nx, y + ny);
+            (n.name, n.text, n.font_size, n.fill) = (name.into(), s.into(), size, Some(ink));
+            (n.wrap, n.w, n.h) = (w > 0.0, if w > 0.0 { w } else { 100.0 }, size * 1.2);
+            edit(&mut n);
+            app.doc.insert(n, Some(stage));
+            id
+        };
+
+        // Ranges: under, through, both; a larger coloured one; bold beside regular (one line under both).
+        let s = "Underline, strike, both, big blue, bold and regular";
+        let at = |word: &str| {
+            let a = s.find(word).map_or(0, |i| s[..i].chars().count());
+            (a, a + word.chars().count())
+        };
+        text(self, "Ranges", s, (40.0, 40.0, 0.0), 26.0, &|n| {
+            let (a, b) = at("Underline");
+            n.toggle_decoration(a, b, false);
+            let (a, b) = at("strike");
+            n.toggle_decoration(a, b, true);
+            let (a, b) = at("both");
+            n.toggle_decoration(a, b, false);
+            n.toggle_decoration(a, b, true);
+            let (a, b) = at("big blue");
+            n.style_range(a, b, |st| (st.size, st.fill, st.underline, st.strike) = (40.0, blue, true, true));
+            let (a, b) = at("bold and regular");
+            n.toggle_decoration(a, b, false);
+            let (a, b) = at("bold");
+            n.style_range(a, b, |st| st.weight = 700);
+        });
+        // The whole node, in another colour, over two lines of auto-width text aligned right.
+        text(self, "Whole node", "All of this text is underlined\nand struck through", (40.0, 110.0, 0.0), 20.0, &|n| {
+            (n.underline, n.strike, n.fill, n.align) = (true, true, Some(red), 2);
+        });
+
+        let lorem = "Justified text stretches every line to the width of its box by sharing the room that is left among the spaces between the words. The last line of a paragraph stays as it is.\nA second paragraph starts here, and its lines are stretched in the same way until the last one.";
+        ground(self, (40.0, 190.0, 420.0, 230.0));
+        let justified = text(self, "Justified", lorem, (40.0, 190.0, 420.0), 17.0, &|n| {
+            n.align = 3;
+            let a = lorem.find("every line").map_or(0, |i| lorem[..i].chars().count());
+            n.toggle_decoration(a, a + 30, false);
+        });
+        ground(self, (520.0, 190.0, 440.0, 230.0));
+        text(self, "Left", lorem, (520.0, 190.0, 440.0), 17.0, &|_| {});
+
+        let items = "Milk and two eggs\nA long item that does not fit the width of its box, so it wraps and hangs under its own text\n\nBread";
+        ground(self, (40.0, 450.0, 300.0, 200.0));
+        let bullets = text(self, "Bullets", items, (40.0, 450.0, 300.0), 17.0, &|n| n.list = 1);
+        ground(self, (370.0, 450.0, 300.0, 200.0));
+        let numbers = text(self, "Numbers", items, (370.0, 450.0, 300.0), 17.0, &|n| {
+            (n.list, n.align) = (2, 3);
+            n.style_range(0, 4, |st| (st.weight, st.fill, st.size) = (700, red, 24.0));
+        });
+        // Auto width, twelve items: the numbers get wider and the box grows by the indent.
+        let twelve: Vec<String> = (1..=12).map(|i| format!("Item {i}")).collect();
+        ground(self, (700.0, 450.0, 110.0, 250.0));
+        text(self, "Twelve", &twelve.join("\n"), (700.0, 450.0, 0.0), 14.0, &|n| n.list = 2);
+        text(self, "Centred list", "Centred\nlist of three\nitems", (830.0, 450.0, 150.0), 15.0, &|n| (n.list, n.align) = (1, 1));
+
+        for (i, name) in ["Top", "Middle", "Bottom"].into_iter().enumerate() {
+            let nx = 40.0 + i as f32 * 200.0;
+            ground(self, (nx, 690.0, 180.0, 120.0));
+            text(self, name, &format!("{name}: two lines\nin a fixed box"), (nx, 690.0, 180.0), 16.0, &|n| {
+                (n.fixed_h, n.h, n.valign, n.align) = (true, 120.0, i as u8, i as u8);
+                n.toggle_decoration(0, name.chars().count(), false);
+            });
+        }
+        // Lower than its lines, aligned to the bottom: they run out at the top.
+        ground(self, (40.0, 850.0, 180.0, 20.0));
+        text(self, "Overflow", "Three lines\nin a box\nof 20", (40.0, 850.0, 180.0), 14.0, &|n| (n.fixed_h, n.h, n.valign) = (true, 20.0, 2));
+
+        // Above the size where glyphs come from the atlas: outlines, with vector lines and markers.
+        let large = text(self, "Large", "Big list\nstruck", (650.0, 690.0, 0.0), 0.0, &|n| {
+            (n.font_size, n.list, n.weight, n.w, n.h) = (60.0, 1, 700, 340.0, 145.0);
+            n.toggle_decoration(4, 8, false);
+            n.toggle_decoration(9, 15, true);
+            n.style_range(9, 15, |st| st.fill = blue);
+        });
+        self.zoom_to((x - 30.0, y - 40.0, x + 1030.0, y + 930.0), 1.0);
+        self.fit_pending = false;
+        self.expanded.insert(stage);
+        self.sel = vec![justified];
+        self.tool = Tool::Select;
+        vec![stage, justified, bullets, numbers, large]
     }
 
     /// `KANVAS_BENCH_NESTED`: a frame holding a frame holding a frame, each with something sticking
