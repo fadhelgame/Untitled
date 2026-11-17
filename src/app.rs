@@ -1650,6 +1650,7 @@ impl App {
         let mut click_group: Option<(u64, bool)> = None; // (id group, shift)
         let mut toggle: Option<u64> = None;
         let mut lock_toggle: Option<u64> = None;
+        let mut hide_toggle: Option<u64> = None;
         let mut menu: Option<u8> = None;
         let targets = self.clip_targets();
         let can_clip = !targets.is_empty();
@@ -1886,6 +1887,12 @@ impl App {
                     let tint = if n.locked { ui.visuals().text_color() } else { ui.visuals().weak_text_color().gamma_multiply(0.6) };
                     lock_icon(&painter, lock_zone.center(), n.locked, tint);
                 }
+                // The eye beside it: always shown on a hidden layer, faint while the row is hovered.
+                let eye_zone = Rect::from_min_max(pos2(rect.right() - 52.0, rect.top()), pos2(rect.right() - 28.0, rect.bottom()));
+                if !n.visible || resp.hovered() {
+                    let tint = if n.visible { ui.visuals().weak_text_color().gamma_multiply(0.6) } else { ui.visuals().text_color() };
+                    eye_icon(&painter, eye_zone.center(), n.visible, tint);
+                }
                 // Klik kanan pada layer yang belum terpilih: pilih dulu, lalu menu berlaku untuknya.
                 if resp.secondary_clicked() && !selected {
                     click = Some((n.id, false, false));
@@ -1895,6 +1902,8 @@ impl App {
                     let px = resp.interact_pointer_pos().map_or(f32::MAX, |p| p.x);
                     if resp.interact_pointer_pos().is_some_and(|p| lock_zone.contains(p)) {
                         lock_toggle = Some(n.id);
+                    } else if resp.interact_pointer_pos().is_some_and(|p| eye_zone.contains(p)) {
+                        hide_toggle = Some(n.id);
                     } else if is_frame && px < chevron + 16.0 {
                         toggle = Some(n.id);
                     } else {
@@ -1963,6 +1972,13 @@ impl App {
                     self.push_undo(pre);
                 }
             }
+        }
+        if let Some(id) = hide_toggle {
+            let pre = self.doc.clone();
+            if let Some(n) = self.doc.find_mut(id) {
+                n.visible = !n.visible;
+            }
+            self.push_undo(pre);
         }
         if let Some(id) = lock_toggle {
             let pre = self.doc.clone();
@@ -2613,6 +2629,19 @@ fn tag_row(p: &egui::Painter, rect: Rect, tag: u8) {
     let (r, c) = (rect.shrink2(vec2(0.0, 1.0)), tag_color(tag));
     p.rect_filled(r, CornerRadius::same(8), c.gamma_multiply(0.2));
     p.rect_filled(Rect::from_min_max(r.min + vec2(0.0, 4.0), pos2(r.left() + 3.0, r.bottom() - 4.0)), CornerRadius::same(2), c);
+}
+
+/// A small eye for the layer panel: open (the layer is shown), or struck through (hidden).
+fn eye_icon(p: &egui::Painter, c: Pos2, visible: bool, color: Color32) {
+    let s = Stroke::new(1.3_f32, color);
+    // Two arcs meeting in the corners of the eye.
+    let lid = |sign: f32| -> Vec<Pos2> { (0..=8).map(|i| i as f32 / 8.0).map(|t| pos2(c.x - 6.5 + 13.0 * t, c.y - sign * 4.2 * (std::f32::consts::PI * t).sin())).collect() };
+    p.add(egui::Shape::line(lid(1.0), s));
+    p.add(egui::Shape::line(lid(-1.0), s));
+    p.circle_filled(c, 1.8, color);
+    if !visible {
+        p.line_segment([c + vec2(-6.0, 5.5), c + vec2(6.0, -5.5)], Stroke::new(1.5_f32, color));
+    }
 }
 
 /// Gembok kecil untuk panel layer: tertutup (terkunci) atau terbuka.
