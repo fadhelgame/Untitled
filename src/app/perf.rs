@@ -104,7 +104,7 @@ impl App {
         }
         let p = &mut b.perf;
         let at = frame - p.mark;
-        if at == LEN - 20 && matches!(PHASES[p.phase], "still" | "pan" | "drag" | "after") && std::env::var_os("KANVAS_PERF_SHOT").is_some() {
+        if at == LEN - 20 && matches!(PHASES[p.phase], "still" | "pan" | "zoom" | "drag" | "after") && std::env::var_os("KANVAS_PERF_SHOT").is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
         // `frame_ms` is the cost of the frame before this one.
@@ -197,6 +197,9 @@ impl App {
                 self.canvas_rect.height(),
                 ctx.pixels_per_point()
             );
+            let kept = self.ext.kept();
+            let head = format!("{head}kept_frames={} pieces={} vertices={} not_kept={}
+", kept.0, kept.1, kept.2, kept.3);
             let _ = std::fs::write(b.out.with_extension("txt"), head + &p.report);
             self.dirty = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

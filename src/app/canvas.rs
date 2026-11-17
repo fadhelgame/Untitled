@@ -151,6 +151,7 @@ impl App {
             depth: 0,
             recording: false,
             no_keep: false,
+            specials: Vec::new(),
         };
         self.labels.clear();
         let (labels, sel, view) = (&mut self.labels, &self.sel, self.view);
@@ -161,13 +162,15 @@ impl App {
                     let lr = Rect::from_min_max(pos2(r.left(), r.top() - 18.0), pos2(r.right(), r.top()));
                     if lr.intersects(rect) {
                         let color = if sel.contains(&n.id) { ACCENT } else { Color32::from_gray(160) };
-                        painter.with_clip_rect(lr.intersect(rect)).text(
-                            pos2(r.left(), r.top() - 4.0),
-                            Align2::LEFT_BOTTOM,
-                            &n.name,
-                            FontId::proportional(11.0),
-                            color,
-                        );
+                        // A name that fits above its frame needs no clip rectangle of its own, so
+                        // egui can draw all such names in one go instead of one draw call each.
+                        let galley = painter.layout_no_wrap(n.name.clone(), FontId::proportional(11.0), color);
+                        let at = pos2(r.left(), r.top() - 4.0 - galley.size().y);
+                        if galley.size().x <= lr.width() && rect.contains_rect(lr) {
+                            painter.galley(at, galley, color);
+                        } else {
+                            painter.with_clip_rect(lr.intersect(rect)).galley(at, galley, color);
+                        }
                         labels.push((n.id, lr));
                     }
                 }

@@ -210,6 +210,9 @@ pub struct Ext {
     epoch: u64,
     /// Screen position of the world origin on the previous frame.
     pub last_origin: Pos2,
+    /// Textures that were replaced by a newer version, kept a little longer: kept frames may
+    /// still draw with them until they are made again.
+    retired: Vec<(TextureHandle, u64)>,
 }
 
 impl Default for Ext {
@@ -273,11 +276,20 @@ impl Default for Ext {
             frames: HashMap::new(),
             epoch: 0,
             last_origin: Pos2::ZERO,
+            retired: Vec::new(),
         }
     }
 }
 
 impl Ext {
+    /// Kept frames: how many, in how many pieces, with how many vertices, and how many cannot be kept.
+    pub fn kept(&self) -> (usize, usize, usize, usize) {
+        let ready = self.frames.values().filter(|f| f.state == 1);
+        let pieces = ready.clone().map(|f| f.prims.len()).sum();
+        let vertices = ready.clone().flat_map(|f| &f.prims).map(|p| if let Kept::Mesh(m) = &p.1 { m.vertices.len() } else { 0 }).sum();
+        (ready.count(), pieces, vertices, self.frames.values().filter(|f| f.state == 2).count())
+    }
+
     /// Images, shadows and blurs still being prepared on other threads.
     pub fn busy(&self) -> usize {
         self.decoding.len() + self.detail_busy.len() + self.shadow_busy.len() + self.blur_busy.len()
@@ -318,7 +330,9 @@ impl Ext {
                     ..egui::TextureOptions::LINEAR
                 };
                 let handle = ctx.load_texture(format!("image-{}-{}", id.0, id.1), image, options);
-                self.tex.insert(id, (handle, self.frame));
+                if let Some(old) = self.tex.insert(id, (handle, self.frame)) {
+                    self.retired.push((old.0, self.frame));
+                }
                 if full {
                     self.tex_full.insert(id);
                 }
@@ -344,7 +358,9 @@ impl Ext {
             match result {
                 Ok(image) => {
                     let tex = ctx.load_texture(format!("shadow-{key}"), image, egui::TextureOptions::LINEAR);
-                    self.shadows.insert(key, ShadowTex { nodes, scale, region, fonts, tex, frame: self.frame });
+                    if let Some(old) = self.shadows.insert(key, ShadowTex { nodes, scale, region, fonts, tex, frame: self.frame }) {
+                        self.retired.push((old.tex, self.frame));
+                    }
                 }
                 Err(_) => {
                     self.shadow_failed.insert(key);
@@ -357,7 +373,9 @@ impl Ext {
             match result {
                 Ok(image) => {
                     let tex = ctx.load_texture(format!("blur-{key}"), image, egui::TextureOptions::LINEAR);
-                    self.blurs.insert(key, BlurTex { nodes, scale, region, fonts, tex, frame: self.frame });
+                    if let Some(old) = self.blurs.insert(key, BlurTex { nodes, scale, region, fonts, tex, frame: self.frame }) {
+                        self.retired.push((old.tex, self.frame));
+                    }
                 }
                 Err(_) => {
                     self.blur_failed.insert(key);
@@ -372,6 +390,7 @@ impl Ext {
         }
         let frame = self.frame;
         self.frames.retain(|_, f| f.used + 300 > frame);
+        self.retired.retain(|r| r.1 + 300 > frame);
         self.blurs.retain(|_, b| b.frame + 300 > frame);
         self.details.retain(|_, d| d.frame + 300 > frame);
         self.shadows.retain(|_, s| s.frame + 300 > frame);
@@ -521,6 +540,8 @@ pub struct PaintCx<'a> {
     /// be kept (it depends on the part of the screen that is visible).
     pub recording: bool,
     pub no_keep: bool,
+    /// While recording: what the GPU draws directly (see `add_special`), with its clip rectangle.
+    pub specials: Vec<(Rect, Special)>,
 }
 
 /// Texture of an image. `mask`: siluet putih (hanya alpha) yang diwarnai lewat tint, untuk color
@@ -1334,7 +1355,7 @@ fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[
     match &mut pc.capture {
         Some(capture) => capture.extend(meshes),
         None => {
-            painter.add(blend::callback(pc.ext.blend_gl.clone(), painter.clip_rect(), meshes, mode));
+            add_special(pc, painter, Special::Blend(meshes, mode));
         }
     }
     true
@@ -1347,19 +1368,74 @@ fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[
 /// Most of the time of a frame went into egui turning shapes into triangles again (rounded
 /// rectangles, strokes, paths, text) although nothing about them had changed. A frame that is
 /// the same `Arc` as on the frame before is tessellated once and then drawn from these meshes,
-/// which are only shifted when the view is panned.
+/// which are only shifted when the view is panned. While the zoom is changing they are scaled
+/// (slightly soft for a moment, like a photo being resized) and made afresh at the new size once
+/// it rests, or when the zoom has moved past half or double the size they were made for.
 struct FrameMesh {
     /// Keeps the node alive, so the same address means the same content.
     node: Arc<Node>,
     /// 0 = seen once, 1 = meshes ready, 2 = cannot be kept.
     state: u8,
     key: FrameKey,
-    /// Screen position of the world origin the meshes are placed for.
+    /// Screen position of the world origin the meshes are placed for, and the zoom they were
+    /// made at.
     origin: Pos2,
-    prims: Vec<(Rect, Arc<egui::Mesh>)>,
+    zoom: f32,
+    prims: Vec<(Rect, Kept)>,
     drawn: usize,
     made: u64,
     used: u64,
+}
+
+/// One piece of a kept frame, in drawing order.
+enum Kept {
+    Mesh(Arc<egui::Mesh>),
+    Special(Special),
+}
+
+/// Something the GPU draws directly instead of egui: a blend mode, or a clipping mask.
+#[derive(Clone)]
+pub enum Special {
+    /// Meshes and their blend mode (1..=6).
+    Blend(Vec<egui::Mesh>, u8),
+    /// The mask and what shows through it.
+    Masked(Vec<egui::Mesh>, Vec<egui::Mesh>),
+}
+
+impl Special {
+    fn shape(self, gl: blend::Shared, clip: Rect) -> Shape {
+        match self {
+            Special::Blend(meshes, mode) => blend::callback(gl, clip, meshes, mode),
+            Special::Masked(mask, content) => blend::masked(gl, clip, mask, content),
+        }
+    }
+
+    fn meshes_mut(&mut self) -> impl Iterator<Item = &mut egui::Mesh> {
+        let (a, b) = match self {
+            Special::Blend(meshes, _) => (meshes, None),
+            Special::Masked(mask, content) => (mask, Some(content)),
+        };
+        a.iter_mut().chain(b.into_iter().flatten())
+    }
+}
+
+/// Texture ids from here on stand for the entries of `PaintCx::specials` in a recording.
+const SPECIAL_MARK: u64 = u64::MAX - (1 << 20);
+
+/// Draw something the GPU handles directly. While a frame is being recorded it is set aside,
+/// and a marker mesh keeps its place among the other shapes.
+fn add_special(pc: &mut PaintCx, painter: &egui::Painter, special: Special) {
+    let clip = painter.clip_rect();
+    if !pc.recording {
+        painter.add(special.shape(pc.ext.blend_gl.clone(), clip));
+        return;
+    }
+    let at = if clip.is_finite() { clip.center() } else { Pos2::ZERO };
+    let mut marker = egui::Mesh::with_texture(TextureId::User(SPECIAL_MARK + pc.specials.len() as u64));
+    marker.vertices = vec![egui::epaint::Vertex { pos: at, uv: egui::epaint::WHITE_UV, color: Color32::TRANSPARENT }; 3];
+    marker.indices = vec![0, 1, 2];
+    painter.add(Shape::mesh(marker));
+    pc.specials.push((clip, special));
 }
 
 /// Everything besides the node itself that the meshes depend on: zoom, pixels per point, opacity
@@ -1374,7 +1450,7 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
     if *OFF.get_or_init(|| std::env::var_os("KANVAS_NO_FRAME_CACHE").is_some()) {
         return false;
     }
-    if pc.moving || pc.editing.is_some() || n.children.is_empty() || n.rotation != 0.0 || n.blend != 0 {
+    if pc.editing.is_some() || n.children.is_empty() || n.rotation != 0.0 || n.blend != 0 {
         return false;
     }
     // Zoomed far into a frame, most of it is off screen: painting only what is visible is less
@@ -1389,7 +1465,7 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
         // New or just changed. A frame that changes every frame (something in it is being
         // dragged) would only add work here, so its meshes are made the second time it is seen.
         if let Some(node) = pc.tops.iter().find(|a| std::ptr::eq(Arc::as_ptr(a), n)) {
-            let entry = FrameMesh { node: node.clone(), state: 0, key: Default::default(), origin: Pos2::ZERO, prims: Vec::new(), drawn: 0, made: frame, used: frame };
+            let entry = FrameMesh { node: node.clone(), state: 0, key: Default::default(), origin: Pos2::ZERO, zoom: 1.0, prims: Vec::new(), drawn: 0, made: frame, used: frame };
             pc.ext.frames.insert(n.id, entry);
         }
         return false;
@@ -1398,24 +1474,33 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
     let atlas = pc.ctx.fonts(|f| f.font_image_size());
     let key: FrameKey = (pc.view.zoom.to_bits(), ppp.to_bits(), alpha.to_bits(), pc.fonts.layouts.generation(), atlas, pc.ext.epoch);
     let origin = pc.view.to_screen(pc.o, 0.0, 0.0);
-    let busy = pc.ext.busy() > 0;
     let Some(e) = pc.ext.frames.get_mut(&n.id) else { return false };
     e.used = frame;
-    if e.state == 2 || busy {
+    if e.state == 2 {
         return false;
     }
     let snap = |d: egui::Vec2| vec2((d.x * ppp).round() / ppp, (d.y * ppp).round() / ppp);
-    let shift = origin - e.origin;
-    // The meshes are moved by whole pixels only, so text stays as sharp as it was made. Once the
-    // view rests, what is left of the move is settled by making them again.
-    let off = pc.still && (shift - snap(shift)).length() > 0.01;
-    // Textures are dropped when nothing asks for them for a while; making the meshes again asks.
-    let old = frame > e.made + 200 + n.id % 64;
-    if e.state == 0 || e.key != key || off || old {
+    let zoom = pc.view.zoom;
+    let same = e.state == 1 && (e.key.1, e.key.2, e.key.3, e.key.4) == (key.1, key.2, key.3, key.4);
+    let usable = if pc.moving {
+        // While the zoom is changing the meshes are scaled; text and edges only hold up so far.
+        // Textures that arrive meanwhile (a shadow at the new size, a sharper image) are picked
+        // up when the zoom rests.
+        same && (0.5..=2.0).contains(&(zoom / e.zoom))
+    } else {
+        let shift = origin - e.origin;
+        // The meshes are moved by whole pixels only, so text stays as sharp as it was made. Once
+        // the view rests, what is left of the move is settled by making them again.
+        let off = pc.still && (shift - snap(shift)).length() > 0.01;
+        // Textures are dropped when nothing asks for them for a while; making the meshes again asks.
+        let old = frame > e.made + 200 + n.id % 64;
+        same && e.key.0 == key.0 && e.key.5 == key.5 && !off && !old
+    };
+    if !usable {
         match record_frame(pc, n, alpha) {
             Some((prims, drawn)) => {
                 let Some(e) = pc.ext.frames.get_mut(&n.id) else { return false };
-                (e.state, e.key, e.origin, e.prims, e.drawn, e.made) = (1, key, origin, prims, drawn, frame);
+                (e.state, e.key, e.origin, e.zoom, e.prims, e.drawn, e.made) = (1, key, origin, zoom, prims, drawn, frame);
             }
             None => {
                 if let Some(e) = pc.ext.frames.get_mut(&n.id) {
@@ -1427,19 +1512,53 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
         }
     }
     let Some(e) = pc.ext.frames.get_mut(&n.id) else { return false };
+    let screen = painter.clip_rect();
+    if e.zoom != zoom {
+        // A scaled copy for this frame; the kept meshes stay as they were made.
+        let (from, k) = (e.origin, zoom / e.zoom);
+        let at = |p: Pos2| origin + (p - from) * k;
+        for (clip, kept) in &e.prims {
+            let clip = Rect::from_min_max(at(clip.min), at(clip.max)).intersect(screen);
+            if !clip.is_positive() {
+                continue;
+            }
+            let moved = |mesh: &mut egui::Mesh| mesh.vertices.iter_mut().for_each(|v| v.pos = at(v.pos));
+            let shape = match kept {
+                Kept::Mesh(mesh) => {
+                    let mut mesh = (**mesh).clone();
+                    moved(&mut mesh);
+                    Shape::mesh(mesh)
+                }
+                Kept::Special(special) => {
+                    let mut special = special.clone();
+                    special.meshes_mut().for_each(moved);
+                    special.shape(pc.ext.blend_gl.clone(), clip)
+                }
+            };
+            painter.with_clip_rect(clip).add(shape);
+        }
+        pc.drawn += e.drawn;
+        return true;
+    }
     let shift = snap(origin - e.origin);
     if shift != egui::Vec2::ZERO {
-        for (clip, mesh) in &mut e.prims {
-            Arc::make_mut(mesh).translate(shift);
+        for (clip, kept) in &mut e.prims {
+            match kept {
+                Kept::Mesh(mesh) => Arc::make_mut(mesh).translate(shift),
+                Kept::Special(special) => special.meshes_mut().for_each(|m| m.translate(shift)),
+            }
             *clip = clip.translate(shift);
         }
         e.origin += shift;
     }
-    let screen = painter.clip_rect();
-    for (clip, mesh) in &e.prims {
+    for (clip, kept) in &e.prims {
         let clip = clip.intersect(screen);
         if clip.is_positive() {
-            painter.with_clip_rect(clip).add(Shape::mesh(mesh.clone()));
+            let shape = match kept {
+                Kept::Mesh(mesh) => Shape::mesh(mesh.clone()),
+                Kept::Special(special) => special.clone().shape(pc.ext.blend_gl.clone(), clip),
+            };
+            painter.with_clip_rect(clip).add(shape);
         }
     }
     pc.drawn += e.drawn;
@@ -1447,20 +1566,21 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
 }
 
 /// Paint `n` off to the side, without culling, and tessellate the result.
-/// `None` = it holds something that cannot be kept as meshes (a blend or mask drawn by the GPU,
-/// an SVG that is rendered for the visible part).
-fn record_frame(pc: &mut PaintCx, n: &Node, alpha: f32) -> Option<(Vec<(Rect, Arc<egui::Mesh>)>, usize)> {
+/// `None` = it holds something that cannot be kept (an SVG that is rendered for the visible part).
+fn record_frame(pc: &mut PaintCx, n: &Node, alpha: f32) -> Option<(Vec<(Rect, Kept)>, usize)> {
     let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("kanvas-frame-meshes"));
     let side = egui::Painter::new(pc.ctx.clone(), layer, Rect::EVERYTHING);
     let (vis, drawn) = (pc.vis, pc.drawn);
     pc.vis = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
     (pc.recording, pc.no_keep, pc.skip_shadow) = (true, false, true);
+    pc.specials.clear();
     paint_node(pc, &side, n, alpha);
     pc.recording = false;
     pc.vis = vis;
     let count = pc.drawn - drawn;
     pc.drawn = drawn;
     let list = pc.ctx.graphics_mut(|g| g.get_mut(layer).map(std::mem::take)).unwrap_or_default();
+    let mut specials: Vec<Option<(Rect, Special)>> = std::mem::take(&mut pc.specials).into_iter().map(Some).collect();
     if pc.no_keep {
         return None;
     }
@@ -1468,11 +1588,15 @@ fn record_frame(pc: &mut PaintCx, n: &Node, alpha: f32) -> Option<(Vec<(Rect, Ar
     let mut prims = Vec::new();
     for p in pc.ctx.tessellate(shapes, pc.ctx.pixels_per_point()) {
         match p.primitive {
+            egui::epaint::Primitive::Mesh(m) if matches!(m.texture_id, TextureId::User(id) if id >= SPECIAL_MARK) => {
+                let TextureId::User(id) = m.texture_id else { continue };
+                prims.push(specials.get_mut((id - SPECIAL_MARK) as usize).and_then(Option::take).map(|(clip, special)| (clip, Kept::Special(special)))?);
+            }
             egui::epaint::Primitive::Mesh(m) => {
                 // A mesh that lies inside its clip rectangle anyway is drawn with the clip of the
                 // canvas, so egui can join it with its neighbours into one draw call.
                 let clip = if p.clip_rect.contains_rect(m.calc_bounds()) { Rect::EVERYTHING } else { p.clip_rect };
-                prims.push((clip, Arc::new(m)));
+                prims.push((clip, Kept::Mesh(Arc::new(m))));
             }
             egui::epaint::Primitive::Callback(_) => return None,
         }
@@ -1551,7 +1675,7 @@ fn flush(pc: &mut PaintCx, sink: &mut Sink, n: &Node, pivot: Pos2) {
             sink.painter.add(Shape::mesh(m));
         }
     } else {
-        sink.painter.add(blend::callback(pc.ext.blend_gl.clone(), sink.painter.clip_rect(), meshes, n.blend));
+        add_special(pc, sink.painter, Special::Blend(meshes, n.blend));
     }
 }
 
@@ -1570,7 +1694,7 @@ pub fn paint_list<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, nod
             paint_run(pc, painter, &nodes[j..k], alpha, &mut |_| {});
             let content = std::mem::replace(&mut pc.capture, outer).unwrap_or_default();
             if !mask.is_empty() && !content.is_empty() {
-                painter.add(blend::masked(pc.ext.blend_gl.clone(), painter.clip_rect(), mask, content));
+                add_special(pc, painter, Special::Masked(mask, content));
             }
         }
         i = k;
