@@ -80,6 +80,9 @@ impl App {
         if b.perf.phase >= PHASES.len() {
             return;
         }
+        if frame == 1 && std::env::var_os("KANVAS_PERF_ABOUT").is_some() {
+            self.about = true;
+        }
         if frame == 1 && self.doc.count() == 0 {
             self.stress_test();
         }

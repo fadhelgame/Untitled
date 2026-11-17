@@ -71,7 +71,14 @@ pub enum EditPending {
 
 /// Kunci tekstur gambar: (id aset, versi siluet putih untuk color overlay).
 type TexKey = (u64, bool);
-type Decoded = (TexKey, Result<ColorImage, String>);
+/// An image out of the decoder. `full`: at full size, not the small first version; `last`: the
+/// thread has nothing more to send for this key.
+struct Decoded {
+    key: TexKey,
+    full: bool,
+    last: bool,
+    image: Result<ColorImage, String>,
+}
 
 /// Sisi terpanjang potongan SVG yang dirasterkan ulang untuk zoom besar.
 const DETAIL_MAX: f32 = 4096.0;
@@ -160,6 +167,8 @@ pub struct Ext {
     pub picker: Picker,
     grads: HashMap<u64, (TextureHandle, u64)>,
     tex: HashMap<TexKey, (TextureHandle, u64)>,
+    /// Textures in `tex` that are the full-size version.
+    tex_full: HashSet<TexKey>,
     decoding: HashSet<TexKey>,
     /// Decode yang gagal: (frame saat gagal, berapa kali sudah dicoba). Dicoba lagi beberapa kali
     /// dengan jeda, supaya satu kegagalan tidak membuat gambar kosong selamanya.
@@ -249,6 +258,7 @@ impl Default for Ext {
             picker: Picker::default(),
             grads: HashMap::new(),
             tex: HashMap::new(),
+            tex_full: HashSet::new(),
             decoding: HashSet::new(),
             decode_failed: HashMap::new(),
             notice: None,
@@ -286,13 +296,17 @@ impl Ext {
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.frame += 1;
         let waiting = self.busy();
+        let mut arrived = false;
         // Uploading a large image to the GPU takes several milliseconds, so only so many pixels
         // are taken per frame; the rest wait for the next one.
         let mut pixels = 0;
         while pixels < UPLOAD_PIXELS {
-            let Ok((id, result)) = self.img_rx.try_recv() else { break };
+            let Ok(Decoded { key: id, full, last, image: result }) = self.img_rx.try_recv() else { break };
             pixels += result.as_ref().map_or(0, |image| image.size[0] * image.size[1]);
-            self.decoding.remove(&id);
+            arrived = true;
+            if last {
+                self.decoding.remove(&id);
+            }
             if let Err(e) = &result {
                 let tries = self.decode_failed.get(&id).map_or(0, |f| f.1) + 1;
                 self.decode_failed.insert(id, (self.frame, tries));
@@ -305,6 +319,9 @@ impl Ext {
                 };
                 let handle = ctx.load_texture(format!("image-{}-{}", id.0, id.1), image, options);
                 self.tex.insert(id, (handle, self.frame));
+                if full {
+                    self.tex_full.insert(id);
+                }
                 self.decode_failed.remove(&id);
             }
         }
@@ -347,7 +364,7 @@ impl Ext {
                 }
             }
         }
-        if self.busy() != waiting {
+        if self.busy() != waiting || arrived {
             self.epoch += 1;
         }
         if pixels >= UPLOAD_PIXELS {
@@ -360,6 +377,8 @@ impl Ext {
         self.shadows.retain(|_, s| s.frame + 300 > frame);
         if self.tex.len() > 6 {
             self.tex.retain(|_, e| e.1 + 1200 > frame);
+            let tex = &self.tex;
+            self.tex_full.retain(|k| tex.contains_key(k));
         }
         self.grads.retain(|_, e| e.1 + 600 > frame);
     }
@@ -504,14 +523,33 @@ pub struct PaintCx<'a> {
     pub no_keep: bool,
 }
 
-/// `mask`: siluet putih (hanya alpha) yang diwarnai lewat tint, untuk color overlay.
-fn image_texture(pc: &mut PaintCx, id: u64, mask: bool) -> Option<TextureId> {
+/// Texture of an image. `mask`: siluet putih (hanya alpha) yang diwarnai lewat tint, untuk color
+/// overlay. `need`: the longest side of the whole image on screen, in physical pixels.
+///
+/// An image first gets a small texture (`SMALL_SIDE`), which is quick to hand to the GPU and
+/// enough while the image is small on screen; the full-size texture replaces it once the image
+/// is shown larger than that. Opening a document with many photos therefore uploads a fraction
+/// of their pixels, and the GPU holds full-size textures only for what was looked at closely.
+fn image_texture(pc: &mut PaintCx, id: u64, mask: bool, need: f32) -> Option<TextureId> {
     let frame = pc.ext.frame;
     let key = (id, mask);
+    let grow = need > SMALL_SIDE as f32 * 1.2;
     if let Some(e) = pc.ext.tex.get_mut(&key) {
         e.1 = frame;
-        return Some(e.0.id());
+        let tex = e.0.id();
+        if grow && !pc.ext.tex_full.contains(&key) {
+            decode(pc, key, true, true);
+        }
+        return Some(tex);
     }
+    decode(pc, key, grow, false);
+    None
+}
+
+/// Start decoding an image on another thread. `full`: the full-size texture is wanted too;
+/// `have_small`: the small one is there already.
+fn decode(pc: &mut PaintCx, key: TexKey, full: bool, have_small: bool) {
+    let frame = pc.ext.frame;
     // Yang pernah gagal dicoba lagi paling banyak tiga kali, dengan jeda.
     let waiting = pc.ext.decode_failed.get(&key).is_some_and(|(at, tries)| *tries >= 3 || at + 120 > frame);
     // Decode di thread lain supaya canvas tidak tersendat. `decoding` hanya ditandai kalau thread
@@ -521,25 +559,58 @@ fn image_texture(pc: &mut PaintCx, id: u64, mask: bool) -> Option<TextureId> {
     // it is worked on, and a document can have a hundred of them. The rest start as these finish
     // (every finished image repaints, and the image is asked for again on each frame).
     let room = pc.ext.decoding.len() < decode_limit();
-    if !waiting && room && !pc.ext.decoding.contains(&key) {
-        if let Some(asset) = pc.assets.get(&id).cloned() {
-            pc.ext.decoding.insert(key);
-            let (tx, ctx) = (pc.ext.img_tx.clone(), pc.ctx.clone());
-            std::thread::spawn(move || {
-                let image = std::panic::catch_unwind(|| {
-                    let mut image = decode_image(&asset.bytes);
-                    if let (true, Ok(image)) = (mask, &mut image) {
-                        silhouette(image);
-                    }
-                    image
-                })
-                .unwrap_or_else(|_| Err("the decoder crashed".into()));
-                let _ = tx.send((key, image));
-                ctx.request_repaint();
-            });
-        }
+    if waiting || !room || pc.ext.decoding.contains(&key) {
+        return;
     }
-    None
+    let Some(asset) = pc.assets.get(&key.0).cloned() else { return };
+    pc.ext.decoding.insert(key);
+    let (tx, ctx) = (pc.ext.img_tx.clone(), pc.ctx.clone());
+    std::thread::spawn(move || {
+        let image = std::panic::catch_unwind(|| {
+            let mut image = decode_image(&asset.bytes);
+            if let (true, Ok(image)) = (key.1, &mut image) {
+                silhouette(image);
+            }
+            image
+        })
+        .unwrap_or_else(|_| Err("the decoder crashed".into()));
+        match image {
+            Ok(image) => {
+                let large = image.size[0].max(image.size[1]) > SMALL_SIDE;
+                if large && !have_small {
+                    let _ = tx.send(Decoded { key, full: false, last: !full, image: Ok(shrink(&image, SMALL_SIDE)) });
+                    ctx.request_repaint();
+                }
+                if full || !large {
+                    let _ = tx.send(Decoded { key, full: true, last: true, image: Ok(image) });
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Decoded { key, full, last: true, image: Err(e) });
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Longest side of the texture an image gets first.
+const SMALL_SIDE: usize = 512;
+
+fn shrink(image: &ColorImage, side: usize) -> ColorImage {
+    let [w, h] = image.size;
+    let k = side as f32 / w.max(h).max(1) as f32;
+    let (nw, nh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+    let raw: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+    match image::RgbaImage::from_raw(w as u32, h as u32, raw) {
+        Some(src) => ColorImage::from_rgba_premultiplied([nw as usize, nh as usize], image::imageops::thumbnail(&src, nw, nh).as_raw()),
+        None => image.clone(),
+    }
+}
+
+/// How large the whole image of `n` is on screen (longest side, physical pixels).
+fn image_need(pc: &PaintCx, n: &Node) -> f32 {
+    let shown = n.crop.map_or(1.0, |[u0, v0, u1, v1]| (u1 - u0).min(v1 - v0).max(1e-3));
+    n.w.max(n.h) / shown * pc.view.zoom * pc.ctx.pixels_per_point()
 }
 
 /// Pixels of decoded images handed to the GPU per frame: one large image, or several small ones.
@@ -630,7 +701,7 @@ fn svg_detail(pc: &mut PaintCx, n: &Node, r: Rect, clip: Rect, whole: bool) -> O
 /// Mode crop: gambar utuh digambar redup di atas dokumen, lalu bagian di dalam kotak crop
 /// digambar penuh di atasnya, supaya terlihat apa yang terpotong.
 pub fn paint_crop_ghost(pc: &mut PaintCx, painter: &egui::Painter, n: &Node) {
-    let Some(tex) = n.image.and_then(|id| image_texture(pc, id, n.fill.is_some())) else { return };
+    let Some(tex) = n.image.and_then(|id| image_texture(pc, id, n.fill.is_some(), f32::INFINITY)) else { return };
     let (o, view) = (pc.o, pc.view);
     let rect = |(x0, y0, x1, y1): (f32, f32, f32, f32)| Rect::from_min_max(view.to_screen(o, x0, y0), view.to_screen(o, x1, y1));
     let (full, r) = (rect(n.image_rect()), rect(n.bounds()));
@@ -656,7 +727,8 @@ fn source(pc: &mut PaintCx, n: &Node, alpha: f32) -> Source {
     if n.kind == Kind::Image {
         // Fill pada gambar = color overlay: warnanya mengganti RGB, alpha gambar dipertahankan.
         let overlay = n.fill.map(|c| col(c).gamma_multiply(alpha));
-        return match n.image.and_then(|id| image_texture(pc, id, overlay.is_some())) {
+        let need = image_need(pc, n);
+        return match n.image.and_then(|id| image_texture(pc, id, overlay.is_some(), need)) {
             Some(t) => Source::Texture(t, overlay.unwrap_or(tint)),
             // Siluet untuk color overlay belum siap: tampilkan gambar aslinya dulu, bukan kotak abu-abu.
             None => match n.image.filter(|_| overlay.is_some()).and_then(|id| pc.ext.tex.get(&(id, false))) {
