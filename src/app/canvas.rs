@@ -151,6 +151,7 @@ impl App {
             assets: &self.doc.assets,
             view: self.view,
             o,
+            canvas: rect,
             vis: (tl.x, tl.y, br.x, br.y),
             editing: self.editing,
             moving,

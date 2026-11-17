@@ -51,7 +51,7 @@ node_fields! {
     follow: [
         fill, gradient, stroke, stroke_w, radius, font, weight, italic, font_size, line_height, letter_spacing, align,
         underline, strike, list, valign, path_offset, path_side,
-        image, crop, flip_h, flip_v, blend, opacity, visible, locked, tag, dash, gap, stroke_align, cap, join, shadow, blur,
+        image, crop, flip_h, flip_v, blend, opacity, visible, locked, tag, dash, gap, stroke_align, cap, join, shadow, blur, inner_shadow, bg_blur,
         fill_style, stroke_style, type_style,
     ],
     by_hand: [text, spans],
@@ -818,6 +818,12 @@ mod tests {
         assert_eq!((at(b, 2).id, at(b, 3).id), (b_rect, b_text));
         assert_eq!((doc.find(b).unwrap().x, doc.find(b).unwrap().y), (400.0, 200.0));
         let loose = add(&mut doc, Kind::Rect, None, (0.0, 900.0, 5.0, 5.0));
+        // Inner shadow and background blur follow like any other property, unless overridden.
+        let inner = Some(crate::doc::Shadow { x: 0.0, y: 2.0, blur: 6.0, color: [0, 0, 0, 90] });
+        assert!(!edit(&mut doc, |d| d.find_mut(b_rect).unwrap().bg_blur = 5.0));
+        assert!(edit(&mut doc, |d| (d.find_mut(2).unwrap().inner_shadow, d.find_mut(2).unwrap().bg_blur) = (inner, 9.0)));
+        assert_eq!((part(&doc, a, 2).inner_shadow, part(&doc, a, 2).bg_blur), (inner, 9.0));
+        assert_eq!((part(&doc, b, 2).inner_shadow, part(&doc, b, 2).bg_blur), (inner, 5.0));
         let shared2 = doc.clone();
         assert!(edit(&mut doc, |d| d.find_mut(2).unwrap().blur = 3.0));
         let top = |d: &Doc, id: u64| d.nodes.iter().find(|n| n.id == id).cloned().unwrap();

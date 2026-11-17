@@ -719,6 +719,7 @@ impl Doc {
                 o.fill_style = n.fill_style.filter(|_| n.fill == o.fill);
                 (o.visible, o.locked, o.tag) = (n.visible, n.locked, n.tag);
                 (o.opacity, o.blend, o.clip, o.shadow, o.blur) = (n.opacity, n.blend, n.clip, n.shadow, n.blur);
+                o.inner_shadow = n.inner_shadow;
                 (o.constrain_h, o.constrain_v, o.absolute) = (n.constrain_h, n.constrain_v, n.absolute);
                 o.group = n.group;
                 set_contours(&mut o, contours);

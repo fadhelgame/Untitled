@@ -382,12 +382,15 @@ impl App {
                     }
                 }
             }
+            let (inner, glass) = (has_inside(&n), glassy(&n));
             effects_section(
                 ui,
                 &mut self.ext.picker,
                 id,
                 &mut n,
                 true,
+                inner,
+                glass,
                 "",
                 "Blurs the whole layer, with its shadow. On a frame, the contents are blurred too.",
             );
@@ -549,7 +552,8 @@ impl App {
         let mixed_fill = !all(&|n| n.fill == first.fill && n.gradient == first.gradient);
         let mixed_stroke = !all(&|n| n.stroke == first.stroke && n.stroke_w == first.stroke_w);
         let mixed_look = !all(&|n| n.opacity == first.opacity && n.blend == first.blend && n.radius == first.radius);
-        let mixed_blur = !all(&|n| n.blur == first.blur && n.shadow == first.shadow);
+        let mixed_blur = !all(&|n| n.blur == first.blur && n.shadow == first.shadow && n.inner_shadow == first.inner_shadow && n.bg_blur == first.bg_blur);
+        let (inner_all, glass_all) = (all(&|n| has_inside(n)), all(&|n| glassy(n)));
         // Frames with auto layout of their own (not that of a main component).
         let auto_all = all(&|n| n.is_auto() && n.instance_of.is_none() && n.source.is_none());
         let mixed_layout = !all(&|n| n.layout == first.layout);
@@ -694,6 +698,8 @@ impl App {
                 key,
                 &mut n,
                 true,
+                inner_all,
+                glass_all,
                 if mixed_blur { MIXED } else { "" },
                 if group.is_some() {
                     "Blurs the whole group as one layer."
@@ -795,6 +801,12 @@ impl App {
             }
             if n.blur != before.blur {
                 t.blur = n.blur;
+            }
+            if n.inner_shadow != before.inner_shadow {
+                t.inner_shadow = n.inner_shadow;
+            }
+            if n.bg_blur != before.bg_blur {
+                t.bg_blur = n.bg_blur;
             }
             if n.radius != before.radius && matches!(t.kind, Kind::Rect | Kind::Image | Kind::Path) {
                 t.radius = n.radius;
@@ -1419,8 +1431,13 @@ impl App {
 /// Bagian "Effects": tombol + membuka daftar efek yang bisa ditambahkan; tiap efek yang terpasang
 /// tampil sebagai satu blok dengan tombol − untuk melepasnya. `shadow` = drop shadow boleh diatur
 /// di sini; `note` = catatan di bawah judul (mis. nilai campuran); `blur_tip` = penjelasan blur.
-fn effects_section(ui: &mut egui::Ui, picker: &mut super::picker::Picker, id: u64, n: &mut Node, shadow: bool, note: &str, blur_tip: &str) {
+/// `inner` / `glass`: the selection can have an inner shadow / a background blur (it has an
+/// inside; it is a shape, an image or a frame).
+#[allow(clippy::too_many_arguments)]
+fn effects_section(ui: &mut egui::Ui, picker: &mut super::picker::Picker, id: u64, n: &mut Node, shadow: bool, inner: bool, glass: bool, note: &str, blur_tip: &str) {
     use crate::doc::Shadow;
+    /// What a new inner shadow starts as.
+    const INNER: Shadow = Shadow { x: 0.0, y: 4.0, blur: 8.0, color: [0, 0, 0, 64] };
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(4.0);
@@ -1432,8 +1449,16 @@ fn effects_section(ui: &mut egui::Ui, picker: &mut super::picker::Picker, id: u6
                     n.shadow = Some(Shadow::default());
                     ui.close_menu();
                 }
+                if inner && ui.add_enabled(n.inner_shadow.is_none(), egui::Button::new("Inner shadow")).clicked() {
+                    n.inner_shadow = Some(INNER);
+                    ui.close_menu();
+                }
                 if ui.add_enabled(n.blur <= 0.0, egui::Button::new("Layer blur")).clicked() {
                     n.blur = 4.0;
+                    ui.close_menu();
+                }
+                if glass && ui.add_enabled(n.bg_blur <= 0.0, egui::Button::new("Background blur")).clicked() {
+                    n.bg_blur = 12.0;
                     ui.close_menu();
                 }
             })
@@ -1461,6 +1486,40 @@ fn effects_section(ui: &mut egui::Ui, picker: &mut super::picker::Picker, id: u6
             });
         }
     }
+    if inner && n.inner_shadow.is_some() {
+        sub(ui, "Inner shadow");
+        let mut color = n.inner_shadow.map(|s| s.color);
+        paint_row(ui, picker, (id, 4), &mut color, None, INNER.color);
+        n.inner_shadow = match (color, n.inner_shadow) {
+            (Some(color), Some(s)) => Some(Shadow { color, ..s }),
+            _ => None,
+        };
+        if let Some(s) = &mut n.inner_shadow {
+            ui.horizontal(|ui| {
+                let third = (ui.available_width() - 16.0) / 3.0;
+                ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.x).speed(0.25).max_decimals(1).prefix("X  "));
+                ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.y).speed(0.25).max_decimals(1).prefix("Y  "));
+                ui.add_sized([third, 28.0], egui::DragValue::new(&mut s.blur).speed(0.25).range(0.0..=500.0).max_decimals(1).prefix("Blur  "));
+            });
+        }
+    }
+    if glass && n.bg_blur > 0.0 {
+        sub(ui, "Background blur");
+        ui.horizontal(|ui| {
+            let half = (ui.available_width() - 8.0) / 2.0;
+            let tip = if n.blur > 0.0 {
+                "Blurs what is behind this layer, inside its shape. Not shown while the layer has a layer blur."
+            } else {
+                "Blurs what is behind this layer, inside its shape. It shows where the fill is see-through, or where there is none."
+            };
+            blur_field(ui, half, &mut n.bg_blur).on_hover_text(tip);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("−").on_hover_text("Remove").clicked() {
+                    n.bg_blur = 0.0;
+                }
+            });
+        });
+    }
     if n.blur > 0.0 {
         sub(ui, "Layer blur");
         ui.horizontal(|ui| {
@@ -1473,6 +1532,20 @@ fn effects_section(ui: &mut egui::Ui, picker: &mut super::picker::Picker, id: u6
             });
         });
     }
+}
+
+/// Can `n` have an inner shadow (does it have an inside)?
+fn has_inside(n: &Node) -> bool {
+    match n.kind {
+        Kind::Line => false,
+        Kind::Path => n.closed,
+        _ => true,
+    }
+}
+
+/// Can `n` have a background blur (see `Node::backdrop`)?
+fn glassy(n: &Node) -> bool {
+    has_inside(n) && n.kind != Kind::Text
 }
 
 fn export_icon(p: &egui::Painter, c: Pos2, color: Color32) {

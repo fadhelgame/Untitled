@@ -22,6 +22,8 @@ pub struct Program {
     u_white: Option<glow::UniformLocation>,
     /// Perlengkapan clipping mask, dibuat saat pertama dipakai.
     mask: Option<MaskGl>,
+    /// What background blur needs (see `glass.rs`), made when first used.
+    pub(super) glass: Option<super::glass::Gl>,
 }
 
 /// Clipping mask: alas dan isi digambar ke dua tekstur seukuran layar, lalu digabung
@@ -38,7 +40,7 @@ struct MaskGl {
     size: [i32; 2],
 }
 
-unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> Result<glow::Program, String> {
+pub(super) unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> Result<glow::Program, String> {
     let program = gl.create_program()?;
     let mut shaders = Vec::new();
     for (kind, src) in [(glow::VERTEX_SHADER, vs), (glow::FRAGMENT_SHADER, fs)] {
@@ -139,6 +141,20 @@ impl MaskGl {
 
 pub type Shared = Arc<Mutex<Option<Program>>>;
 
+/// The shared program, made when first used. `None`: its shaders could not be made.
+pub(super) unsafe fn ensure<'a>(gl: &glow::Context, slot: &'a mut Option<Program>) -> Option<&'a mut Program> {
+    if slot.is_none() {
+        match Program::new(gl) {
+            Ok(p) => *slot = Some(p),
+            Err(e) => {
+                eprintln!("blend shader: {e}");
+                return None;
+            }
+        }
+    }
+    slot.as_mut()
+}
+
 impl Program {
     unsafe fn new(gl: &glow::Context) -> Result<Self, String> {
         let version = egui_glow::ShaderVersion::get(gl);
@@ -204,12 +220,13 @@ impl Program {
             u_sampler: gl.get_uniform_location(program, "u_sampler"),
             u_white: gl.get_uniform_location(program, "u_white"),
             mask: None,
+            glass: None,
         })
     }
 }
 
-fn bytes<T>(slice: &[T]) -> &[u8] {
-    // Aman: T di sini hanya `Vertex` (repr(C), tanpa padding) dan `u32`.
+pub(super) fn bytes<T>(slice: &[T]) -> &[u8] {
+    // Aman: T di sini hanya `Vertex` (repr(C), tanpa padding), `u32`, dan `f32`.
     unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
 }
 

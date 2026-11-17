@@ -241,6 +241,20 @@ fn paint(v: &Value) -> Result<(Option<[u8; 4]>, Option<Gradient>), String> {
     Ok((Some(first), Some(Gradient { radial, angle, stops, line: None, radial_line: None })))
 }
 
+/// A drop shadow or an inner shadow as {x, y, blur, color}; what is left out is taken from
+/// `d`. null = none.
+fn parse_shadow(v: &Value, d: crate::doc::Shadow) -> Result<Option<crate::doc::Shadow>, String> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let f = |key: &str, default: f32| v.get(key).and_then(|x| x.as_f64()).map_or(default, |x| x as f32);
+    let color = match v.get("color") {
+        Some(c) => color(c)?,
+        None => d.color,
+    };
+    Ok(Some(crate::doc::Shadow { x: f("x", d.x), y: f("y", d.y), blur: f("blur", d.blur).max(0.0), color }))
+}
+
 fn kind_name(k: Kind) -> &'static str {
     match k {
         Kind::Frame => "frame",
@@ -407,6 +421,12 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     }
     if n.blur != 0.0 {
         put("blur", r2(n.blur));
+    }
+    if let Some(s) = n.inner_shadow {
+        put("inner_shadow", json!({ "x": r2(s.x), "y": r2(s.y), "blur": r2(s.blur), "color": hex(s.color) }));
+    }
+    if n.bg_blur != 0.0 {
+        put("background_blur", r2(n.bg_blur));
     }
     if n.rotation != 0.0 {
         put("rotation", r2(n.rotation));
@@ -998,20 +1018,11 @@ impl App {
                     }
                 }
                 "radius" => n.radius = num(k, v)?.max(0.0),
-                "shadow" => {
-                    n.shadow = if v.is_null() {
-                        None
-                    } else {
-                        let d = crate::doc::Shadow::default();
-                        let f = |key: &str, default: f32| v.get(key).and_then(|x| x.as_f64()).map_or(default, |x| x as f32);
-                        let color = match v.get("color") {
-                            Some(c) => color(c)?,
-                            None => d.color,
-                        };
-                        Some(crate::doc::Shadow { x: f("x", d.x), y: f("y", d.y), blur: f("blur", d.blur).max(0.0), color })
-                    };
-                }
+                "shadow" => n.shadow = parse_shadow(v, crate::doc::Shadow::default())?,
+                // (What is left out: as a new inner shadow starts in the panel.)
+                "inner_shadow" => n.inner_shadow = parse_shadow(v, crate::doc::Shadow { blur: 8.0, ..Default::default() })?,
                 "blur" => n.blur = if v.is_null() { 0.0 } else { num(k, v)?.clamp(0.0, 500.0) },
+                "background_blur" => n.bg_blur = if v.is_null() { 0.0 } else { num(k, v)?.clamp(0.0, 500.0) },
                 "rotation" => n.rotation = num(k, v)?,
                 "flip_h" | "flip_v" => {
                     let on = flag(k, v)?;
@@ -1804,6 +1815,26 @@ mod tests {
         assert_eq!((c["x"].as_f64(), c["y"].as_f64()), (Some(20.0), Some(30.0)));
         assert_eq!(c["fill"], json!("#ff0000"));
         assert_eq!(describe(&f, (0.0, 0.0), false)["child_count"], json!(1));
+    }
+
+    #[test]
+    fn effects_are_read_and_described() {
+        use crate::doc::Shadow;
+        let mut n = Node::new(1, Kind::Rect, 0.0, 0.0);
+        let v = describe(&n, (0.0, 0.0), true);
+        assert_eq!((&v["inner_shadow"], &v["background_blur"], &v["shadow"]), (&Value::Null, &Value::Null, &Value::Null));
+        n.inner_shadow = parse_shadow(&json!({ "y": 2, "blur": 6, "color": "#00000080" }), Shadow::default()).unwrap();
+        assert_eq!(n.inner_shadow, Some(Shadow { x: 0.0, y: 2.0, blur: 6.0, color: [0, 0, 0, 128] }));
+        n.bg_blur = 12.5;
+        let v = describe(&n, (0.0, 0.0), true);
+        assert_eq!(v["inner_shadow"], json!({ "x": 0.0, "y": 2.0, "blur": 6.0, "color": "#00000080" }));
+        assert_eq!(v["background_blur"], json!(12.5));
+        // What is left out comes from the default; null takes the shadow away; a bad colour is refused.
+        let d = Shadow { x: 1.0, y: 2.0, blur: 3.0, color: [4, 5, 6, 7] };
+        assert_eq!(parse_shadow(&json!({}), d).unwrap(), Some(d));
+        assert_eq!(parse_shadow(&json!({ "blur": -4 }), d).unwrap().map(|s| s.blur), Some(0.0));
+        assert_eq!(parse_shadow(&Value::Null, d).unwrap(), None);
+        assert!(parse_shadow(&json!({ "color": "#12345" }), d).is_err());
     }
 
     #[test]

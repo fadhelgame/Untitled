@@ -12,6 +12,37 @@ use std::path::Path;
 
 type Assets = std::collections::BTreeMap<u64, std::sync::Arc<Asset>>;
 
+/// Background blur in an export.
+///
+/// SVG has no portable way to blur what lies behind an element (neither resvg nor PDF knows a
+/// backdrop filter), so `to_svg` works it out itself: for every node with a background blur, in
+/// paint order, it renders what is painted before that node, blurs it, and embeds the result as
+/// a picture clipped to the shape of the node, under the node's own fill. PNG, JPG, SVG and PDF
+/// all get that same picture; it is a bitmap (`BACKDROP_SCALE` pixels per unit or more) even
+/// where the rest of the file is vector.
+#[derive(Default)]
+struct Stage {
+    /// The finished pictures, as SVG, by the id of their node.
+    images: std::collections::HashMap<u64, String>,
+    /// While what is behind a node is written out: that node, where writing ends...
+    stop: Option<u64>,
+    /// ...whether it has been reached...
+    stopped: bool,
+    /// ...and the area that is wanted (nodes outside of it are left out).
+    cull: Option<(f32, f32, f32, f32)>,
+}
+
+thread_local! {
+    static STAGE: std::cell::RefCell<Stage> = std::cell::RefCell::new(Stage::default());
+}
+
+fn stage<R>(f: impl FnOnce(&mut Stage) -> R) -> R {
+    STAGE.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// Pixels per document unit of an embedded blurred backdrop, at least.
+const BACKDROP_SCALE: f32 = 2.0;
+
 fn paint(attr: &str, c: Option<[u8; 4]>) -> String {
     match c {
         Some([r, g, b, a]) => {
@@ -432,6 +463,21 @@ fn shadow_group<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, 
         out.push_str("</g>");
         return;
     }
+    // A member with a background blur: its blurred backdrop must not darken the shadow, and
+    // what is behind it includes the whole shadow. So the shadow is written from the shapes
+    // alone, then the members over it.
+    let staged = stage(|s| nodes.iter().map(|n| n.as_ref().id).any(|id| s.stop == Some(id) || s.images.contains_key(&id)));
+    if staged {
+        let _ = write!(out, "<g{filter}>");
+        for n in nodes {
+            node_fx(out, n.as_ref(), assets, fonts, ctx, Fx::Shape);
+        }
+        out.push_str("</g>");
+        for n in nodes {
+            node_fx(out, n.as_ref(), assets, fonts, ctx, Fx::NoShadow);
+        }
+        return;
+    }
     // Anggota ditulis sekali lalu dipakai dua kali (lihat `node_fx`): salinan berfilter untuk
     // bayangan, dan aslinya di atasnya.
     let _ = write!(out, r#"<defs><g id="gs{}">"#, first.id);
@@ -455,9 +501,34 @@ fn solid_box(n: &Node, assets: &Assets) -> Option<f32> {
     }
 }
 
+/// How far `n` can paint, with its stroke, glyphs, shadow and layer blur.
+fn reach(n: &Node) -> (f32, f32, f32, f32) {
+    let text = if n.kind == Kind::Text { n.max_size() } else { 0.0 };
+    let pad = n.stroke_w.max(0.0) + n.blur_pad() + text + n.shadow.filter(|s| s.color[3] > 0).map_or(0.0, |s| s.pad());
+    let b = n.aabb();
+    (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad)
+}
+
+fn touches(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+    a.0 <= b.2 && a.2 >= b.0 && a.1 <= b.3 && a.3 >= b.1
+}
+
 fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context, fx: Fx) {
     if !n.visible {
         return;
+    }
+    // Background blur (see `Stage`): the picture of what is behind this node, if it has one, and
+    // whether writing stops here because that picture is being made.
+    let (mut stop, mut glass) = (false, None);
+    if !matches!(fx, Fx::ShadowOnly | Fx::Shape) {
+        let skip = stage(|s| {
+            stop = s.stop == Some(n.id);
+            glass = s.images.get(&n.id).cloned();
+            s.stopped || (!stop && s.cull.is_some_and(|c| !touches(reach(n), c)))
+        });
+        if skip {
+            return;
+        }
     }
     let shadow = n.shadow.filter(|s| s.color[3] > 0 && !matches!(fx, Fx::NoShadow | Fx::Shape));
     if fx == Fx::ShadowOnly && shadow.is_none() {
@@ -472,9 +543,33 @@ fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager,
         let (cx, cy) = n.center();
         let _ = write!(attrs, r#" transform="rotate({} {cx} {cy})""#, n.rotation);
     }
-    if n.blend != 0 && matches!(fx, Fx::Full | Fx::NoShadow) {
+    let blended = n.blend != 0 && matches!(fx, Fx::Full | Fx::NoShadow);
+    if blended {
+        // The blurred backdrop is not part of what is blended: it goes under the group.
+        if let Some(glass) = glass.take() {
+            let _ = write!(out, "<g{attrs}>{glass}</g>");
+        }
         let _ = write!(attrs, r#" style="mix-blend-mode:{}""#, blend::CSS[(n.blend as usize).min(blend::CSS.len() - 1)]);
     }
+    if stop {
+        // Everything behind this node has been written. Its own drop shadow is the last of
+        // that (not when the node is blended: then its backdrop lies under the shadow too).
+        if let Some(s) = shadow.filter(|_| !blended) {
+            let filter = shadow_filter(out, n, &s);
+            let _ = write!(out, "<g{attrs}><g{filter}>");
+            match solid_box(n, assets) {
+                Some(r) => {
+                    let (x0, y0, x1, y1) = n.bounds();
+                    let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{}" height="{}" rx="{r}"/>"#, x1 - x0, y1 - y0);
+                }
+                None => node_inner(out, n, assets, fonts, ctx),
+            }
+            out.push_str("</g></g>");
+        }
+        stage(|s| s.stopped = true);
+        return;
+    }
+    let glass = glass.unwrap_or_default();
     let filter = shadow.map(|s| shadow_filter(out, n, &s));
     if !attrs.is_empty() {
         let _ = write!(out, "<g{attrs}>");
@@ -489,7 +584,10 @@ fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager,
     };
     match (&filter, fx) {
         (None, Fx::Shape) => shape(out, fonts),
-        (None, _) => node_inner(out, n, assets, fonts, ctx),
+        (None, _) => {
+            out.push_str(&glass);
+            node_inner(out, n, assets, fonts, ctx);
+        }
         (Some(filter), Fx::ShadowOnly) => {
             let _ = write!(out, "<g{filter}>");
             shape(out, fonts);
@@ -501,7 +599,7 @@ fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager,
         (Some(filter), _) => {
             let _ = write!(out, r#"<defs><g id="n{}">"#, n.id);
             node_inner(out, n, assets, fonts, ctx);
-            let _ = write!(out, r##"</g></defs><use href="#n{id}"{filter}/><use href="#n{id}"/>"##, id = n.id);
+            let _ = write!(out, r##"</g></defs><use href="#n{id}"{filter}/>{glass}<use href="#n{id}"/>"##, id = n.id);
         }
     }
     if !attrs.is_empty() {
@@ -558,20 +656,27 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
             if flipped {
                 out.push_str("</g>");
             }
+            // The inner shadow of a frame lies on its fill, under what the frame holds.
+            inner_fx(out, n, fonts, ctx, Inner::Plain);
             let _ = write!(out, r#"<clipPath id="c{id}"><rect x="{x0}" y="{y0}" width="{w}" height="{h}"/></clipPath><g clip-path="url(#c{id})">"#, id = n.id);
             list_svg(out, &n.children, assets, fonts, ctx);
             out.push_str("</g>");
-            stroke_rect(out, n, 0.0);
+            // (Not when only what is behind a node inside this frame is being written.)
+            if !stage(|s| s.stopped) {
+                stroke_rect(out, n, 0.0);
+            }
         }
         Kind::Rect => {
             let fill = fill(out, n);
             let _ = write!(out, r#"<rect x="{x0}" y="{y0}" width="{w}" height="{h}" rx="{r}" {fill}/>"#);
+            inner_fx(out, n, fonts, ctx, Inner::Flipped);
             stroke_rect(out, n, r);
         }
         Kind::Ellipse => {
             let fill = fill(out, n);
             let (cx, cy) = (x0 + w * 0.5, y0 + h * 0.5);
             let _ = write!(out, r#"<ellipse cx="{cx}" cy="{cy}" rx="{}" ry="{}" {fill}/>"#, w * 0.5, h * 0.5);
+            inner_fx(out, n, fonts, ctx, Inner::Flipped);
             if n.stroke.is_some() && n.stroke_w > 0.0 {
                 let i = n.stroke_inset();
                 let _ = write!(
@@ -598,28 +703,17 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
             if n.points.is_empty() {
                 return;
             }
-            let at = |x: f32, y: f32| (n.x + x * n.w, n.y + y * n.h);
-            let mut d = String::new();
-            let mut sub = |points: &[crate::doc::PathPoint], closed: bool| {
-                let Some(first) = points.first() else { return };
-                let (sx, sy) = at(first.x, first.y);
-                let _ = write!(d, "M{sx:.2} {sy:.2}");
-                let count = if closed { points.len() } else { points.len() - 1 };
-                for i in 0..count {
-                    let (a, b) = (points[i], points[(i + 1) % points.len()]);
-                    let (c1, c2, p) = (at(a.x + a.hout[0], a.y + a.hout[1]), at(b.x + b.hin[0], b.y + b.hin[1]), at(b.x, b.y));
-                    let _ = write!(d, "C{:.2} {:.2} {:.2} {:.2} {:.2} {:.2}", c1.0, c1.1, c2.0, c2.1, p.0, p.1);
-                }
-                if closed {
-                    d.push('Z');
-                }
-            };
-            // Sudut yang dibulatkan (`radius`) ikut diekspor sebagai kurva.
-            sub(&n.rounded_points(&n.points, n.closed), n.closed);
-            for h in &n.holes {
-                sub(&n.rounded_points(h, true), true);
-            }
+            let d = path_d(n);
             let fill = if n.closed { fill(out, n) } else { r#"fill="none""#.to_owned() };
+            if n.inner().is_some() {
+                // The inner shadow goes between the fill and the stroke: two elements.
+                let _ = write!(out, r#"<path d="{d}" {fill} fill-rule="evenodd"/>"#);
+                inner_fx(out, n, fonts, ctx, Inner::Flipped);
+                if n.stroke.is_some() && n.stroke_w > 0.0 {
+                    let _ = write!(out, r#"<path d="{d}" fill="none" {}/>"#, stroke(n));
+                }
+                return;
+            }
             let _ = write!(
                 out,
                 r#"<path d="{d}" {fill} fill-rule="evenodd" {}/>"#,
@@ -661,10 +755,177 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
                 mime(&asset.bytes),
                 b64::encode(&asset.bytes)
             );
+            inner_fx(out, n, fonts, ctx, Inner::Flipped);
             stroke_rect(out, n, r);
         }
-        Kind::Text => text_svg(out, n, fonts, ctx),
+        Kind::Text => {
+            text_svg(out, n, fonts, ctx);
+            inner_fx(out, n, fonts, ctx, Inner::Flipped);
+        }
     }
+}
+
+/// Path data of a path node, in the document: its contours with the rounded corners (`radius`)
+/// as curves.
+fn path_d(n: &Node) -> String {
+    let at = |x: f32, y: f32| (n.x + x * n.w, n.y + y * n.h);
+    let mut d = String::new();
+    let mut sub = |points: &[crate::doc::PathPoint], closed: bool| {
+        let Some(first) = points.first() else { return };
+        let (sx, sy) = at(first.x, first.y);
+        let _ = write!(d, "M{sx:.2} {sy:.2}");
+        let count = if closed { points.len() } else { points.len() - 1 };
+        for i in 0..count {
+            let (a, b) = (points[i], points[(i + 1) % points.len()]);
+            let (c1, c2, p) = (at(a.x + a.hout[0], a.y + a.hout[1]), at(b.x + b.hin[0], b.y + b.hin[1]), at(b.x, b.y));
+            let _ = write!(d, "C{:.2} {:.2} {:.2} {:.2} {:.2} {:.2}", c1.0, c1.1, c2.0, c2.1, p.0, p.1);
+        }
+        if closed {
+            d.push('Z');
+        }
+    };
+    // Sudut yang dibulatkan (`radius`) ikut diekspor sebagai kurva.
+    sub(&n.rounded_points(&n.points, n.closed), n.closed);
+    for h in &n.holes {
+        sub(&n.rounded_points(h, true), true);
+    }
+    d
+}
+
+/// The shape of `n` as SVG elements without a paint of their own (so: black), where the node
+/// itself is drawn before it is turned or flipped. An inner shadow falls into this shape and a
+/// background blur shows in it. A frame, an image: their box.
+fn silhouette(n: &Node, fonts: &mut FontManager, ctx: &egui::Context) -> Option<String> {
+    let (x0, y0, x1, y1) = n.bounds();
+    let (w, h) = (x1 - x0, y1 - y0);
+    let rect = |r: f32| format!(r#"<rect x="{x0}" y="{y0}" width="{w}" height="{h}" rx="{r}"/>"#);
+    match n.kind {
+        Kind::Frame => Some(rect(0.0)),
+        Kind::Rect | Kind::Image => Some(rect(n.radius.min(w * 0.5).min(h * 0.5).max(0.0))),
+        Kind::Ellipse => Some(format!(r#"<ellipse cx="{}" cy="{}" rx="{}" ry="{}"/>"#, x0 + w * 0.5, y0 + h * 0.5, w * 0.5, h * 0.5)),
+        Kind::Path if n.closed && !n.points.is_empty() => Some(format!(r#"<path d="{}" fill-rule="evenodd" clip-rule="evenodd"/>"#, path_d(n))),
+        Kind::Text => {
+            let mut glyphs = String::new();
+            text_svg(&mut glyphs, n, fonts, ctx);
+            (!glyphs.is_empty()).then_some(glyphs)
+        }
+        Kind::Path | Kind::Line => None,
+    }
+}
+
+/// The area the filter of an inner shadow works in: the box of the node and a little around it
+/// (glyphs reach out of the box of their text).
+pub fn inner_region(n: &Node) -> (f32, f32, f32, f32) {
+    let (x0, y0, x1, y1) = n.bounds();
+    let pad = 2.0 + if n.kind == Kind::Text { n.max_size() } else { 0.0 };
+    (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+}
+
+/// The inner shadow of `n`, to be written right after its fill: the shadow colour wherever the
+/// shape of the node, blurred and moved by the offset, does not cover the shape itself. `mode`:
+/// see `Inner`.
+/// Like a drop shadow, an inner shadow keeps its direction when the node is flipped (and turns
+/// with it when it is rotated).
+fn inner_fx(out: &mut String, n: &Node, fonts: &mut FontManager, ctx: &egui::Context, mode: Inner) {
+    let Some(s) = n.inner() else { return };
+    let Some(shape) = silhouette(n, fonts, ctx) else { return };
+    let (flip_h, flip_v) = n.flips();
+    let flipped = flip_h || flip_v;
+    // The canvas turns and mirrors what it draws, this shadow with it: there the shadow is
+    // made for the node as it is before that, with the offset mirrored beforehand.
+    // In a file the filter works in the space of the document instead: the groups that turn
+    // and flip the node are undone around it and applied to the shape inside it, and the
+    // offset is turned by hand. (A renderer may not turn or mirror the offset of a filter that
+    // is inside a turned or mirrored group; resvg does neither for half a turn or a flip.)
+    let local = !matches!(mode, Inner::Flipped | Inner::Plain);
+    let turned = !local && n.rotation != 0.0;
+    let (dx, dy) = if local {
+        (if flip_h { -s.x } else { s.x }, if flip_v { -s.y } else { s.y })
+    } else {
+        let (sin, cos) = n.rotation.to_radians().sin_cos();
+        (s.x * cos - s.y * sin, s.x * sin + s.y * cos)
+    };
+    let (x0, y0, x1, y1) = if turned {
+        let (a, pad) = (n.aabb(), 2.0 + if n.kind == Kind::Text { n.max_size() } else { 0.0 });
+        (a.0 - pad, a.1 - pad, a.2 + pad, a.3 + pad)
+    } else {
+        inner_region(n)
+    };
+    let clipped = mode != Inner::Canvas;
+    let (cx, cy) = n.center();
+    if mode == Inner::Flipped && flipped {
+        out.push_str("</g>");
+    }
+    if turned {
+        let _ = write!(out, r#"<g transform="rotate({} {cx} {cy})">"#, -n.rotation);
+    }
+    let [r, g, b, a] = s.color;
+    let _ = write!(
+        out,
+        r#"<filter id="is{id}" filterUnits="userSpaceOnUse" x="{x0}" y="{y0}" width="{}" height="{}" color-interpolation-filters="sRGB">"#,
+        x1 - x0,
+        y1 - y0,
+        id = n.id
+    );
+    let source = if s.blur >= 0.01 {
+        let _ = write!(out, r#"<feGaussianBlur in="SourceAlpha" stdDeviation="{}"/>"#, s.blur * 0.5);
+        String::new()
+    } else {
+        r#" in="SourceAlpha""#.to_owned()
+    };
+    let _ = write!(
+        out,
+        r##"<feOffset{source} dx="{dx}" dy="{dy}" result="b"/><feFlood flood-color="#{r:02x}{g:02x}{b:02x}" flood-opacity="{:.3}"/><feComposite in2="b" operator="out"/>"##,
+        a as f32 / 255.0
+    );
+    if clipped {
+        out.push_str(r#"<feComposite in2="SourceAlpha" operator="in"/>"#);
+    }
+    let _ = write!(out, r#"</filter><g filter="url(#is{})">"#, n.id);
+    if turned {
+        let _ = write!(out, r#"<g transform="rotate({} {cx} {cy})">"#, n.rotation);
+    }
+    let mirrored = !local && flip_open(out, n);
+    out.push_str(&shape);
+    for _ in 0..1 + mirrored as usize + 2 * turned as usize {
+        out.push_str("</g>");
+    }
+    if mode == Inner::Flipped && flipped {
+        flip_open(out, n);
+    }
+}
+
+/// Where an inner shadow is written (see `inner_fx`).
+#[derive(Clone, Copy, PartialEq)]
+enum Inner {
+    /// In a file, inside the group that flips the node: that group is closed around the shadow.
+    Flipped,
+    /// In a file, outside of that group (the fill of a frame).
+    Plain,
+    /// For the canvas, the shadow colour also fills everything around the shape: the canvas
+    /// draws the result with the mesh of the shape, so its edge is as sharp as that of the fill.
+    Canvas,
+    /// For the canvas, cut off at the shape (the glyphs of a text).
+    CanvasCut,
+}
+
+/// SVG with nothing but the inner shadow of `n`, for its texture on the canvas: the node as it
+/// is before it is turned and flipped (the canvas does both with its meshes). Result: the SVG,
+/// the area it covers, and whether the shadow is cut off at the shape already (a text; for
+/// other shapes see `inner_fx`).
+pub fn inner_shadow_svg(n: &Node, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32), bool)> {
+    n.inner()?;
+    let region = inner_region(n);
+    let (w, h) = (region.2 - region.0, region.3 - region.1);
+    let clipped = n.kind == Kind::Text;
+    let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{} {} {w} {h}">"#, region.0, region.1);
+    let start = out.len();
+    inner_fx(&mut out, n, fonts, ctx, if clipped { Inner::CanvasCut } else { Inner::Canvas });
+    if out.len() == start {
+        return None;
+    }
+    out.push_str("</svg>");
+    Some((out, region, clipped))
 }
 
 /// SVG untuk satu node (mis. frame terpilih) atau seluruh dokumen. Hasil: (svg, lebar, tinggi).
@@ -691,12 +952,172 @@ pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui:
     let mut out = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{x0} {y0} {w} {h}">"#
     );
+    let mut write = |out: &mut String, fonts: &mut FontManager| match target {
+        Some(n) => run_svg(out, std::slice::from_ref(n), assets, fonts, ctx),
+        None => list_svg(out, &doc.nodes, assets, fonts, ctx),
+    };
+    // Background blurs first (see `Stage`), bottom to top: one that lies over another shows
+    // that one blurred as well.
+    let mut glass = Vec::new();
     match target {
-        Some(n) => run_svg(&mut out, std::slice::from_ref(n), assets, fonts, ctx),
-        None => list_svg(&mut out, &doc.nodes, assets, fonts, ctx),
+        Some(n) => glass_nodes(std::slice::from_ref(n), &mut glass),
+        None => glass_nodes(&doc.nodes, &mut glass),
     }
+    let _reset = StageReset;
+    stage(|s| *s = Stage::default());
+    for g in glass {
+        if let Some(picture) = backdrop_image(g, (x0, y0, x0 + w, y0 + h), &mut write, fonts, ctx) {
+            stage(|s| s.images.insert(g.id, picture));
+        }
+    }
+    write(&mut out, fonts);
     out.push_str("</svg>");
     Some((out, w, h))
+}
+
+/// Leaves no pictures of one export behind for the next.
+struct StageReset;
+
+impl Drop for StageReset {
+    fn drop(&mut self) {
+        stage(|s| *s = Stage::default());
+    }
+}
+
+/// The nodes that show a background blur, in the order they are painted. Not those inside a
+/// layer blur (that is one blurred picture already) and not those that take part in a clipping
+/// mask.
+fn glass_nodes<'a, T: AsRef<Node>>(nodes: &'a [T], found: &mut Vec<&'a Node>) {
+    let mut i = 0;
+    while i < nodes.len() {
+        let (j, k) = crate::doc::clip_run(nodes, i);
+        if k == j {
+            for n in nodes[i..j].iter().map(|n| n.as_ref()).filter(|n| n.visible && n.blur <= 0.0) {
+                if n.backdrop() > 0.0 {
+                    found.push(n);
+                }
+                glass_nodes(&n.children, found);
+            }
+        }
+        i = k;
+    }
+}
+
+/// Weights of a gaussian with standard deviation `sigma` (in pixels) out to three deviations
+/// on each side; they add up to 1.
+pub fn gaussian_kernel(sigma: f32) -> Vec<f32> {
+    let radius = (sigma.max(0.0) * 3.0).ceil() as i32;
+    if radius == 0 {
+        return vec![1.0];
+    }
+    let weights: Vec<f32> = (-radius..=radius).map(|i| (-0.5 * (i as f32 / sigma).powi(2)).exp()).collect();
+    let total: f32 = weights.iter().sum();
+    weights.into_iter().map(|w| w / total).collect()
+}
+
+/// Blur RGBA pixels (premultiplied) in place. Past its edges the picture is taken to go on
+/// with the pixels of the edge, so the blur does not fade out there.
+pub fn gaussian_blur(data: &mut [u8], w: usize, h: usize, sigma: f32) {
+    let kernel = gaussian_kernel(sigma);
+    let radius = kernel.len() / 2;
+    if radius == 0 || w == 0 || h == 0 || data.len() != w * h * 4 {
+        return;
+    }
+    // Along x into `mid`, then along y back into `data`.
+    let mut mid = vec![0.0_f32; data.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = [0.0_f32; 4];
+            for (i, k) in kernel.iter().enumerate() {
+                let at = (y * w + (x + i).saturating_sub(radius).min(w - 1)) * 4;
+                for c in 0..4 {
+                    sum[c] += data[at + c] as f32 * k;
+                }
+            }
+            mid[(y * w + x) * 4..][..4].copy_from_slice(&sum);
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = [0.0_f32; 4];
+            for (i, k) in kernel.iter().enumerate() {
+                let at = ((y + i).saturating_sub(radius).min(h - 1) * w + x) * 4;
+                for c in 0..4 {
+                    sum[c] += mid[at + c] * k;
+                }
+            }
+            for c in 0..4 {
+                data[(y * w + x) * 4 + c] = sum[c].round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// The blurred backdrop of `n` as SVG: a picture of what `write` paints before `n`, blurred,
+/// clipped to the shape of `n`. To be written inside the group that turns the node, right under
+/// its fill. `bounds`: the area being exported; nothing outside of it is seen, and the blur
+/// treats its edge as the edge of the picture. `None`: there is nothing behind the node.
+fn backdrop_image(
+    n: &Node,
+    bounds: (f32, f32, f32, f32),
+    write: &mut dyn FnMut(&mut String, &mut FontManager),
+    fonts: &mut FontManager,
+    ctx: &egui::Context,
+) -> Option<String> {
+    use resvg::tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
+    let blur = n.backdrop();
+    let shape = silhouette(n, fonts, ctx)?;
+    let cut = |b: (f32, f32, f32, f32)| (b.0.max(bounds.0), b.1.max(bounds.1), b.2.min(bounds.2), b.3.min(bounds.3));
+    let a = n.aabb();
+    // Where the node shows, and how far around it the blur reaches (three deviations).
+    let shown = cut((a.0 - 1.0, a.1 - 1.0, a.2 + 1.0, a.3 + 1.0));
+    let pad = blur * 1.5;
+    let (x0, y0, x1, y1) = cut((shown.0 - pad, shown.1 - pad, shown.2 + pad, shown.3 + pad));
+    let (w, h) = (x1 - x0, y1 - y0);
+    if !(shown.2 > shown.0 && shown.3 > shown.1) {
+        return None;
+    }
+    // Blurred at a size where the deviation is 4 pixels (plenty to carry a gaussian, and quick
+    // however large the radius), then enlarged smoothly to the size it is embedded at.
+    let scale = (8.0 / blur).min(4.0).min(4096.0 / w.max(h));
+    let (pw, ph) = ((w * scale).ceil().max(1.0) as u32, (h * scale).ceil().max(1.0) as u32);
+    let mut svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{x0} {y0} {w} {h}">"#);
+    stage(|s| (s.stop, s.stopped, s.cull) = (Some(n.id), false, Some((x0, y0, x1, y1))));
+    write(&mut svg, fonts);
+    stage(|s| (s.stop, s.stopped, s.cull) = (None, false, None));
+    svg.push_str("</svg>");
+    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).ok()?;
+    let mut small = Pixmap::new(pw, ph)?;
+    resvg::render(&tree, Transform::from_scale(scale, scale), &mut small.as_mut());
+    if small.data().chunks_exact(4).all(|p| p[3] == 0) {
+        return None;
+    }
+    gaussian_blur(small.data_mut(), pw as usize, ph as usize, blur * 0.5 * scale);
+    let grow = (BACKDROP_SCALE / scale).min(4096.0 / pw.max(ph) as f32);
+    let picture = if grow > 1.01 {
+        let (bw, bh) = ((pw as f32 * grow).round().max(1.0) as u32, (ph as f32 * grow).round().max(1.0) as u32);
+        let mut big = Pixmap::new(bw, bh)?;
+        let paint = PixmapPaint { quality: FilterQuality::Bicubic, ..Default::default() };
+        big.draw_pixmap(0, 0, small.as_ref(), &paint, Transform::from_scale(bw as f32 / pw as f32, bh as f32 / ph as f32), None);
+        big
+    } else {
+        small
+    };
+    let png = picture.encode_png().ok()?;
+    // (The picture covers whole pixels: a little more than the area that was asked for.)
+    let (iw, ih) = (pw as f32 / scale, ph as f32 / scale);
+    let back = if n.rotation != 0.0 {
+        // The picture is in the document; the group it is written in turns with the node.
+        let (cx, cy) = n.center();
+        format!(r#" transform="rotate({} {cx} {cy})""#, -n.rotation)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        r##"<clipPath id="bc{id}">{shape}</clipPath><g clip-path="url(#bc{id})"><image x="{x0}" y="{y0}" width="{iw}" height="{ih}" preserveAspectRatio="none"{back} href="data:image/png;base64,{}"/></g>"##,
+        b64::encode(&png),
+        id = n.id
+    ))
 }
 
 /// Render SVG ke PNG atau JPG pada skala tertentu (1x, 2x, 0.5x, …).
@@ -1218,5 +1639,186 @@ mod tests {
         assert!(left[0] > 200 && left[2] < 60, "left should be red, got {left:?}");
         assert!(right[2] > 200 && right[0] < 60, "right should be blue, got {right:?}");
         let _ = std::fs::remove_file(path);
+    }
+    /// A white frame of 100 x 100 with a gray square (20..80) in it, set up by `edit`, exported.
+    fn square_export(edit: &dyn Fn(&mut Node)) -> (String, image::RgbaImage) {
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        let mut doc = Doc::default();
+        let mut frame = Node::new(doc.alloc_id(), Kind::Frame, 0.0, 0.0);
+        (frame.w, frame.h, frame.fill) = (100.0, 100.0, Some([255, 255, 255, 255]));
+        let mut r = Node::new(doc.alloc_id(), Kind::Rect, 20.0, 20.0);
+        (r.w, r.h, r.fill) = (60.0, 60.0, Some([200, 200, 200, 255]));
+        r.inner_shadow = Some(Shadow { x: 0.0, y: 10.0, blur: 0.0, color: [255, 0, 0, 255] });
+        edit(&mut r);
+        frame.children.push(r);
+        let id = frame.id;
+        doc.insert(frame, None);
+        let (svg, w, h) = to_svg(&doc, Some(id), &mut fonts, &ctx).unwrap();
+        let (png, ..) = render_png(&svg, w, h, 1.0).unwrap();
+        (svg, image::load_from_memory(&png).unwrap().to_rgba8())
+    }
+
+    #[test]
+    fn inner_shadow_falls_inside_the_shape() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const GRAY: [u8; 4] = [200, 200, 200, 255];
+        const WHITE: [u8; 4] = [255, 255, 255, 255];
+        // A sharp shadow moved down by 10: a band of 10 inside the top edge, nothing outside.
+        let (svg, img) = square_export(&|_| {});
+        let at = |img: &image::RgbaImage, x: u32, y: u32| img.get_pixel(x, y).0;
+        assert_eq!(svg.matches(r#"<filter id="is"#).count(), 1);
+        assert_eq!([at(&img, 50, 25), at(&img, 50, 35), at(&img, 50, 75), at(&img, 50, 15), at(&img, 50, 85)], [RED, GRAY, GRAY, WHITE, WHITE]);
+        assert_eq!([at(&img, 22, 50), at(&img, 78, 50)], [GRAY, GRAY]);
+        // Flipped, it keeps its direction; turned upside down, it turns with the shape.
+        let (_, img) = square_export(&|r| r.flip_v = true);
+        assert_eq!([at(&img, 50, 25), at(&img, 50, 75)], [RED, GRAY]);
+        let (_, img) = square_export(&|r| r.rotation = 180.0);
+        assert_eq!([at(&img, 50, 25), at(&img, 50, 75)], [GRAY, RED]);
+        // Blurred: strongest at the edge, gone further in. With the drop shadow beside it.
+        let (svg, img) = square_export(&|r| {
+            r.inner_shadow = Some(Shadow { x: 0.0, y: 0.0, blur: 12.0, color: [255, 0, 0, 255] });
+            r.shadow = Some(Shadow { x: 0.0, y: 0.0, blur: 8.0, color: [0, 0, 255, 255] });
+        });
+        let (edge, inside, middle, outside) = (at(&img, 50, 21), at(&img, 50, 27), at(&img, 50, 50), at(&img, 50, 17));
+        assert!(edge[1] < 150 && edge[0] > 215, "red near the edge, got {edge:?}");
+        assert!(inside[1] > edge[1] + 20 && inside[1] < 200, "fading inwards, got {inside:?} after {edge:?}");
+        assert_eq!(middle, GRAY);
+        assert!(outside[2] == 255 && outside[0] < 235, "the drop shadow outside is blue, got {outside:?}");
+        assert!(svg.contains(r#"<filter id="is"#) && svg.contains(r#"<filter id="sh"#));
+        // Under the stroke; a transparent shadow, a line and an open path have none.
+        let (_, img) = square_export(&|r| (r.stroke, r.stroke_w) = (Some([0, 0, 0, 255]), 4.0));
+        assert_eq!([at(&img, 50, 22), at(&img, 50, 27)], [[0, 0, 0, 255], RED]);
+        let (svg, _) = square_export(&|r| r.inner_shadow = Some(Shadow { x: 0.0, y: 4.0, blur: 4.0, color: [0, 0, 0, 0] }));
+        assert!(!svg.contains("<filter"));
+        let (svg, _) = square_export(&|r| (r.kind, r.stroke, r.stroke_w) = (Kind::Line, Some([0, 0, 0, 255]), 2.0));
+        assert!(!svg.contains("<filter"));
+
+        // A ring (a path with a hole): the shadow follows both edges; fill, shadow and stroke
+        // are three elements in that order.
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        let mut ring = Node::new(7, Kind::Path, 0.0, 0.0);
+        let p = |x, y| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2], r: None };
+        (ring.w, ring.h, ring.closed, ring.fill, ring.stroke, ring.stroke_w) = (100.0, 100.0, true, Some([200, 200, 200, 255]), Some([0, 0, 0, 255]), 1.0);
+        ring.points = vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)];
+        ring.holes = vec![vec![p(0.4, 0.4), p(0.6, 0.4), p(0.6, 0.6), p(0.4, 0.6)]];
+        ring.inner_shadow = Some(Shadow { x: 0.0, y: 10.0, blur: 0.0, color: [255, 0, 0, 255] });
+        let mut out = String::new();
+        node_body(&mut out, &ring, &Default::default(), &mut fonts, &ctx);
+        let (fill_at, shadow_at, stroke_at) = (out.find("fill=\"#c8c8c8\"").unwrap(), out.find("<filter").unwrap(), out.find("stroke-width").unwrap());
+        assert!(fill_at < shadow_at && shadow_at < stroke_at, "{out}");
+        let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">{out}</svg>"#);
+        let (png, ..) = render_png(&svg, 100.0, 100.0, 1.0).unwrap();
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        // Below the top edge and below the hole: shadow. In the hole: nothing at all.
+        assert_eq!([at(&img, 50, 5), at(&img, 50, 65), at(&img, 50, 30), at(&img, 50, 50)], [RED, RED, GRAY, [0, 0, 0, 0]]);
+
+        // The texture of the canvas: the shadow alone, for shapes not cut off at the shape
+        // (the mesh of the shape does that), for text cut off at the glyphs.
+        let (only, region, clipped) = inner_shadow_svg(&ring, &mut fonts, &ctx).unwrap();
+        assert!(!clipped && region == (-2.0, -2.0, 102.0, 102.0) && !only.contains("#c8c8c8") && !only.contains(r#"operator="in""#), "{only}");
+        let mut text = Node::new(8, Kind::Text, 0.0, 0.0);
+        (text.text, text.fill, text.inner_shadow) = ("Kanvas".into(), Some([0, 0, 0, 255]), ring.inner_shadow);
+        let (only, _, clipped) = inner_shadow_svg(&text, &mut fonts, &ctx).unwrap();
+        assert!(clipped && only.contains(r#"operator="in""#));
+        text.inner_shadow = None;
+        assert!(inner_shadow_svg(&text, &mut fonts, &ctx).is_none());
+    }
+
+    #[test]
+    fn background_blur_shows_what_is_behind_blurred_in_the_shape() {
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        // A white frame of 200 x 100 whose left half is black; over the middle a glass panel
+        // without a fill (50..150 x 20..80), background blur 20.
+        let mut doc = Doc::default();
+        let mut frame = Node::new(doc.alloc_id(), Kind::Frame, 0.0, 0.0);
+        (frame.w, frame.h, frame.fill) = (200.0, 100.0, Some([255, 255, 255, 255]));
+        let mut black = Node::new(doc.alloc_id(), Kind::Rect, 0.0, 0.0);
+        (black.w, black.h, black.fill) = (100.0, 100.0, Some([0, 0, 0, 255]));
+        let mut glass = Node::new(doc.alloc_id(), Kind::Rect, 50.0, 20.0);
+        (glass.w, glass.h, glass.bg_blur) = (100.0, 60.0, 20.0);
+        let (frame_id, glass_id) = (frame.id, glass.id);
+        frame.children.extend([black, glass]);
+        doc.insert(frame, None);
+        let render = |doc: &Doc, only: u64, fonts: &mut FontManager| {
+            let (svg, w, h) = to_svg(doc, Some(only), fonts, &ctx).unwrap();
+            let (png, ..) = render_png(&svg, w, h, 1.0).unwrap();
+            (svg, image::load_from_memory(&png).unwrap().to_rgba8())
+        };
+        let (svg, img) = render(&doc, frame_id, &mut fonts);
+        assert_eq!(svg.matches("<image").count(), 1);
+        let gray = |img: &image::RgbaImage, x: u32, y: u32| img.get_pixel(x, y)[0];
+        // Inside the panel the edge between black and white is a soft ramp...
+        assert!((100..156).contains(&gray(&img, 100, 50)), "half way at the edge, got {}", gray(&img, 100, 50));
+        assert!((15..70).contains(&gray(&img, 90, 50)) && (185..240).contains(&gray(&img, 110, 50)), "a ramp, got {} and {}", gray(&img, 90, 50), gray(&img, 110, 50));
+        assert!(gray(&img, 55, 50) < 3 && gray(&img, 145, 50) > 252, "far from the edge it is as before");
+        // ...and outside of it nothing changed.
+        assert_eq!([gray(&img, 98, 10), gray(&img, 102, 10), gray(&img, 98, 90), gray(&img, 102, 90)], [0, 255, 0, 255]);
+        assert!(img.pixels().all(|p| p[3] == 255));
+        // The node's own fill lies over the blur; fully opaque, it hides it.
+        doc.find_mut(glass_id).unwrap().fill = Some([255, 0, 0, 128]);
+        let (_, img) = render(&doc, frame_id, &mut fonts);
+        let (l, r) = (img.get_pixel(55, 50).0, img.get_pixel(145, 50).0);
+        assert!((126..130).contains(&l[0]) && l[1] < 3 && (126..130).contains(&r[1]) && r[0] == 255, "red glass over black and white, got {l:?} {r:?}");
+        // At the edge of what is exported the blur does not fade out: the panel moved to the
+        // left edge shows plain black there.
+        doc.find_mut(glass_id).unwrap().fill = None;
+        doc.find_mut(glass_id).unwrap().x = 0.0;
+        let (_, img) = render(&doc, frame_id, &mut fonts);
+        assert_eq!(img.get_pixel(0, 50).0, [0, 0, 0, 255]);
+        // A second panel on top sees the first one's blur; turned, its picture stays in place.
+        let mut second = doc.find(glass_id).unwrap().clone();
+        (second.id, second.x, second.rotation) = (doc.alloc_id(), 60.0, 90.0);
+        doc.insert(second, Some(frame_id));
+        let (svg, img) = render(&doc, frame_id, &mut fonts);
+        assert_eq!(svg.matches("<image").count(), 2);
+        // (The first panel, which ends at that edge, had made its dark side lighter there.)
+        assert!((135..200).contains(&gray(&img, 100, 50)), "blurred twice at the edge, got {}", gray(&img, 100, 50));
+        // Turned, the second panel stands upright (80..140 x 0..100): the ramp reaches the top
+        // of the frame, still running from left to right, and ends at the panel's sides.
+        let (l, r) = (gray(&img, 90, 3), gray(&img, 110, 3));
+        assert!(l > 10 && l + 60 < r && r < 245, "a ramp from left to right, got {l} and {r}");
+        assert_eq!([gray(&img, 70, 3), gray(&img, 150, 3)], [0, 255]);
+        // Alone, with nothing behind it, a panel has nothing to blur. Neither has one that is
+        // layer-blurred itself, nor a text.
+        let (svg, _) = render(&doc, glass_id, &mut fonts);
+        assert!(!svg.contains("<image"));
+        let mut n = doc.find(glass_id).unwrap().clone();
+        assert_eq!(n.backdrop(), 20.0);
+        n.blur = 4.0;
+        assert_eq!(n.backdrop(), 0.0);
+        (n.blur, n.kind) = (0.0, Kind::Text);
+        assert_eq!(n.backdrop(), 0.0);
+        // Nothing of one export is left behind for the next.
+        assert!(stage(|s| s.images.is_empty() && s.stop.is_none() && s.cull.is_none()));
+    }
+
+    #[test]
+    fn gaussian_blur_keeps_what_is_even_and_spreads_an_edge() {
+        let k = gaussian_kernel(2.0);
+        assert_eq!(k.len(), 13);
+        assert!((k.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!(k.iter().zip(k.iter().rev()).all(|(a, b)| a == b) && k[6] > k[5] && k[5] > k[0]);
+        // The middle weight of a gaussian: 1 / (sigma * sqrt(2 pi)), a little more for the cut-off tails.
+        assert!((k[6] - 0.1995).abs() < 0.002, "{}", k[6]);
+        assert_eq!(gaussian_kernel(0.0), vec![1.0]);
+        // One colour everywhere stays that colour, up to the edges.
+        let (w, h) = (16, 9);
+        let mut even = [40u8, 80, 120, 200].repeat(w * h);
+        gaussian_blur(&mut even, w, h, 3.0);
+        assert!(even.chunks_exact(4).all(|p| p == [40, 80, 120, 200]));
+        // A step from 0 to 255 at x = 8: half way at the step, the ends untouched, the same on every row.
+        let mut step: Vec<u8> = (0..w * h).flat_map(|i| [if i % w < 8 { 0 } else { 255 }; 4]).collect();
+        gaussian_blur(&mut step, w, h, 1.5);
+        let at = |x: usize, y: usize| step[(y * w + x) * 4];
+        assert!((at(7, 4) as i32 + at(8, 4) as i32 - 255).abs() <= 1 && at(7, 4) > 60 && at(7, 4) < 127, "{} {}", at(7, 4), at(8, 4));
+        assert_eq!((at(0, 4), at(15, 4)), (0, 255));
+        assert!((0..h).all(|y| at(7, y) == at(7, 0)));
+        // Sizes that do not fit are left alone.
+        let mut odd = vec![1u8; 10];
+        gaussian_blur(&mut odd, 2, 2, 3.0);
+        assert_eq!(odd, vec![1u8; 10]);
     }
 }

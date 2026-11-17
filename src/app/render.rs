@@ -1,6 +1,7 @@
 //! Menggambar node ke canvas: bentuk, gradasi, gambar, path, teks bergaya, rotasi, dan blend mode.
 
 use super::blend;
+use super::glass;
 use super::picker::Picker;
 use super::vtext;
 use super::{col, View};
@@ -137,6 +138,31 @@ struct BlurTex {
 
 type BlurDone = (Vec<Node>, usize, f32, (f32, f32, f32, f32), Result<ColorImage, String>);
 
+/// Texture of the inner shadow of one node; the key is its id. `probe`: what the shadow was made
+/// from (see `inner_probe`), `extra`: what else it depends on (a text on a path: its layout),
+/// `scale`: pixels per document unit, `region`: the document area it covers, `clipped`: cut
+/// off at the shape already (text; otherwise the mesh of the shape does that).
+struct InnerTex {
+    probe: Node,
+    extra: u64,
+    scale: f32,
+    region: (f32, f32, f32, f32),
+    clipped: bool,
+    fonts: usize,
+    tex: TextureHandle,
+    frame: u64,
+}
+
+struct InnerDone {
+    probe: Node,
+    extra: u64,
+    scale: f32,
+    region: (f32, f32, f32, f32),
+    clipped: bool,
+    fonts: usize,
+    image: Result<ColorImage, String>,
+}
+
 struct DetailReq {
     node: u64,
     key: TexKey,
@@ -244,6 +270,12 @@ pub struct Ext {
     blur_failed: HashSet<u64>,
     bl_tx: mpsc::Sender<BlurDone>,
     bl_rx: mpsc::Receiver<BlurDone>,
+    /// Inner shadow textures per node, those being rendered, and those that failed.
+    inners: HashMap<u64, InnerTex>,
+    inner_busy: HashSet<u64>,
+    inner_failed: HashSet<u64>,
+    in_tx: mpsc::Sender<InnerDone>,
+    in_rx: mpsc::Receiver<InnerDone>,
     pub export_scale: f32,
     pub export_fmt: usize,
     pub v_plain: bool,
@@ -265,8 +297,14 @@ impl Default for Ext {
         let (img_tx, img_rx) = mpsc::channel();
         let (det_tx, det_rx) = mpsc::channel();
         let (sh_tx, sh_rx) = mpsc::channel();
+        let (in_tx, in_rx) = mpsc::channel();
         let (bl_tx, bl_rx) = mpsc::channel();
         Ext {
+            inners: HashMap::new(),
+            inner_busy: HashSet::new(),
+            inner_failed: HashSet::new(),
+            in_tx,
+            in_rx,
             blurs: HashMap::new(),
             blur_busy: HashSet::new(),
             blur_failed: HashSet::new(),
@@ -341,7 +379,7 @@ impl Ext {
 
     /// Images, shadows and blurs still being prepared on other threads.
     pub fn busy(&self) -> usize {
-        self.decoding.len() + self.detail_busy.len() + self.shadow_busy.len() + self.blur_busy.len()
+        self.decoding.len() + self.detail_busy.len() + self.shadow_busy.len() + self.blur_busy.len() + self.inner_busy.len()
     }
 
     /// Mesh vector untuk teks yang di layar lebih besar dari batas atlas glyph (`px` = tinggi
@@ -431,6 +469,22 @@ impl Ext {
                 }
             }
         }
+        while let Ok(done) = self.in_rx.try_recv() {
+            let key = done.probe.id;
+            self.inner_busy.remove(&key);
+            match done.image {
+                Ok(image) => {
+                    let tex = ctx.load_texture(format!("inner-shadow-{key}"), image, egui::TextureOptions::LINEAR);
+                    let InnerDone { probe, extra, scale, region, clipped, fonts, .. } = done;
+                    if let Some(old) = self.inners.insert(key, InnerTex { probe, extra, scale, region, clipped, fonts, tex, frame: self.frame }) {
+                        self.retired.push((old.tex, self.frame));
+                    }
+                }
+                Err(_) => {
+                    self.inner_failed.insert(key);
+                }
+            }
+        }
         if self.busy() != waiting || arrived {
             self.epoch += 1;
         }
@@ -443,6 +497,7 @@ impl Ext {
         self.blurs.retain(|_, b| b.frame + 300 > frame);
         self.details.retain(|_, d| d.frame + 300 > frame);
         self.shadows.retain(|_, s| s.frame + 300 > frame);
+        self.inners.retain(|_, s| s.frame + 300 > frame);
         if self.tex.len() > 6 {
             self.tex.retain(|_, e| e.1 + 1200 > frame);
             let tex = &self.tex;
@@ -568,6 +623,8 @@ pub struct PaintCx<'a> {
     pub assets: &'a BTreeMap<u64, Arc<Asset>>,
     pub view: View,
     pub o: Pos2,
+    /// The part of the screen that shows the document.
+    pub canvas: Rect,
     /// Area dunia yang terlihat; node di luar ini dilewati (culling).
     pub vis: (f32, f32, f32, f32),
     pub editing: Option<u64>,
@@ -1888,6 +1945,123 @@ fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[
     true
 }
 
+// ---------------------------------------------------------------- inner shadow
+
+/// Resolution of an inner shadow texture. One that the mesh of the shape cuts out only has to
+/// carry the blurred edge of the shadow; one that is cut off at the glyphs of a text in the
+/// texture itself has to be as fine as the screen.
+fn inner_scale(blur: f32, screen: f32, side: f32, clipped: bool) -> f32 {
+    let fine = if clipped { screen.min(4096.0 / side.max(1.0)) } else { screen.min(8.0 / blur.max(0.5)).min(2048.0 / side.max(1.0)) };
+    fine.max(1e-3)
+}
+
+/// What the inner shadow of `n` is made from, as a node of its own: its shape (not where it
+/// is, what it holds or how it is painted) and the shadow.
+fn inner_probe(n: &Node) -> Node {
+    let mut p = Node::new(n.id, n.kind, n.x, n.y);
+    (p.w, p.h, p.radius, p.inner_shadow, p.flip_h, p.flip_v) = (n.w, n.h, n.radius, n.inner_shadow, n.flip_h, n.flip_v);
+    match n.kind {
+        Kind::Path => (p.closed, p.points, p.holes) = (n.closed, n.points.clone(), n.holes.clone()),
+        Kind::Text => {
+            (p.text, p.spans, p.font, p.weight, p.italic) = (n.text.clone(), n.spans.clone(), n.font.clone(), n.weight, n.italic);
+            (p.font_size, p.line_height, p.letter_spacing, p.align, p.wrap) = (n.font_size, n.line_height, n.letter_spacing, n.align, n.wrap);
+            (p.underline, p.strike, p.list, p.valign, p.fixed_h) = (n.underline, n.strike, n.list, n.valign, n.fixed_h);
+            (p.on_path, p.path_offset, p.path_side, p.fill) = (n.on_path, n.path_offset, n.path_side, n.fill);
+        }
+        _ => {}
+    }
+    p
+}
+
+/// Is `p` (see `inner_probe`) still what the inner shadow of `n` would be made from? A node
+/// that only moved keeps its shadow (the texture moves along), but for a text on a path.
+fn inner_same(p: &Node, n: &Node) -> bool {
+    (p.kind, p.w, p.h, p.radius, p.inner_shadow, p.flip_h, p.flip_v) == (n.kind, n.w, n.h, n.radius, n.inner_shadow, n.flip_h, n.flip_v)
+        && match n.kind {
+            Kind::Path => p.closed == n.closed && p.points == n.points && p.holes == n.holes,
+            Kind::Text => {
+                (&p.text, &p.spans, &p.font, p.weight, p.italic) == (&n.text, &n.spans, &n.font, n.weight, n.italic)
+                    && (p.font_size, p.line_height, p.letter_spacing, p.align, p.wrap) == (n.font_size, n.line_height, n.letter_spacing, n.align, n.wrap)
+                    && (p.underline, p.strike, p.list, p.valign, p.fixed_h) == (n.underline, n.strike, n.list, n.valign, n.fixed_h)
+                    && (p.on_path, p.path_offset, p.path_side, p.fill) == (n.on_path, n.path_offset, n.path_side, n.fill)
+                    && (n.on_path.is_none() || (p.x, p.y) == (n.x, n.y))
+            }
+            _ => true,
+        }
+}
+
+/// The inner shadow of `n` as a texture: (texture, the screen rectangle it covers, whether it
+/// is cut off at the shape already). It is drawn over the fill of the node with the node's
+/// other shapes, so it is turned, flipped, blended and clipped with them.
+///
+/// Like a drop shadow it is rendered on another thread from the SVG of the export; until a
+/// new version is ready the old one stays in use.
+fn inner_layer(pc: &mut PaintCx, n: &Node) -> Option<(TextureId, Rect, bool)> {
+    let shadow = n.inner()?;
+    let frame = pc.ext.frame;
+    let screen = pc.view.zoom * pc.ctx.pixels_per_point();
+    let text = n.kind == Kind::Text;
+    let fonts = if text { pc.fonts.usable_count() } else { 0 };
+    // A text on a path changes with its path too (`path_laid` has just laid it out).
+    let extra = if text && n.on_path.is_some() { pc.ext.path_texts.get(&n.id).map_or(0, |t| t.key) } else { 0 };
+    let moving = pc.moving;
+    let fresh = pc.ext.inners.get_mut(&n.id).is_some_and(|c| {
+        c.frame = frame;
+        let want = inner_scale(shadow.blur, screen, (c.region.2 - c.region.0).max(c.region.3 - c.region.1), c.clipped);
+        // While the zoom is changing a text keeps the texture it has; it is made again at rest.
+        let fits = if c.clipped && !moving { c.scale >= want * 0.8 && c.scale <= want * 1.6 } else { c.scale >= want * 0.66 && c.scale <= want * 4.0 };
+        inner_same(&c.probe, n) && c.extra == extra && c.fonts == fonts && (fits || (c.clipped && moving))
+    });
+    if !fresh && !pc.ext.inner_busy.contains(&n.id) && !pc.ext.inner_failed.contains(&n.id) {
+        if let Some((svg, region, clipped)) = crate::export::inner_shadow_svg(n, pc.fonts, pc.ctx) {
+            let scale = inner_scale(shadow.blur, screen, (region.2 - region.0).max(region.3 - region.1), clipped);
+            pc.ext.inner_busy.insert(n.id);
+            let probe = inner_probe(n);
+            let (tx, ctx) = (pc.ext.in_tx.clone(), pc.ctx.clone());
+            std::thread::spawn(move || {
+                let image = render_shadow(&svg, region, scale);
+                let _ = tx.send(InnerDone { probe, extra, scale, region, clipped, fonts, image });
+                ctx.request_repaint();
+            });
+        }
+    }
+    let c = pc.ext.inners.get(&n.id)?;
+    let (dx, dy) = (n.x - c.probe.x, n.y - c.probe.y);
+    let r = Rect::from_min_max(pc.view.to_screen(pc.o, c.region.0 + dx, c.region.1 + dy), pc.view.to_screen(pc.o, c.region.2 + dx, c.region.3 + dy));
+    Some((c.tex.id(), r, c.clipped))
+}
+
+/// The inner shadow of a text: its texture over the glyphs.
+fn text_inner(pc: &mut PaintCx, sink: &mut Sink, n: &Node, alpha: f32) {
+    if let Some((tex, area, _)) = inner_layer(pc, n) {
+        sink.add(egui::epaint::RectShape::filled(area, CornerRadius::ZERO, Color32::WHITE.gamma_multiply(alpha)).with_texture(tex, UV_FULL));
+    }
+}
+
+/// Where `r` lies in `area`, as texture coordinates of a texture that covers `area`.
+fn uv_in(r: Rect, area: Rect) -> Rect {
+    let at = |p: Pos2| pos2((p.x - area.left()) / area.width().max(1e-3), (p.y - area.top()) / area.height().max(1e-3));
+    Rect::from_min_max(at(r.min), at(r.max))
+}
+
+/// The background blur of `n`, to be painted before anything else of the node: what is on
+/// screen by then shows blurred inside `shape` (the node's outline, filled with any opaque
+/// colour, as it is before the node is turned). Not for a node that is part of a clipping mask.
+fn backdrop_layer(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, shape: Shape, pivot: Pos2) {
+    if pc.capture.is_some() {
+        return;
+    }
+    let mut meshes = tessellate(pc.ctx, vec![shape]);
+    if n.rotation != 0.0 {
+        let rot = egui::emath::Rot2::from_angle(n.rotation.to_radians());
+        for m in &mut meshes {
+            m.rotate(rot, pivot);
+        }
+    }
+    // (Half the radius is the deviation of the gaussian, as for the other blurs.)
+    add_special(pc, painter, Special::Backdrop(meshes, n.backdrop() * 0.5 * pc.view.zoom));
+}
+
 // ---------------------------------------------------------------- frame cache
 
 /// A top-level frame with everything in it, as finished meshes.
@@ -1920,18 +2094,25 @@ enum Kept {
     Special(Special),
 }
 
-/// Something the GPU draws directly instead of egui: a blend mode, or a clipping mask.
+/// Something the GPU draws directly instead of egui: a blend mode, a clipping mask, or a
+/// background blur.
 #[derive(Clone)]
 pub enum Special {
     /// Meshes and their blend mode (1..=6).
     Blend(Vec<egui::Mesh>, u8),
     /// The mask and what shows through it.
     Masked(Vec<egui::Mesh>, Vec<egui::Mesh>),
+    /// Background blur: the shape of the node (the alpha of its vertices is how strongly the
+    /// blur shows) and the deviation of the gaussian in points. See `glass.rs`.
+    Backdrop(Vec<egui::Mesh>, f32),
 }
 
 impl Special {
-    fn shape(self, gl: blend::Shared, clip: Rect) -> Shape {
+    /// `clip`: the clip rectangle it is drawn in; `canvas`: the part of the screen that shows
+    /// the document.
+    fn shape(self, gl: blend::Shared, clip: Rect, canvas: Rect) -> Shape {
         match self {
+            Special::Backdrop(meshes, sigma) => glass::callback(gl, clip, canvas, meshes, sigma),
             Special::Blend(meshes, mode) => blend::callback(gl, clip, meshes, mode),
             Special::Masked(mask, content) => blend::masked(gl, clip, mask, content),
         }
@@ -1939,10 +2120,17 @@ impl Special {
 
     fn meshes_mut(&mut self) -> impl Iterator<Item = &mut egui::Mesh> {
         let (a, b) = match self {
-            Special::Blend(meshes, _) => (meshes, None),
+            Special::Blend(meshes, _) | Special::Backdrop(meshes, _) => (meshes, None),
             Special::Masked(mask, content) => (mask, Some(content)),
         };
         a.iter_mut().chain(b.into_iter().flatten())
+    }
+
+    /// After its meshes were scaled by `k` (a kept frame while the zoom changes).
+    fn scaled(&mut self, k: f32) {
+        if let Special::Backdrop(_, sigma) = self {
+            *sigma *= k;
+        }
     }
 }
 
@@ -1954,7 +2142,7 @@ const SPECIAL_MARK: u64 = u64::MAX - (1 << 20);
 fn add_special(pc: &mut PaintCx, painter: &egui::Painter, special: Special) {
     let clip = painter.clip_rect();
     if !pc.recording {
-        painter.add(special.shape(pc.ext.blend_gl.clone(), clip));
+        painter.add(special.shape(pc.ext.blend_gl.clone(), clip, pc.canvas));
         return;
     }
     let at = if clip.is_finite() { clip.center() } else { Pos2::ZERO };
@@ -2059,7 +2247,8 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
                 Kept::Special(special) => {
                     let mut special = special.clone();
                     special.meshes_mut().for_each(moved);
-                    special.shape(pc.ext.blend_gl.clone(), clip)
+                    special.scaled(k);
+                    special.shape(pc.ext.blend_gl.clone(), clip, screen)
                 }
             };
             painter.with_clip_rect(clip).add(shape);
@@ -2083,7 +2272,7 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
         if clip.is_positive() {
             let shape = match kept {
                 Kept::Mesh(mesh) => Shape::mesh(mesh.clone()),
-                Kept::Special(special) => special.clone().shape(pc.ext.blend_gl.clone(), clip),
+                Kept::Special(special) => special.clone().shape(pc.ext.blend_gl.clone(), clip, screen),
             };
             painter.with_clip_rect(clip).add(shape);
         }
@@ -2299,6 +2488,10 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 let rad = (n.radius * z).min(r.width() * 0.5).min(r.height() * 0.5).clamp(0.0, 255.0);
                 CornerRadius::same(rad.round() as u8)
             };
+            let white = Color32::WHITE.gamma_multiply(alpha);
+            if n.backdrop() > 0.0 {
+                backdrop_layer(pc, painter, n, Shape::rect_filled(r, rad, white), pivot);
+            }
             match source(pc, n, alpha) {
                 Source::None => {}
                 Source::Solid(c) => sink.add(Shape::rect_filled(r, rad, c)),
@@ -2328,6 +2521,10 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                         None => sink.add(egui::epaint::RectShape::filled(r, rad, tint).with_texture(t, uv)),
                     }
                 }
+            }
+            // Over the fill (the picture), under what a frame holds and under the stroke.
+            if let Some((tex, area, _)) = inner_layer(pc, n) {
+                sink.add(egui::epaint::RectShape::filled(r, rad, white).with_texture(tex, uv_in(r, area)));
             }
             // Frame yang terlalu kecil di layar: isinya tidak perlu digambar.
             if is_frame && r.width() >= 3.0 && r.height() >= 3.0 {
@@ -2362,6 +2559,10 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 return;
             }
             let ellipse = |fill: Color32| egui::epaint::EllipseShape::filled(r.center(), r.size() * 0.5, fill);
+            let white = Color32::WHITE.gamma_multiply(alpha);
+            if n.backdrop() > 0.0 {
+                backdrop_layer(pc, painter, n, ellipse(white).into(), pivot);
+            }
             match source(pc, n, alpha) {
                 Source::None => {}
                 Source::Solid(c) => sink.add(ellipse(c)),
@@ -2369,6 +2570,11 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                     for shape in textured(pc, ellipse(tint).into(), r, t) {
                         sink.add(shape);
                     }
+                }
+            }
+            if let Some((tex, area, _)) = inner_layer(pc, n) {
+                for shape in textured(pc, ellipse(white).into(), area, tex) {
+                    sink.add(shape);
                 }
             }
             if let Some(s) = stroke.filter(|s| !styled_stroke(pc, &mut sink, n, *s)) {
@@ -2417,11 +2623,9 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                     Source::Solid(c) => (None, c),
                     Source::Texture(t, tint) => (Some(t), tint),
                 };
-                if color != Color32::TRANSPARENT {
-                    let mut mesh = egui::Mesh::default();
-                    if let Some(t) = tex {
-                        mesh.texture_id = t;
-                    }
+                let glass = n.backdrop() > 0.0 && pc.capture.is_none();
+                let inner = inner_layer(pc, n);
+                if color != Color32::TRANSPARENT || glass || inner.is_some() {
                     let (verts, indices) = if holes.is_empty() {
                         vtext::fill_polygon(&pts).unwrap_or_else(|| (pts.clone(), earclip(&pts)))
                     } else {
@@ -2429,21 +2633,39 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                         cs.extend(holes.iter().map(|h| h.as_slice()));
                         vtext::fill_contours(&cs, vtext::FillRule::EvenOdd).unwrap_or_else(|| (pts.clone(), earclip(&pts)))
                     };
-                    for p in &verts {
-                        let uv = match tex {
-                            Some(_) => pos2((p.x - r.left()) / r.width().max(1e-3), (p.y - r.top()) / r.height().max(1e-3)),
-                            None => egui::epaint::WHITE_UV,
-                        };
-                        mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv, color });
-                    }
-                    mesh.indices = indices;
-                    sink.add(Shape::mesh(mesh));
-                    if tex.is_none() && stroke.is_none() {
-                        // Garis tipis sewarna untuk menghaluskan tepi isian.
-                        sink.add(Shape::closed_line(pts.clone(), Stroke::new(1.0_f32, color)));
-                        for h in &holes {
-                            sink.add(Shape::closed_line(h.clone(), Stroke::new(1.0_f32, color)));
+                    // The shape filled with a texture stretched over `over`, or with a plain colour.
+                    let filled = |tex: Option<(TextureId, Rect)>, color: Color32| {
+                        let mut mesh = egui::Mesh::default();
+                        if let Some((t, _)) = tex {
+                            mesh.texture_id = t;
                         }
+                        for p in &verts {
+                            let uv = match tex {
+                                Some((_, over)) => pos2((p.x - over.left()) / over.width().max(1e-3), (p.y - over.top()) / over.height().max(1e-3)),
+                                None => egui::epaint::WHITE_UV,
+                            };
+                            mesh.vertices.push(egui::epaint::Vertex { pos: *p, uv, color });
+                        }
+                        mesh.indices = indices.clone();
+                        Shape::mesh(mesh)
+                    };
+                    let white = Color32::WHITE.gamma_multiply(alpha);
+                    if glass {
+                        backdrop_layer(pc, painter, n, filled(None, white), pivot);
+                    }
+                    if color != Color32::TRANSPARENT {
+                        sink.add(filled(tex.map(|t| (t, r)), color));
+                        if tex.is_none() && stroke.is_none() {
+                            // Garis tipis sewarna untuk menghaluskan tepi isian.
+                            sink.add(Shape::closed_line(pts.clone(), Stroke::new(1.0_f32, color)));
+                            for h in &holes {
+                                sink.add(Shape::closed_line(h.clone(), Stroke::new(1.0_f32, color)));
+                            }
+                        }
+                    }
+                    // Over the fill, under the stroke.
+                    if let Some((t, area, _)) = inner {
+                        sink.add(filled(Some((t, area)), white));
                     }
                 }
             }
@@ -2468,6 +2690,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
             if let Some(laid) = path_laid(pc, n) {
                 let clip = (n.rotation == 0.0 && !flipped).then(|| painter.clip_rect());
                 paint_path_text(pc, &mut sink, &laid, n, alpha, clip);
+                text_inner(pc, &mut sink, n, alpha);
                 flush(pc, &mut sink, n, pivot);
                 return;
             }
@@ -2496,6 +2719,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                     if !mesh.indices.is_empty() {
                         sink.add(Shape::mesh(mesh));
                     }
+                    text_inner(pc, &mut sink, n, alpha);
                     flush(pc, &mut sink, n, pivot);
                     return;
                 }
@@ -2508,6 +2732,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
                 shape.transform(egui::emath::TSTransform::from_scaling(k));
                 sink.add(shape);
             }
+            text_inner(pc, &mut sink, n, alpha);
         }
     }
     flush(pc, &mut sink, n, pivot);

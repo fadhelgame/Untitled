@@ -18,6 +18,7 @@ mod constraints;
 mod corners;
 mod crop;
 mod find;
+mod glass;
 mod home;
 mod icons;
 mod library;
@@ -183,6 +184,12 @@ fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
     for q in n.points.iter_mut().chain(n.holes.iter_mut().flatten()) {
         q.r = q.r.map(|r| r * s);
     }
+    if let Some(inner) = &mut n.inner_shadow {
+        inner.x *= s;
+        inner.y *= s;
+        inner.blur *= s;
+    }
+    n.bg_blur *= s;
     n.blur *= s;
     if let Some(l) = &mut n.layout {
         l.gap *= s;
@@ -2410,6 +2417,12 @@ impl App {
         let center = self.canvas_rect.center();
         match b.frame {
             1 => self.stress_test(),
+            // `KANVAS_BENCH_GLASS=<n>`: n glass panels over the frames (see `bench_glass`).
+            6 => {
+                if let Ok(n) = std::env::var("KANVAS_BENCH_GLASS") {
+                    self.bench_glass(n.parse().unwrap_or(1));
+                }
+            }
             2..=9 => {}
             10..=99 => {
                 b.samples.push(self.frame_ms);
@@ -2623,6 +2636,13 @@ impl App {
                 // duplicating and deleting are tried too and printed to stderr.
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_TEXTPATH") {
                     b.ids = self.bench_textpath(ctx, &mode);
+                }
+                // `KANVAS_BENCH_EFFECTS=1`: glass panels (background blur) over a busy background
+                // and a row of inner shadows, beside the export of that frame (see
+                // `bench_effects`; the export waits for the fonts). `=view:x0,y0,x1,y1`: that
+                // part. `=panel`: a glass panel is selected, the panel shows its Effects.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_EFFECTS") {
+                    b.ids = self.bench_effects(ctx, &mode, &mut b.inject);
                 }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
@@ -3253,6 +3273,30 @@ impl App {
                         eprintln!("TEXTPATH frame {}: {:.2} ms", b.frame, self.frame_ms);
                     }
                 }
+                let effects = std::env::var_os("KANVAS_BENCH_EFFECTS").is_some() && b.ids.len() == 1;
+                if effects {
+                    // Every font of the frame has to be there, as the export is made only once;
+                    // they are asked for here, since the frame may be out of view.
+                    let mut fonts = Vec::new();
+                    if let Some(stage) = self.doc.find(b.ids[0]) {
+                        stage.walk(&mut |n| {
+                            if n.kind == Kind::Text {
+                                fonts.push((n.font.clone(), n.weight, n.italic));
+                            }
+                        });
+                    }
+                    for (font, weight, italic) in &fonts {
+                        self.fonts.resolve(font, *weight, *italic);
+                    }
+                    let loaded = fonts.iter().all(|(font, weight, italic)| self.fonts.settled(font, *weight, *italic));
+                    if b.aux == 0 && b.frame >= 230 && (loaded || b.frame > 900) {
+                        b.aux = b.frame;
+                        self.bench_effects_finish(ctx, b.ids[0], &b.out);
+                    }
+                    if b.aux != 0 && (50..=55).contains(&(b.frame - b.aux)) {
+                        eprintln!("EFFECTS frame {}: {:.2} ms", b.frame, self.frame_ms);
+                    }
+                }
                 if std::env::var_os("KANVAS_BENCH_CAPS").is_some() && (250..=255).contains(&b.frame) {
                     eprintln!("CAPS frame {}: {:.2} ms", b.frame, self.frame_ms);
                 }
@@ -3290,6 +3334,7 @@ impl App {
                 }
                 let settled = b.frame > if nested { 760 } else if component { 640 } else if auto { 356 } else { 260 };
                 let settled = settled && (textpath.is_none() || (b.aux != 0 && b.frame > b.aux + 80));
+                let settled = settled && (!effects || (b.aux != 0 && b.frame > b.aux + 80 && self.ext.busy() == 0));
                 let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && settled && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;

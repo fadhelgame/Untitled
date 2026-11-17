@@ -367,6 +367,15 @@ pub struct Node {
     /// Anggota satu group yang nilainya sama diburamkan sebagai satu kesatuan (lihat `blur_run`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub blur: f32,
+    /// Inner shadow: a shadow that falls inside the shape, over its fill and under its stroke
+    /// (in a frame: under what the frame holds). Same units and blur convention as `shadow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_shadow: Option<Shadow>,
+    /// Background blur: whatever is painted behind the node shows blurred inside its shape
+    /// ("frosted glass"), under its own fill. Same convention as `blur`; 0 = none.
+    /// See `Node::backdrop` for where it applies.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bg_blur: f32,
     /// Color style yang dipakai fill / stroke, dan text style (id ke `Doc::colors` / `Doc::type_styles`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_style: Option<u64>,
@@ -445,6 +454,32 @@ impl Node {
             0 => self.stroke_w * 0.5,
             2 => -self.stroke_w * 0.5,
             _ => 0.0,
+        }
+    }
+
+    /// The inner shadow that is drawn, if any: a shape that has an inside.
+    pub fn inner(&self) -> Option<Shadow> {
+        let has_inside = match self.kind {
+            Kind::Line => false,
+            Kind::Path => self.closed,
+            _ => true,
+        };
+        self.inner_shadow.filter(|s| has_inside && s.color[3] > 0)
+    }
+
+    /// The background blur that is drawn (0 = none). Rectangles, ellipses, closed paths, images
+    /// and frames have it, in their shape. A layer with a layer blur is one blurred picture
+    /// already and has none.
+    pub fn backdrop(&self) -> f32 {
+        let shaped = match self.kind {
+            Kind::Rect | Kind::Ellipse | Kind::Frame | Kind::Image => true,
+            Kind::Path => self.closed,
+            Kind::Line | Kind::Text => false,
+        };
+        if shaped && self.blur <= 0.0 && self.bg_blur > 0.0 {
+            self.bg_blur
+        } else {
+            0.0
         }
     }
 
@@ -756,6 +791,8 @@ impl Node {
             join: 0,
             shadow: None,
             blur: 0.0,
+            inner_shadow: None,
+            bg_blur: 0.0,
             fill_style: None,
             stroke_style: None,
             type_style: None,
@@ -2335,6 +2372,24 @@ mod tests {
         assert_eq!((back.cap, back.join), (1, 2));
         let old: Doc = serde_json::from_str(r#"{"nodes":[]}"#).unwrap();
         assert_eq!((old.page_count(), old.page_id()), (1, 0));
+        // The same for inner shadow and background blur: a file from before has neither, and
+        // a node without them is written as it was then.
+        assert_eq!((line.inner_shadow, line.bg_blur, line.inner(), line.backdrop()), (None, 0.0, None, 0.0));
+        let mut rect = Node::new(2, Kind::Rect, 0.0, 0.0);
+        let json = serde_json::to_string(&rect).unwrap();
+        assert!(!json.contains("inner_shadow") && !json.contains("bg_blur"), "{json}");
+        (rect.inner_shadow, rect.bg_blur) = (Some(Shadow { x: 1.0, y: 2.0, blur: 3.0, color: [4, 5, 6, 7] }), 12.0);
+        let back: Node = serde_json::from_str(&serde_json::to_string(&rect).unwrap()).unwrap();
+        assert_eq!((back.inner_shadow, back.bg_blur), (rect.inner_shadow, 12.0));
+        assert_eq!((back.inner(), back.backdrop()), (rect.inner_shadow, 12.0));
+        // A line has no inside; an open path neither.
+        (line.inner_shadow, line.bg_blur) = (rect.inner_shadow, 12.0);
+        assert_eq!((line.inner(), line.backdrop()), (None, 0.0));
+        let mut path = Node::new(3, Kind::Path, 0.0, 0.0);
+        (path.inner_shadow, path.bg_blur) = (rect.inner_shadow, 12.0);
+        assert_eq!((path.inner(), path.backdrop()), (None, 0.0));
+        path.closed = true;
+        assert_eq!((path.inner(), path.backdrop()), (rect.inner_shadow, 12.0));
     }
 
     #[test]
