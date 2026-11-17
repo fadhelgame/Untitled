@@ -415,6 +415,8 @@ pub struct App {
     library: library::Library,
     /// Mode crop gambar yang sedang aktif.
     crop: Option<crop::Session>,
+    /// The About window is open.
+    about: bool,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -500,6 +502,7 @@ impl App {
             pages: Default::default(),
             library: library::Library::new(library_dir),
             crop: None,
+            about: false,
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -1570,6 +1573,9 @@ impl App {
                     self.stress_test();
                 }
             });
+            if ui.button("About").clicked() {
+                self.about = true;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(format!("{:.0}%", self.view.zoom * 100.0));
             });
@@ -2021,6 +2027,35 @@ impl App {
     // ------------------------------------------------------------ canvas
 
     // ------------------------------------------------------------ pointer
+
+    // ------------------------------------------------------------ about
+
+    /// A short card about the app: what it is, the version that is running, who made it.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("kanvas_about")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.vertical_centered(|ui| {
+                ui.add_space(6.0);
+                ui.label(theme::title("Kanvas").size(24.0));
+                ui.label(egui::RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).color(ACCENT));
+                ui.add_space(10.0);
+                ui.label("A light, native design editor: an infinite canvas, frames, vector tools, images and Google Fonts — fast, offline, and yours.");
+                ui.add_space(10.0);
+                ui.weak("Made by Fadhel");
+                ui.hyperlink_to("github.com/fadhelgame/Untitled", "https://github.com/fadhelgame/Untitled");
+                ui.add_space(12.0);
+                if ui.add(egui::Button::new("Close").min_size(vec2(84.0, 28.0))).clicked() {
+                    self.about = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.about = false;
+        }
+    }
 
     // ------------------------------------------------------------ bench
 

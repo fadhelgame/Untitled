@@ -1244,6 +1244,7 @@ impl eframe::App for App {
         self.photos_window(ctx);
         self.library_window(ctx);
         self.eyedropper(ctx);
+        self.about_window(ctx);
 
         let name = self.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled".into(), |n| n.to_string_lossy());
         let title = format!("{}{} — Kanvas", name, if self.dirty { " *" } else { "" });
