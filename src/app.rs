@@ -523,6 +523,7 @@ impl App {
     fn touch(&mut self) {
         self.dirty = true;
         self.ext.rev += 1;
+        self.files.version += 1;
         self.files.last_change = std::time::Instant::now();
     }
 
@@ -1109,32 +1110,13 @@ impl App {
         }
     }
 
-    fn load(&mut self, path: PathBuf) -> bool {
-        let path = std::path::absolute(&path).unwrap_or(path);
-        let result = std::fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|b| serde_json::from_slice::<Doc>(&b).map_err(|e| e.to_string()));
-        match result {
-            Ok(mut doc) => {
-                // Pastikan id baru tidak bentrok dengan id di file.
-                doc.next_id = doc.next_id.max(doc.max_node_id());
-                doc.fix_pages();
-                self.doc = doc;
-                self.status = format!("Opened: {}", path.display());
-                self.opened(&path);
-                self.path = Some(path);
-                self.reset_session();
-                true
-            }
-            Err(e) => {
-                self.status = format!("Couldn't open the file: {e}");
-                false
-            }
-        }
-    }
-
     /// Hasil true = dokumen tersimpan (false juga kalau dialog lokasi dibatalkan).
     fn save(&mut self, save_as: bool) -> bool {
+        if !save_as && self.path.is_some() && self.bench.is_none() {
+            // The file already has a location: written in the background, like auto-save.
+            self.save_soon();
+            return true;
+        }
         let path = match (&self.path, save_as) {
             (Some(p), false) => Some(p.clone()),
             _ => rfd::FileDialog::new().add_filter("Kanvas", &["kanvas"]).set_file_name("Untitled.kanvas").save_file(),

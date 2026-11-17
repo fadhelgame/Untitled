@@ -1178,11 +1178,19 @@ impl eframe::App for App {
         self.icons.poll(ctx);
         self.photos_poll(ctx);
         self.library.poll(ctx);
-        self.remote_poll(ctx);
+        self.save_poll();
+        self.load_poll();
+        // Remote commands wait while a file is being opened: they are meant for that document.
+        if !self.loading() {
+            self.remote_poll(ctx);
+        }
         // `cpu_usage` adalah frame sebelumnya, jadi kurangi dengan waktu tunggu frame sebelumnya.
         self.frame_ms = (frame.info().cpu_usage.unwrap_or(0.0) * 1000.0 - self.pace_ms).max(0.0);
         self.pace_ms = pacer::wait();
         self.close_flow(ctx);
+        if self.loading_screen(ctx) {
+            return;
+        }
         if self.home {
             self.home_screen(ctx);
             if self.home {

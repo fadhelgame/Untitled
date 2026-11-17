@@ -1214,7 +1214,7 @@ impl App {
                 let path = path.ok_or("`path` is required to open a file")?;
                 if self.path.as_deref() != Some(path.as_path()) {
                     self.remote_leave(args)?;
-                    if !self.load(path) {
+                    if !self.load_now(path) {
                         return Err(self.status.clone());
                     }
                 }

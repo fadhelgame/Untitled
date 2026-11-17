@@ -7,6 +7,7 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Key,
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_RECENT: usize = 40;
@@ -59,6 +60,49 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
+/// Write the document to `path`. The JSON is streamed into a temporary file that then replaces
+/// the old one, so a large document is never held in memory twice and an interrupted save
+/// leaves the old file intact. Safe to call from any thread.
+pub(super) fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let write = || -> Result<(), String> {
+        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        serde_json::to_writer(&mut out, doc).map_err(|e| e.to_string())?;
+        drop(out.into_inner().map_err(|e| e.to_string())?);
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    };
+    write().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Read a document from `path`. Safe to call from any thread.
+pub(super) fn read_doc(path: &Path) -> Result<Doc, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut doc: Doc = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    // New ids must not collide with the ids in the file.
+    doc.next_id = doc.next_id.max(doc.max_node_id());
+    doc.fix_pages();
+    Ok(doc)
+}
+
+/// A save running on another thread.
+struct Saving {
+    path: PathBuf,
+    /// `Files::version` of the document being written.
+    version: u64,
+    rx: mpsc::Receiver<Result<(), String>>,
+}
+
+/// A file being read and parsed on another thread.
+struct Loading {
+    path: PathBuf,
+    rx: mpsc::Receiver<Result<Doc, String>>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct Recent {
     path: PathBuf,
@@ -76,6 +120,13 @@ pub(super) struct Files {
     /// Thumbnail file yang terbuka belum mengikuti isi terakhir.
     stale: bool,
     pub last_change: Instant,
+    /// Goes up with every change to the document; tells whether a finished background save
+    /// still matches what is on screen.
+    pub version: u64,
+    saving: Option<Saving>,
+    /// Save as soon as possible (Ctrl+S), without waiting for the auto-save pause.
+    asap: bool,
+    loading: Option<Loading>,
     /// Pesan dialog "simpan dulu?" saat menutup aplikasi.
     prompt: Option<String>,
     closing: bool,
@@ -95,6 +146,10 @@ impl Files {
             thumbs: HashMap::new(),
             stale: false,
             last_change: Instant::now(),
+            version: 0,
+            saving: None,
+            asap: false,
+            loading: None,
             prompt: None,
             closing: false,
             note: String::new(),
@@ -167,9 +222,12 @@ impl App {
     // ------------------------------------------------------------ simpan
 
     /// Tulis dokumen ke `path` dan catat sebagai file terbaru.
+    /// Blocks until the file is written; an unfinished background save is waited for first, so
+    /// two writers never share the temporary file.
     pub(super) fn write_doc(&mut self, path: &Path) -> Result<(), String> {
-        let bytes = serde_json::to_vec(&self.doc).map_err(|e| e.to_string())?;
-        write_atomic(path, &bytes).map_err(|e| e.to_string())?;
+        self.save_wait();
+        save_doc(&self.doc, path)?;
+        self.files.asap = false;
         self.path = Some(path.to_owned());
         self.dirty = false;
         self.files.stale = true;
@@ -186,29 +244,172 @@ impl App {
     }
 
     /// Simpan otomatis file yang sudah punya lokasi, sesaat setelah pengguna berhenti mengedit.
+    /// The file is written on another thread (see `start_save`), so a large document does not
+    /// freeze the canvas; only one save runs at a time.
     pub(super) fn autosave(&mut self, ctx: &egui::Context) {
-        if !self.dirty || self.bench.is_some() {
+        if !self.dirty || self.bench.is_some() || self.files.saving.is_some() {
             return;
         }
         let Some(path) = self.path.clone() else { return };
-        let busy = !matches!(self.drag, Drag::None) || self.editing.is_some() || ctx.input(|i| i.pointer.any_down());
-        if busy {
+        if !self.files.asap {
+            let busy = !matches!(self.drag, Drag::None) || self.editing.is_some() || ctx.input(|i| i.pointer.any_down());
+            if busy {
+                return;
+            }
+            let idle = self.files.last_change.elapsed();
+            if idle < AUTOSAVE_DELAY {
+                ctx.request_repaint_after(AUTOSAVE_DELAY - idle);
+                return;
+            }
+        }
+        self.files.asap = false;
+        self.start_save(path);
+    }
+
+    /// Ctrl+S on a file that already has a location: save in the background right away.
+    pub(super) fn save_soon(&mut self) {
+        if self.dirty {
+            self.files.asap = true;
+            self.status = "Saving…".into();
+        } else {
+            self.status = "All changes saved.".into();
+        }
+    }
+
+    /// Write a snapshot of the document on another thread. The snapshot is cheap: layers and
+    /// images are shared through `Arc`.
+    fn start_save(&mut self, path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        let (doc, ctx, to) = (self.doc.clone(), self.files.ctx.clone(), path.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(save_doc(&doc, &to));
+            ctx.request_repaint();
+        });
+        self.files.saving = Some(Saving { path, version: self.files.version, rx });
+    }
+
+    /// Each frame: pick up the result of a finished background save.
+    pub(super) fn save_poll(&mut self) {
+        let Some(job) = &self.files.saving else { return };
+        let result = match job.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("the save was interrupted".into()),
+        };
+        if let Some(job) = self.files.saving.take() {
+            self.saved(job, result);
+        }
+    }
+
+    /// Block until the background save (if any) has finished.
+    pub(super) fn save_wait(&mut self) {
+        if let Some(job) = self.files.saving.take() {
+            let result = job.rx.recv().unwrap_or_else(|_| Err("the save was interrupted".into()));
+            self.saved(job, result);
+        }
+    }
+
+    fn saved(&mut self, job: Saving, result: Result<(), String>) {
+        // The user moved on to another file in the meantime: nothing to update here.
+        if self.path.as_deref() != Some(job.path.as_path()) {
             return;
         }
-        let idle = self.files.last_change.elapsed();
-        if idle < AUTOSAVE_DELAY {
-            ctx.request_repaint_after(AUTOSAVE_DELAY - idle);
-            return;
-        }
-        match self.write_doc(&path) {
-            Ok(()) => self.status = "All changes saved.".into(),
+        match result {
+            Ok(()) => {
+                // Changes made while the file was being written are saved by the next round.
+                if job.version == self.files.version {
+                    self.dirty = false;
+                    self.status = "All changes saved.".into();
+                }
+                self.files.stale = true;
+                self.files.touch(&job.path);
+            }
             Err(e) => {
                 self.status = format!("Auto-save failed: {e}");
                 // Coba lagi setelah jeda berikutnya.
                 self.files.last_change = Instant::now();
-                ctx.request_repaint_after(AUTOSAVE_DELAY);
+                self.files.ctx.request_repaint_after(AUTOSAVE_DELAY);
             }
         }
+    }
+
+    // ------------------------------------------------------------ buka
+
+    /// Open a file. It is read and parsed on another thread (a document with many images takes
+    /// a while); `loading_screen` is shown meanwhile and `load_poll` installs the result.
+    pub(super) fn load(&mut self, path: PathBuf) {
+        let path = std::path::absolute(&path).unwrap_or(path);
+        if self.bench.is_some() {
+            // The bench scripts frames by number: the document has to be there from frame one.
+            self.load_now(path);
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (ctx, from) = (self.files.ctx.clone(), path.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(read_doc(&from));
+            ctx.request_repaint();
+        });
+        self.files.loading = Some(Loading { path, rx });
+    }
+
+    /// Open a file and wait for it. Result false = it could not be opened (see `status`).
+    pub(super) fn load_now(&mut self, path: PathBuf) -> bool {
+        let path = std::path::absolute(&path).unwrap_or(path);
+        self.files.loading = None;
+        let result = read_doc(&path);
+        self.finish_load(path, result)
+    }
+
+    fn finish_load(&mut self, path: PathBuf, result: Result<Doc, String>) -> bool {
+        match result {
+            Ok(doc) => {
+                self.doc = doc;
+                self.status = format!("Opened: {}", path.display());
+                self.opened(&path);
+                self.path = Some(path);
+                self.reset_session();
+                true
+            }
+            Err(e) => {
+                self.status = format!("Couldn't open the file: {e}");
+                false
+            }
+        }
+    }
+
+    pub(super) fn loading(&self) -> bool {
+        self.files.loading.is_some()
+    }
+
+    /// Each frame: install the document once the background read has finished.
+    pub(super) fn load_poll(&mut self) {
+        let Some(job) = &self.files.loading else { return };
+        let result = match job.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("reading the file was interrupted".into()),
+        };
+        let Some(job) = self.files.loading.take() else { return };
+        if !self.finish_load(job.path, result) {
+            self.files.note = self.status.clone();
+            self.files.refresh();
+        }
+    }
+
+    /// Shown instead of the editor while a file is being opened. Result true = it was shown.
+    pub(super) fn loading_screen(&mut self, ctx: &egui::Context) -> bool {
+        let Some(job) = &self.files.loading else { return false };
+        let name = job.path.file_stem().map_or("file".into(), |n| n.to_string_lossy().into_owned());
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(CANVAS_BG)).show(ctx, |ui| {
+            ui.add_space(ui.available_height() * 0.42);
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Spinner::new().size(26.0));
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(format!("Opening {name}…")).size(15.0));
+            });
+        });
+        true
     }
 
     /// Bereskan dokumen sebelum ditinggalkan: simpan perubahan dan perbarui thumbnail.
@@ -216,6 +417,8 @@ impl App {
     pub(super) fn settle(&mut self) -> bool {
         self.finish_text_edit();
         let Some(path) = self.path.clone() else { return true };
+        // A background save that is about to finish may already hold everything.
+        self.save_wait();
         if self.dirty {
             if let Err(e) = self.write_doc(&path) {
                 self.status = format!("Couldn't save: {e}");
@@ -302,6 +505,7 @@ impl App {
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
+        self.save_wait();
         self.files.prompt = None;
         self.files.closing = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -423,9 +627,8 @@ impl App {
             Act::Load(p) => {
                 if self.path.as_ref() == Some(&p) {
                     self.home = false;
-                } else if self.confirm_discard() && !self.load(p.clone()) {
-                    self.files.note = self.status.clone();
-                    self.files.refresh();
+                } else if self.confirm_discard() {
+                    self.load(p);
                 }
             }
         }
@@ -494,4 +697,32 @@ fn card(
         }
     });
     act
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::{Kind, Node};
+
+    #[test]
+    fn save_and_read_round_trip() {
+        let mut doc = Doc::default();
+        let image = doc.add_asset(vec![7; 3000]);
+        let mut frame = Node::new(doc.alloc_id(), Kind::Frame, 0.0, 0.0);
+        frame.children.push(Node::new(doc.alloc_id(), Kind::Rect, 10.0, 10.0));
+        doc.insert(frame, None);
+        let path = std::env::temp_dir().join(format!("kanvas_test_save_{}.kanvas", std::process::id()));
+        save_doc(&doc, &path).unwrap();
+        // Saving again replaces the file and leaves no temporary file behind.
+        save_doc(&doc, &path).unwrap();
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(!Path::new(&tmp).exists());
+        let back = read_doc(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.count(), 2);
+        assert_eq!(back.nodes[0].children, doc.nodes[0].children);
+        assert_eq!(back.assets[&image].bytes, vec![7; 3000]);
+        assert!(read_doc(&path).is_err());
+    }
 }
