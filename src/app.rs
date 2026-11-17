@@ -13,6 +13,7 @@ pub(crate) mod blend;
 mod builder;
 mod canvas;
 mod components;
+mod constraints;
 mod corners;
 mod crop;
 mod home;
@@ -2358,6 +2359,21 @@ impl App {
                         b.inject.extend((1..=8u32).map(|s| (202 + s, mv(from + (to - from) * (s as f32 / 8.0)))));
                     }
                 }
+                // `KANVAS_BENCH_CONSTRAINTS=1`: a frame with one layer per constraint (see
+                // `bench_constraints`), enlarged by 200×100 with a drag of its bottom right handle;
+                // then one layer is selected, to show the Constraints section. The boxes are printed
+                // to stderr. `=mixed` selects two layers instead; `=remote` goes on to resize the frame
+                // and set constraints with remote commands.
+                if std::env::var("KANVAS_BENCH_CONSTRAINTS").is_ok() {
+                    b.ids = self.bench_constraints();
+                    let (o, c) = (self.canvas_rect.min, self.doc.find(b.ids[0]).map_or((0.0, 0.0), |n| (n.x + n.w, n.y + n.h)));
+                    let (from, to) = (self.view.to_screen(o, c.0, c.1), self.view.to_screen(o, c.0 + 200.0, c.1 + 100.0));
+                    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                    let mv = egui::Event::PointerMoved;
+                    b.inject.extend([(200, mv(from)), (202, button(from, true))]);
+                    b.inject.extend((1..=8u32).map(|s| (202 + s, mv(from + (to - from) * (s as f32 / 8.0)))));
+                    b.inject.push((212, button(to, false)));
+                }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
                     let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
@@ -2695,6 +2711,43 @@ impl App {
                     let left = self.doc.find(b.ids[0]).zip(self.doc.parent_of(b.ids[0]).and_then(|p| self.doc.find(p))).map(|(n, p)| n.x - p.x);
                     eprintln!("DISTRIBUTE dragged box at {left:?} (want 320: 50 from its neighbour, like the two beside it), {} markers", self.ext.gaps.len());
                 }
+                if let (6, Ok(mode)) = (b.ids.len(), std::env::var("KANVAS_BENCH_CONSTRAINTS")) {
+                    let ids = b.ids.clone();
+                    let boxes = |app: &Self| -> Vec<String> {
+                        let Some(f) = app.doc.find(ids[0]) else { return Vec::new() };
+                        let head = format!("frame {}x{}", f.w, f.h);
+                        std::iter::once(head).chain(f.children.iter().map(|c| format!("{} ({:.2}, {:.2}) {:.2}x{:.2}", c.name, c.x - f.x, c.y - f.y, c.w, c.h))).collect()
+                    };
+                    match b.frame {
+                        206 => eprintln!("CONSTRAINTS halfway: {:?}", boxes(self)),
+                        250 => {
+                            eprintln!("CONSTRAINTS after the drag: {:?}\nCONSTRAINTS want: frame 800x400, Sidebar (20, 20) 80x360, Header (120, 20) 660x40, Badge (410, 180) 80x40, Button (700, 340) 80x40, Picture (160, 106.67) 160x80", boxes(self));
+                            self.sel = if mode == "mixed" { vec![ids[1], ids[4]] } else { vec![ids[4]] };
+                        }
+                        252 if mode == "remote" => {
+                            use serde_json::json;
+                            let (frame, badge, button) = (ids[0], ids[3], ids[4]);
+                            let run = |app: &mut Self, cmd: &str, args: serde_json::Value| {
+                                let answer = app.remote_bench(cmd, &args);
+                                eprintln!("CONSTRAINTS remote {cmd} {args} -> {}", answer.chars().take(330).collect::<String>());
+                            };
+                            self.do_undo();
+                            eprintln!("CONSTRAINTS drag undone: {:?}", boxes(self));
+                            run(self, "update_nodes", json!({ "nodes": [{ "id": frame, "w": 900, "h": 450 }] }));
+                            eprintln!("CONSTRAINTS remote 900x450: {:?} (want Sidebar 80x410, Header 760x40, Badge (460, 205), Button (800, 390), Picture (180, 120) 180x90)", boxes(self));
+                            run(self, "update_nodes", json!({ "nodes": [{ "id": frame, "w": 600, "h": 300, "keep_children": true }] }));
+                            eprintln!("CONSTRAINTS remote back to 600x300, children kept: {:?} (want the same boxes)", boxes(self));
+                            run(self, "update_nodes", json!({ "nodes": [{ "id": badge, "constraints": { "horizontal": "right", "vertical": "middle" } }] }));
+                            run(self, "update_nodes", json!({ "nodes": [{ "id": badge, "constraints": { "horizontal": "left_right" } }] }));
+                            run(self, "create_nodes", json!({ "parent": frame, "nodes": [{ "kind": "rect", "name": "Made", "x": 10, "y": 10, "w": 20, "h": 20, "constraints": { "horizontal": "scale", "vertical": "bottom" } }] }));
+                            run(self, "get_document", json!({ "ids": [badge, button] }));
+                            let made = self.doc.find(frame).and_then(|f| f.children.last()).map(|c| (c.constrain_h, c.constrain_v));
+                            eprintln!("CONSTRAINTS remote made: {made:?} (want Scale, Max); badge: {:?} (want Stretch, Center)", self.doc.find(badge).map(|c| (c.constrain_h, c.constrain_v)));
+                            self.sel = vec![button];
+                        }
+                        _ => {}
+                    }
+                }
                 let component = b.ids.len() == 6 && std::env::var_os("KANVAS_BENCH_COMPONENT").is_some();
                 if component {
                     let (main_rect, main_label, wide, own) = (b.ids[1], b.ids[2], b.ids[3], b.ids[4]);
@@ -2756,7 +2809,7 @@ impl App {
                         }
                         610 => {
                             let made = self.doc.nodes.iter().find(|n| n.name == "Wide button").map(|n| (n.is_instance(), n.w, look(self, n.id)));
-                            eprintln!("COMPONENT remote instance: {made:?} (want true, 330 wide, teal, its layers stretched)");
+                            eprintln!("COMPONENT remote instance: {made:?} (want true, 330 wide, teal, the background as wide and the label in its middle)");
                             self.sel = vec![own];
                         }
                         _ => {}

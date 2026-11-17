@@ -7,6 +7,7 @@ mod doc;
 mod export;
 mod file;
 mod fonts;
+mod layout;
 
 use eframe::egui;
 

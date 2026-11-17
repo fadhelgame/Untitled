@@ -6,9 +6,11 @@
 //! Nothing records what an instance overrides. When a main changes from `old` to `new`, a
 //! property of an instance follows only if it still had the `old` value; anything else was
 //! changed by the user and stays (see `Node::follow`). Position, size and structure are not
-//! overridable: they are rebuilt from the main every time, mapped into the box of the instance.
+//! overridable: they are rebuilt from the main every time, laid out in the box of the instance
+//! by the constraints that the layers have in the main (see `layout.rs`).
 
 use crate::doc::{Doc, Kind, Node};
+use crate::layout::{self, Rect};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -52,7 +54,7 @@ node_fields! {
         fill_style, stroke_style, type_style,
     ],
     by_hand: [text, spans],
-    fixed: [id, name, kind, x, y, w, h, rotation, wrap, points, closed, holes, group, clip, children, component, instance_of, source],
+    fixed: [id, name, kind, x, y, w, h, rotation, wrap, points, closed, holes, group, clip, children, component, instance_of, source, constrain_h, constrain_v],
 }
 
 impl Node {
@@ -100,27 +102,24 @@ fn index(n: &Node) -> HashMap<u64, &Node> {
     out
 }
 
-/// Maps the box of the main onto the box of the instance.
+/// Lays the layers of the main out in the box of the instance.
 struct Fit {
-    from: (f32, f32, f32, f32),
-    to: (f32, f32, f32, f32),
+    /// The box of the instance.
+    to: Rect,
     /// The instance is flipped against its main (left-right, top-bottom): the parts are laid
     /// out mirrored, and what they show is mirrored too.
     flip: (bool, bool),
 }
 
 impl Fit {
-    /// Put `part` where `main` (the node it mirrors) lands in the instance.
-    fn place(&self, part: &mut Node, main: &Node) {
-        let (f, t) = (self.from, self.to);
+    /// Put `part` where `main` (the node it mirrors) lands in the instance: by the constraints
+    /// of `main`, as the frame around it goes from the box `from` it has in the main to the box
+    /// `to` it has here. Result: the box of the part (before mirroring), for what it holds.
+    fn place(part: &mut Node, main: &Node, from: Rect, to: Rect) -> Rect {
         let mut g = Node::new(0, main.kind, main.x, main.y);
-        (g.w, g.h, g.rotation, g.wrap) = (main.w, main.h, main.rotation, main.wrap);
-        if (f.2, f.3) == (t.2, t.3) {
-            g.translate(t.0 - f.0, t.1 - f.1);
-        } else {
-            let scale = |a: f32, b: f32| if a.abs() > 1e-3 { b / a } else { 1.0 };
-            g.stretch((f.0, f.1), (t.0, t.1), (scale(f.2, t.2), scale(f.3, t.3)));
-        }
+        (g.w, g.h, g.rotation, g.wrap, g.align) = (main.w, main.h, main.rotation, main.wrap, main.align);
+        (g.constrain_h, g.constrain_v) = (main.constrain_h, main.constrain_v);
+        layout::reflow(&mut g, from, to);
         if main.kind == Kind::Text && part.own_text(main) {
             // Its size comes from its own content; keep that, anchored where the text aligns.
             if main.wrap {
@@ -137,6 +136,7 @@ impl Fit {
             (part.x, part.y, part.w, part.h) = (g.x, g.y, g.w, g.h);
         }
         part.rotation = main.rotation;
+        (g.x, g.y, g.w, g.h)
     }
 
     /// Mirror a part (its children are not in it yet) the way the instance is flipped. Doing
@@ -165,7 +165,8 @@ struct Rebuild<'a> {
 }
 
 impl Rebuild<'_> {
-    fn part(&mut self, main: &Node) -> Node {
+    /// The part for `main`, a layer of a frame that has the box `from` in the main and `to` here.
+    fn part(&mut self, main: &Node, from: Rect, to: Rect) -> Node {
         let mut part = match self.pool.remove(&main.id) {
             Some(mut part) => {
                 // Compare with the main as the main has it: unmirrored.
@@ -186,6 +187,7 @@ impl Rebuild<'_> {
         part.name.clone_from(&main.name);
         part.clip = main.clip;
         part.wrap = main.wrap;
+        (part.constrain_h, part.constrain_v) = (main.constrain_h, main.constrain_v);
         part.closed = main.closed;
         part.points.clone_from(&main.points);
         part.holes.clone_from(&main.holes);
@@ -205,9 +207,9 @@ impl Rebuild<'_> {
                 }
             },
         };
-        self.fit.place(&mut part, main);
+        let at = Fit::place(&mut part, main, from, to);
         self.fit.mirror(&mut part);
-        part.children = main.children.iter().map(|c| self.part(c)).collect();
+        part.children = main.children.iter().map(|c| self.part(c, (main.x, main.y, main.w, main.h), at)).collect();
         part
     }
 }
@@ -243,9 +245,9 @@ fn sync_instance(inst: &mut Node, old: &HashMap<u64, &Node>, new: &Node, next_id
         }
     }
     let flip = (inst.flip_h != new.flip_h, inst.flip_v != new.flip_v);
-    let fit = Fit { from: (new.x, new.y, new.w, new.h), to: (inst.x, inst.y, inst.w, inst.h), flip };
-    let mut rebuild = Rebuild { old, pool, fit, groups, next_id, names };
-    inst.children = new.children.iter().map(|c| rebuild.part(c)).collect();
+    let (from, to) = ((new.x, new.y, new.w, new.h), (inst.x, inst.y, inst.w, inst.h));
+    let mut rebuild = Rebuild { old, pool, fit: Fit { to, flip }, groups, next_id, names };
+    inst.children = new.children.iter().map(|c| rebuild.part(c, from, to)).collect();
 }
 
 impl Doc {
@@ -491,6 +493,7 @@ impl Doc {
     }
 
     /// `fit_instance` for an instance in the document. Result: whether anything changed.
+    #[cfg(test)]
     pub fn relayout(&mut self, id: u64) -> bool {
         let Some(mut inst) = self.find(id).filter(|n| n.is_instance()).cloned() else { return false };
         if !self.fit_instance(&mut inst) {
@@ -632,6 +635,7 @@ impl Doc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Constraint;
 
     const RED: Option<[u8; 4]> = Some([255, 0, 0, 255]);
     const BLUE: Option<[u8; 4]> = Some([0, 0, 255, 255]);
@@ -839,8 +843,13 @@ mod tests {
     }
 
     #[test]
-    fn a_resized_instance_stretches_what_it_holds() {
+    fn a_resized_instance_lays_its_parts_out_again() {
         let mut doc = button();
+        // Both layers scale with the frame.
+        for id in [2, 3] {
+            let n = doc.find_mut(id).unwrap();
+            (n.constrain_h, n.constrain_v) = (Constraint::Scale, Constraint::Scale);
+        }
         let i = place(&mut doc, 1, 400.0, 300.0, None);
         // Twice as wide, half as high; the size change alone lays it out again.
         assert!(edit(&mut doc, |d| {
@@ -849,9 +858,8 @@ mod tests {
         }));
         let (rect, text) = (at2(&doc, i, 2), at2(&doc, i, 3));
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (400.0, 300.0, 400.0, 40.0));
-        // Auto-width text keeps its size; its centre moves along. In the main: (150, 140) of 200×80.
-        assert_eq!((text.w, text.h), (60.0, 20.0));
-        assert_eq!(text.center(), (500.0, 320.0));
+        // Auto-width text keeps its size; its corner moves along. In the main: (20, 30) of 200×80.
+        assert_eq!((text.x, text.y, text.w, text.h), (440.0, 315.0, 60.0, 20.0));
         assert!(!doc.relayout(i));
         // A change in the main lands in the stretched box; the instance keeps its size.
         assert!(edit(&mut doc, |d| {
@@ -874,6 +882,50 @@ mod tests {
         assert!(edit(&mut doc, |d| d.find_mut(3).unwrap().translate(5.0, 5.0)));
         let t = doc.find(label).unwrap();
         assert_eq!((t.x, t.y, t.w, t.text.as_str()), (25.0, 635.0, 180.0, "A much longer label"));
+    }
+
+    #[test]
+    fn parts_follow_the_constraints_of_the_main() {
+        use Constraint::*;
+        let mut doc = button();
+        let rect_of = |d: &Doc, i: u64, s: u64| {
+            let n = part(d, i, s);
+            (n.x, n.y, n.w, n.h)
+        };
+        let pin = |d: &mut Doc, id: u64, c: (Constraint, Constraint)| {
+            let n = d.find_mut(id).unwrap();
+            (n.constrain_h, n.constrain_v) = c;
+        };
+        // The background fills the button, the label stays at the top left, a badge in the
+        // bottom right corner, and a bar across the middle with a knob at its right end.
+        pin(&mut doc, 2, (Stretch, Stretch));
+        let badge = add(&mut doc, Kind::Ellipse, Some(1), (270.0, 150.0, 20.0, 20.0));
+        pin(&mut doc, badge, (Max, Max));
+        let bar = add(&mut doc, Kind::Frame, Some(1), (150.0, 110.0, 100.0, 20.0));
+        pin(&mut doc, bar, (Stretch, Center));
+        let knob = add(&mut doc, Kind::Rect, Some(bar), (240.0, 110.0, 10.0, 20.0));
+        pin(&mut doc, knob, (Max, Stretch));
+        let i = place(&mut doc, 1, 400.0, 300.0, None);
+        // The size of the main: everything where the main has it.
+        assert_eq!((rect_of(&doc, i, badge), rect_of(&doc, i, knob)), ((570.0, 350.0, 20.0, 20.0), (540.0, 310.0, 10.0, 20.0)));
+        assert!(edit(&mut doc, |d| {
+            let n = d.find_mut(i).unwrap();
+            (n.w, n.h) = (300.0, 100.0);
+        }));
+        assert_eq!(rect_of(&doc, i, 2), (400.0, 300.0, 300.0, 100.0));
+        assert_eq!(rect_of(&doc, i, 3), (420.0, 330.0, 60.0, 20.0));
+        assert_eq!(rect_of(&doc, i, badge), (670.0, 370.0, 20.0, 20.0));
+        // The bar is wider and stays 20 above the middle; the knob follows the end of the bar.
+        assert_eq!((rect_of(&doc, i, bar), rect_of(&doc, i, knob)), ((450.0, 320.0, 200.0, 20.0), (640.0, 320.0, 10.0, 20.0)));
+        // The parts carry the constraints of the main, and a change of them arrives like any other.
+        assert_eq!((part(&doc, i, badge).constrain_h, part(&doc, i, knob).constrain_v), (Max, Stretch));
+        assert!(edit(&mut doc, |d| pin(d, badge, (Min, Max))));
+        assert_eq!((rect_of(&doc, i, badge), part(&doc, i, badge).constrain_h), ((570.0, 370.0, 20.0, 20.0), Min));
+        // The constraint of the instance itself, in the frame it sits in, is its own.
+        let own = doc.find_mut(i).unwrap();
+        own.constrain_h = Center;
+        assert!(edit(&mut doc, |d| d.find_mut(2).unwrap().fill = BLUE));
+        assert_eq!(doc.find(i).unwrap().constrain_h, Center);
     }
 
     #[test]
@@ -907,8 +959,8 @@ mod tests {
         assert_eq!((at(&doc, 2).flip_h, at(&doc, 2).flip_v), (true, true));
         // Resizing lays it out again, still mirrored.
         assert!(edit(&mut doc, |d| d.find_mut(i).unwrap().w = 400.0));
-        // (The text keeps its size and has its centre at 40 of 200, so at 80 of 400 from the right.)
-        assert_eq!((at(&doc, 3).x, at(&doc, 3).w, at(&doc, arrow).x), (690.0, 60.0, 440.0));
+        // (Both keep their distance to the left edge of the main, which is the right edge here.)
+        assert_eq!((at(&doc, 3).x, at(&doc, 3).w, at(&doc, arrow).x), (730.0, 60.0, 620.0));
         // Flipped back, it is laid out like the main again; the override is still there.
         doc.find_mut(i).unwrap().w = 200.0;
         assert!(doc.flip(&[i], true) && doc.relayout(i));

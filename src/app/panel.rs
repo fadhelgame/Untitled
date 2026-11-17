@@ -106,6 +106,7 @@ impl App {
         let mut crop_image = false;
         let mut style_action: Option<super::styles::StyleAction> = None;
         let mut comp_act: Option<super::components::Act> = None;
+        let mut constrain: super::constraints::Pair = (None, None);
         let has_parent = self.doc.parent_of(id).is_some();
         // A part of an instance: its look can be changed, its place, size and name follow the main.
         let pinned = orig.source.is_some();
@@ -160,6 +161,9 @@ impl App {
                     }
                 }
             });
+            if has_parent {
+                constrain = super::constraints::constraints_section(ui, (Some(n.constrain_h), Some(n.constrain_v)), pinned);
+            }
 
             section(ui, "Appearance");
             ui.horizontal(|ui| {
@@ -331,6 +335,10 @@ impl App {
             self.component_act(act);
             return;
         }
+        if constrain != (None, None) {
+            self.set_constraints(constrain);
+            return;
+        }
         if pinned {
             (n.x, n.y, n.w, n.h, n.rotation, n.wrap) = (before.x, before.y, before.w, before.h, before.rotation, before.wrap);
         }
@@ -383,6 +391,16 @@ impl App {
                 c.translate(dx, dy);
             }
         }
+        if n.kind == Kind::Frame && (n.w, n.h) != (orig.w, orig.h) {
+            // What the frame holds is laid out from how it was before this undo step (one drag
+            // of the field), so making it small and large again in one go loses nothing.
+            let to = (n.x, n.y, n.w, n.h);
+            let start = self.undo.last().and_then(|d| d.find(id)).filter(|s| s.kind == Kind::Frame && s.count() == orig.count());
+            let mut laid = start.unwrap_or(&orig).clone();
+            crate::layout::set_box(&mut laid, to, crate::layout::Children::Constrain);
+            (n.w, n.h, n.children) = (laid.w, laid.h, laid.children);
+            self.doc.refit(&mut n, &orig);
+        }
         if let Some(slot) = self.doc.find_mut(id) {
             *slot = n;
         }
@@ -426,6 +444,8 @@ impl App {
         let mut align: Option<u8> = None;
         let mut flip: Option<bool> = None;
         let units = self.doc.unit_count(&ids);
+        let constrained = self.constraints_shown();
+        let mut constrain: super::constraints::Pair = (None, None);
         const MIXED: &str = "Mixed — showing the first layer; a change applies to all.";
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -465,6 +485,9 @@ impl App {
                 }
                 flip = flip_buttons(ui);
             });
+            if let Some(shown) = constrained {
+                constrain = super::constraints::constraints_section(ui, shown, pinned);
+            }
 
             section(ui, "Appearance");
             if mixed_look {
@@ -552,6 +575,10 @@ impl App {
         }
         if let Some(act) = comp_act {
             self.component_act(act);
+            return;
+        }
+        if constrain != (None, None) {
+            self.set_constraints(constrain);
             return;
         }
         if n == before {

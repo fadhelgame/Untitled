@@ -1,6 +1,7 @@
 //! Model dokumen. Node level atas disimpan sebagai `Arc<Node>` supaya snapshot
 //! undo berbagi memori untuk frame yang tidak berubah (ratusan frame tetap murah).
 
+use crate::layout::Constraint;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -345,6 +346,11 @@ pub struct Node {
     /// Inside an instance: the id of the node in the main component that this one mirrors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<u64>,
+    /// In a frame: how this node keeps its place when the frame is resized. See `layout.rs`.
+    #[serde(default, skip_serializing_if = "Constraint::is_default")]
+    pub constrain_h: Constraint,
+    #[serde(default, skip_serializing_if = "Constraint::is_default")]
+    pub constrain_v: Constraint,
     #[serde(default)]
     pub children: Vec<Node>,
 }
@@ -696,6 +702,8 @@ impl Node {
             component: false,
             instance_of: None,
             source: None,
+            constrain_h: Constraint::Min,
+            constrain_v: Constraint::Min,
             children: Vec::new(),
         }
     }

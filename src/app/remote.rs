@@ -14,6 +14,7 @@ use super::render::{self, PenPt};
 use super::{blend, App, Drag};
 use crate::doc::{b64, Doc, Gradient, Kind, Node, Stop};
 use crate::export;
+use crate::layout::{self, Children, Constraint};
 use crate::fonts::CatalogState;
 use eframe::egui;
 use serde_json::{json, Map, Value};
@@ -338,6 +339,9 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     }
     if n.group != 0 {
         put("group", json!(n.group));
+    }
+    if !n.constrain_h.is_default() || !n.constrain_v.is_default() {
+        put("constraints", json!({ "horizontal": n.constrain_h.key(true), "vertical": n.constrain_v.key(false) }));
     }
     if n.component {
         put("component", json!(true));
@@ -773,6 +777,29 @@ impl App {
                     let dy = o.1 + num(k, v)? - n.y;
                     n.translate(0.0, dy);
                 }
+                "keep_children" if !creating => {
+                    flag(k, v)?;
+                }
+                "constraints" => {
+                    let c = v.as_object().ok_or("`constraints` must be an object like {\"horizontal\": \"left_right\", \"vertical\": \"top\"}")?;
+                    for (axis, value) in c {
+                        let horizontal = match axis.as_str() {
+                            "horizontal" => true,
+                            "vertical" => false,
+                            other => return Err(format!("unknown key `{other}` in `constraints`; use horizontal and vertical")),
+                        };
+                        let name = string(axis, value)?;
+                        let parsed = Constraint::parse(&name, horizontal).ok_or_else(|| {
+                            let all: Vec<&str> = Constraint::ALL.iter().map(|c| c.key(horizontal)).collect();
+                            format!("unknown {axis} constraint \"{name}\"; use one of: {}", all.join(", "))
+                        })?;
+                        if horizontal {
+                            n.constrain_h = parsed;
+                        } else {
+                            n.constrain_v = parsed;
+                        }
+                    }
+                }
                 "w" => n.w = if n.kind == Kind::Line { num(k, v)? } else { num(k, v)?.max(1.0) },
                 "h" => n.h = if n.kind == Kind::Line { num(k, v)? } else { num(k, v)?.max(1.0) },
                 "fill" => (n.fill, n.gradient) = paint(v)?,
@@ -985,7 +1012,7 @@ impl App {
         n.translate(at.0 - n.x, at.1 - n.y);
         notes.natural = None;
         self.apply(&mut n, m, o, true, notes)?;
-        // Given a size of its own, its layers stretch along.
+        // Given a size of its own, its layers are laid out again.
         self.doc.fit_instance(&mut n);
         Ok(n)
     }
@@ -1098,7 +1125,7 @@ impl App {
             return Err("a frame can't be moved into itself or into something inside it".into());
         }
         if n.source.is_some() {
-            let fixed = ["x", "y", "w", "h", "rotation", "name", "points", "closed", "wrap", "parent", "component"];
+            let fixed = ["x", "y", "w", "h", "rotation", "name", "points", "closed", "wrap", "parent", "component", "constraints"];
             if let Some(k) = m.keys().find(|k| fixed.contains(&k.as_str())) {
                 return Err(format!("node {id} is part of an instance: `{k}` follows the main component (only its look and text can be changed). Edit the main component, or detach the instance."));
             }
@@ -1106,7 +1133,16 @@ impl App {
         if target != current {
             self.may_hold(&n, target)?;
         }
+        let was = n.clone();
         self.apply(&mut n, m, o, false, notes)?;
+        if n.kind == Kind::Frame && (n.w, n.h) != (was.w, was.h) {
+            // A resized frame lays out what it holds, unless asked to leave it where it is.
+            let keep = m.get("keep_children").is_some_and(|v| v.as_bool() == Some(true));
+            let to = (n.x, n.y, n.w, n.h);
+            (n.w, n.h) = (was.w, was.h);
+            layout::set_box(&mut n, to, if keep { Children::Keep } else { Children::Constrain });
+            self.doc.refit(&mut n, &was);
+        }
         if target != current {
             self.doc.remove(id);
             self.doc.insert(n, target);
@@ -1407,6 +1443,16 @@ mod tests {
         assert_eq!((c["x"].as_f64(), c["y"].as_f64()), (Some(20.0), Some(30.0)));
         assert_eq!(c["fill"], json!("#ff0000"));
         assert_eq!(describe(&f, (0.0, 0.0), false)["child_count"], json!(1));
+    }
+
+    #[test]
+    fn constraints_are_described_where_they_are_set() {
+        let mut n = Node::new(1, Kind::Rect, 0.0, 0.0);
+        assert_eq!(describe(&n, (0.0, 0.0), true)["constraints"], Value::Null);
+        (n.constrain_h, n.constrain_v) = (Constraint::Stretch, Constraint::Max);
+        assert_eq!(describe(&n, (0.0, 0.0), true)["constraints"], json!({ "horizontal": "left_right", "vertical": "bottom" }));
+        n.constrain_v = Constraint::Min;
+        assert_eq!(describe(&n, (0.0, 0.0), true)["constraints"], json!({ "horizontal": "left_right", "vertical": "top" }));
     }
 
     #[test]

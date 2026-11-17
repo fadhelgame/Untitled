@@ -4,6 +4,7 @@
 use super::render::{self, paint_list, PaintCx};
 use super::*;
 use crate::doc::PathPoint;
+use crate::layout::Children;
 
 impl App {
     pub(super) fn canvas(&mut self, ui: &mut egui::Ui) {
@@ -837,8 +838,13 @@ impl App {
                         }
                     }
                 }
-                // An instance lays its parts out again as it is resized.
-                self.doc.relayout(*id);
+                // A frame lays out what it holds, from how it was when the drag began (an
+                // instance: from its main). Ctrl: the children stay where they are.
+                if let Some(to) = self.doc.find(*id).filter(|n| n.kind == Kind::Frame).map(|n| (n.x, n.y, n.w, n.h)) {
+                    let children = if inp.mods.command { Children::Keep } else { Children::Constrain };
+                    let from = self.pre_drag.as_ref().and_then(|d| d.find(*id));
+                    self.doc.set_box(*id, from, to, children);
+                }
             }
             Drag::Scale { id, handle, orig } => {
                 let (x0, y0, x1, y1) = orig.bounds();
@@ -909,6 +915,13 @@ impl App {
                     if *scale {
                         scale_node(&mut n, sx, x0, y0);
                         n.translate(nx - x0, ny - y0);
+                    } else if n.kind == Kind::Frame && !inp.mods.command {
+                        // The frame is stretched with the selection; what it holds follows its constraints.
+                        let mut g = Node::new(0, Kind::Frame, n.x, n.y);
+                        (g.w, g.h, g.rotation) = (n.w, n.h, n.rotation);
+                        g.stretch((x0, y0), (nx, ny), (sx, sy));
+                        crate::layout::set_box(&mut n, (g.x, g.y, g.w, g.h), Children::Constrain);
+                        self.doc.refit(&mut n, node);
                     } else {
                         n.stretch((x0, y0), (nx, ny), (sx, sy));
                     }

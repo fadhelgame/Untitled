@@ -3,6 +3,7 @@
 //! The model and the rules of following are in `crate::component`.
 
 use super::*;
+use crate::layout::Constraint;
 
 /// Mains and instances are drawn in this colour: name label, outline, Layers panel icon.
 pub(super) const PURPLE: Color32 = Color32::from_rgb(151, 71, 255);
@@ -386,8 +387,11 @@ impl App {
         let button = make(Kind::Frame, "Button", (60.0, 70.0, 220.0, 72.0), None);
         let mut back = make(Kind::Rect, "Background", (60.0, 70.0, 220.0, 72.0), Some([13, 153, 255, 255]));
         back.radius = 16.0;
+        // The background fills the button at any size, the label stays in its middle.
+        (back.constrain_h, back.constrain_v) = (Constraint::Stretch, Constraint::Stretch);
         let mut label = make(Kind::Text, "Label", (118.0, 90.0, 104.0, 32.0), Some([255, 255, 255, 255]));
         (label.text, label.font_size, label.weight) = ("Button".into(), 26.0, 700);
+        (label.constrain_h, label.constrain_v) = (Constraint::Center, Constraint::Center);
         let (stage_id, button_id, back_id, label_id, b) = (stage.id, button.id, back.id, label.id, stage.bounds());
         self.doc.insert(stage, None);
         self.doc.insert(button, Some(stage_id));
