@@ -4,7 +4,7 @@
 use super::render::{self, paint_list, PaintCx};
 use super::*;
 use crate::doc::PathPoint;
-use crate::layout::Children;
+use crate::layout::{Children, Sizing};
 
 impl App {
     pub(super) fn canvas(&mut self, ui: &mut egui::Ui) {
@@ -76,6 +76,8 @@ impl App {
             if !self.ruler_pointer(p, &inp, hovered) {
                 self.pointer(p, &inp, hovered, space);
             }
+            // What is drawn below is already laid out around what was just dragged.
+            self.settle_live();
             if resp.double_clicked() {
                 if self.tool == Tool::Pen {
                     // egui menghitung klik ganda dari waktu saja; dua titik yang diklik cepat di tempat
@@ -291,6 +293,7 @@ impl App {
         }
         self.paint_ruler_guides(&painter, inp.pos);
         self.paint_guides(&painter);
+        self.paint_drop_mark(&painter);
         self.paint_grad(&painter);
         if self.tool == Tool::Pen {
             self.paint_pen_anchors(&painter);
@@ -679,7 +682,8 @@ impl App {
                         }
                     }
                     // Snapping ke objek lain / frame, dengan garis bantu (tahan Ctrl untuk mematikan).
-                    if inp.mods.command {
+                    // An item of an auto layout is placed by its frame: nothing to snap to.
+                    if inp.mods.command || self.drag_in_layout(*start + total) {
                         self.ext.guides.clear();
                         self.ext.gaps.clear();
                     } else {
@@ -695,6 +699,9 @@ impl App {
                             }
                         }
                     }
+                }
+                if *moved {
+                    self.reorder_drag(*start + *applied);
                 }
                 // Alt ditahan kapan pun selama drag: yang digeser jadi salinan, aslinya kembali ke
                 // tempat semula. Alt dilepas lagi sebelum mouse dilepas: salinan dibuang (seperti Figma).
@@ -715,10 +722,20 @@ impl App {
                                 self.sel.push(n.id);
                                 self.doc.insert(n, parent);
                             }
-                            for id in roots {
-                                if let Some(n) = self.doc.find_mut(id) {
-                                    n.translate(-applied.x, -applied.y);
+                            // The originals go back to where the drag began: also into the frame
+                            // and the place in the row that the drag may have taken them out of.
+                            let mut back: Vec<(Node, Option<u64>, usize)> = Vec::new();
+                            if let Some(pre) = &self.pre_drag {
+                                for id in &roots {
+                                    let parent = pre.parent_of(*id);
+                                    let at = pre.child_ids(parent).iter().position(|c| c == id);
+                                    back.extend(pre.find(*id).cloned().zip(at).map(|(n, at)| (n, parent, at)));
                                 }
+                            }
+                            back.sort_by_key(|b| b.2);
+                            for (n, parent, at) in back {
+                                self.doc.remove(n.id);
+                                self.doc.insert_at(n, parent, at);
                             }
                             *dup = Some(originals);
                         }
@@ -836,14 +853,26 @@ impl App {
                         if n.kind == Kind::Text && (n.w - ow).abs() > 0.5 {
                             n.wrap = true;
                         }
+                        // A side that was dragged has the size it was dragged to: it no longer
+                        // hugs or fills. (The other one may only have been rounded.)
+                        let (across, down) = (!matches!(*handle, 1 | 5) || inp.mods.shift, !matches!(*handle, 3 | 7) || inp.mods.shift);
+                        if across && (n.w - ow).abs() > 1e-3 {
+                            n.size_h = Sizing::Fixed;
+                        }
+                        if down && (n.h - oh).abs() > 1e-3 {
+                            n.size_v = Sizing::Fixed;
+                        }
                     }
                 }
                 // A frame lays out what it holds, from how it was when the drag began (an
                 // instance: from its main). Ctrl: the children stay where they are.
-                if let Some(to) = self.doc.find(*id).filter(|n| n.kind == Kind::Frame).map(|n| (n.x, n.y, n.w, n.h)) {
+                if let Some((to, sizes)) = self.doc.find(*id).filter(|n| n.kind == Kind::Frame).map(|n| ((n.x, n.y, n.w, n.h), (n.size_h, n.size_v))) {
                     let children = if inp.mods.command { Children::Keep } else { Children::Constrain };
-                    let from = self.pre_drag.as_ref().and_then(|d| d.find(*id));
-                    self.doc.set_box(*id, from, to, children);
+                    let mut from = self.pre_drag.as_ref().and_then(|d| d.find(*id)).cloned();
+                    if let Some(f) = &mut from {
+                        (f.size_h, f.size_v) = sizes;
+                    }
+                    self.doc.set_box(*id, from.as_ref(), to, children);
                 }
             }
             Drag::Scale { id, handle, orig } => {
@@ -870,6 +899,12 @@ impl App {
                 }
                 let mut scaled = orig.clone();
                 scale_node(&mut scaled, s, ax, ay);
+                if s != 1.0 && scaled.size_h == Sizing::Fill {
+                    scaled.size_h = Sizing::Fixed;
+                }
+                if s != 1.0 && scaled.size_v == Sizing::Fill {
+                    scaled.size_v = Sizing::Fixed;
+                }
                 if let Some(slot) = self.doc.find_mut(*id) {
                     *slot = scaled;
                 }
@@ -912,6 +947,13 @@ impl App {
                 let (nx, ny) = (place(fx, x0, x1, bw * sx), place(fy, y0, y1, bh * sy));
                 for node in orig.iter() {
                     let mut n = node.clone();
+                    // Stretched by hand: that side no longer hugs or fills.
+                    if sx != 1.0 && (!*scale || n.size_h == Sizing::Fill) {
+                        n.size_h = Sizing::Fixed;
+                    }
+                    if sy != 1.0 && (!*scale || n.size_v == Sizing::Fill) {
+                        n.size_v = Sizing::Fixed;
+                    }
                     if *scale {
                         scale_node(&mut n, sx, x0, y0);
                         n.translate(nx - x0, ny - y0);
@@ -1133,6 +1175,7 @@ impl App {
     fn release(&mut self, drag: Drag) {
         let pre = self.pre_drag.take();
         self.end_snap();
+        self.drop_mark = None;
         match drag {
             Drag::Rotate { id, orig, .. } => {
                 let changed = self.doc.find(id).is_some_and(|n| n.rotation != orig);
@@ -1150,6 +1193,10 @@ impl App {
                 let grab = start + applied;
                 for &id in &roots {
                     let Some(n) = self.doc.find(id) else { continue };
+                    // An item of an auto layout was put where it belongs while it was dragged.
+                    if self.doc.auto_item(id) {
+                        continue;
+                    }
                     let (x, y) = if roots.len() == 1 { (grab.x, grab.y) } else { n.center() };
                     let target = self.doc.frame_for(n, x, y, &roots);
                     if target != self.doc.parent_of(id) && self.doc.would_cycle(n, target) {

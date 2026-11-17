@@ -148,6 +148,8 @@ Every screenshot here is the real app.
       Turn a frame into a <b>component</b> (<code>Ctrl+Alt+K</code>) and every copy of it is an <b>instance</b>: change the main component and all its instances follow, on every page. An instance keeps what you changed on it (a label, a color, a photo) and still takes everything else from the main; it can be resized, and components can hold instances of other components. The <i>Components</i> button in the toolbar lists them all, one click to place.
       <h3>Constraints</h3>
       Tell each layer in a frame what to hold on to when the frame is resized: <b>left</b>, <b>right</b>, <b>left and right</b> (it stretches), <b>center</b> or <b>scale</b>, and the same from top to bottom. Pick them in the <i>Constraints</i> section of the Design panel, from the dropdowns or by clicking the sides of the little frame. Frames inside the frame pass the change on to their own layers, and a resized instance lays out its layers by the constraints of the main component. Hold <code>Ctrl</code> while dragging a resize handle to leave the content where it is.
+      <h3>Auto layout</h3>
+      Press <code>Shift+A</code> and a frame places its children itself: in a <b>row</b>, a <b>column</b> or <b>wrapping rows</b>, with a gap, padding and alignment (or <i>Auto</i> gap: space between). The direction, gap and padding are read off how the layers are arranged, and loose layers are wrapped in a new frame. A frame can <b>hug</b> its contents and an item can <b>fill</b> the room that is left, so a button grows with its label and a card with its text, also in an <b>instance</b> whose label you changed. Drag an item to re-order it while the others make room, drop anything into the row at the place you point at, or swap neighbours with the arrow keys. <i>Absolute position</i> takes a layer out of the flow and back under its constraints. <code>Alt+Shift+A</code> removes the layout and leaves everything where it is.
       <h3>Select smarter</h3>
       The <b>Magic wand</b> selects every object that shares a property with the one you click, with a tolerance for near-matching colors. Objects snap to edges and centers of their neighbors with guide lines as you move them, and to their <b>spacing</b>: when the gap to a neighbor matches the gap between two others, the object snaps there and the equal gaps are marked with their size. Turn on <b>rulers</b> with <code>Shift+R</code> and drag <b>guides</b> out of them; objects snap to guides too.
       <h3>Arrange in one step</h3>
@@ -172,7 +174,7 @@ Every screenshot here is the real app.
     </td>
     <td width="33%" valign="top">
       <h4>🗃️ Layers</h4>
-      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree that follows nested frames to any depth, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, components and instances, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment, equal spacing and tidy up of several objects, duplicate with Alt+drag, rotation, flip, and precise position and size fields.
+      <b>Pages</b> above the layer list (add, rename, duplicate, reorder; <code>Page Up</code> / <code>Page Down</code> to switch), a layer tree that follows nested frames to any depth, drag and drop in the Layers panel to reorder layers or move them between frames and groups, groups, components and instances, auto layout, clipping masks, show/hide, lock (`Ctrl+Shift+L`, or the padlock in the Layers panel), bring to front and send to back, alignment, equal spacing and tidy up of several objects, duplicate with Alt+drag, rotation, flip, and precise position and size fields.
     </td>
     <td width="33%" valign="top">
       <h4>💾 Files</h4>
@@ -222,6 +224,8 @@ Every screenshot here is the real app.
 | | | `Ctrl+Alt+K` | Create a component from the selection |
 | | | `Ctrl+Alt+B` | Detach an instance from its main component |
 | | | `Ctrl` + drag a resize handle | Resize a frame without its constraints (the content stays where it is) |
+| | | `Shift+A` / `Alt+Shift+A` | Add auto layout (to a frame, or around the selection) / remove it |
+| | | Arrow keys on an auto-layout item | Swap it with its neighbour |
 | | | `Shift+X` | Swap fill and stroke |
 | | | `Ctrl+V` | Paste at the pointer |
 | | | `Ctrl+Shift+V` | Paste in place (same position, in the frame under the pointer) |

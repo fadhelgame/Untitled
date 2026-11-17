@@ -1,7 +1,9 @@
 //! Panel properti (kanan), toolbar bawah, export, dan loop `update`.
 
+use super::autolayout::{layout_section, sizing_row};
 use super::picker::paint_row;
 use super::*;
+use crate::layout::Sizing;
 
 const FORMATS: [&str; 4] = ["PNG", "JPG", "SVG", "PDF"];
 
@@ -76,6 +78,10 @@ impl App {
                     "Ctrl+Alt+G     clipping mask",
                     "Ctrl+Alt+K     create component",
                     "Ctrl+Alt+B     detach instance",
+                    "Shift+A        add auto layout",
+                    "Alt+Shift+A    remove auto layout",
+                    "Auto layout: drag an item to re-order,",
+                    "      arrows swap it with its neighbour",
                     "Enter          edit text / into a frame",
                     "Shift+Enter    select the parent frame",
                     "Ctrl+\\         hide panels",
@@ -108,6 +114,12 @@ impl App {
         let mut comp_act: Option<super::components::Act> = None;
         let mut constrain: super::constraints::Pair = (None, None);
         let has_parent = self.doc.parent_of(id).is_some();
+        let mut auto_act: Option<super::autolayout::Act> = None;
+        let mut sized: (Option<Sizing>, Option<Sizing>) = (None, None);
+        // In a frame with auto layout, and placed by it (unless set to absolute).
+        let in_auto = self.doc.parent_of(id).and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto());
+        let item = self.doc.auto_item(id);
+        let choices = (self.sizing_choices(id, true), self.sizing_choices(id, false));
         // A part of an instance: its look can be changed, its place, size and name follow the main.
         let pinned = orig.source.is_some();
         let linked = orig.is_linked() || pinned;
@@ -124,16 +136,24 @@ impl App {
             ui.add_enabled_ui(!pinned, |ui| {
                 section(ui, "Position");
                 sub(ui, "Alignment");
-                ui.add_enabled_ui(has_parent, |ui| {
+                ui.add_enabled_ui(has_parent && !item, |ui| {
                     if let Some(mode) = align_buttons(ui) {
                         align = Some(mode);
                     }
                 });
                 sub(ui, "Position");
-                ui.horizontal(|ui| {
-                    field(ui, half, "X", &mut n.x);
-                    field(ui, half, "Y", &mut n.y);
+                ui.add_enabled_ui(!item, |ui| {
+                    ui.horizontal(|ui| {
+                        field(ui, half, "X", &mut n.x);
+                        field(ui, half, "Y", &mut n.y);
+                    });
                 });
+                if in_auto {
+                    ui.checkbox(&mut n.absolute, "Absolute position").on_hover_text("Left out of the auto layout of its frame: it stays where you put it, and follows its constraints when the frame is resized.");
+                    if item {
+                        ui.weak("Placed by the auto layout of its frame.");
+                    }
+                }
                 let spins = !matches!(n.kind, Kind::Frame | Kind::Line);
                 sub(ui, if spins { "Rotation" } else { "Flip" });
                 ui.horizontal(|ui| {
@@ -159,9 +179,17 @@ impl App {
                         n.w = n.w.max(1.0);
                         n.h = n.h.max(1.0);
                     }
+                    sized = sizing_row(ui, half, (Some(n.size_h), Some(n.size_v)), (&choices.0, &choices.1));
                 }
             });
-            if has_parent {
+            if n.kind == Kind::Frame {
+                let locked = (pinned || n.instance_of.is_some()).then_some("The layout of an instance follows its main component.");
+                if n.layout.is_some() || locked.is_none() {
+                    auto_act = layout_section(ui, &mut n.layout, locked, "");
+                }
+            }
+            // An item of an auto layout has nothing to be pinned to.
+            if has_parent && !item {
                 constrain = super::constraints::constraints_section(ui, (Some(n.constrain_h), Some(n.constrain_v)), pinned);
             }
 
@@ -339,8 +367,24 @@ impl App {
             self.set_constraints(constrain);
             return;
         }
+        match auto_act {
+            Some(super::autolayout::Act::Add) => return self.add_auto_layout(),
+            Some(super::autolayout::Act::Remove) => return self.remove_auto_layout(),
+            None => {}
+        }
         if pinned {
             (n.x, n.y, n.w, n.h, n.rotation, n.wrap) = (before.x, before.y, before.w, before.h, before.rotation, before.wrap);
+            n.layout.clone_from(&before.layout);
+            (n.size_h, n.size_v, n.absolute) = (before.size_h, before.size_v, before.absolute);
+        } else {
+            (n.size_h, n.size_v) = (sized.0.unwrap_or(n.size_h), sized.1.unwrap_or(n.size_v));
+            // A size that was typed in is the size: that side no longer hugs or fills.
+            if n.w != before.w {
+                n.size_h = Sizing::Fixed;
+            }
+            if n.h != before.h {
+                n.size_v = Sizing::Fixed;
+            }
         }
         if n == before {
             return;
@@ -397,6 +441,8 @@ impl App {
             let to = (n.x, n.y, n.w, n.h);
             let start = self.undo.last().and_then(|d| d.find(id)).filter(|s| s.kind == Kind::Frame && s.count() == orig.count());
             let mut laid = start.unwrap_or(&orig).clone();
+            laid.layout.clone_from(&n.layout);
+            (laid.size_h, laid.size_v) = (n.size_h, n.size_v);
             crate::layout::set_box(&mut laid, to, crate::layout::Children::Constrain);
             (n.w, n.h, n.children) = (laid.w, laid.h, laid.children);
             self.doc.refit(&mut n, &orig);
@@ -426,6 +472,10 @@ impl App {
         let mixed_stroke = !all(&|n| n.stroke == first.stroke && n.stroke_w == first.stroke_w);
         let mixed_look = !all(&|n| n.opacity == first.opacity && n.blend == first.blend && n.radius == first.radius);
         let mixed_blur = !all(&|n| n.blur == first.blur && n.shadow == first.shadow);
+        // Frames with auto layout of their own (not that of a main component).
+        let auto_all = all(&|n| n.is_auto() && n.instance_of.is_none() && n.source.is_none());
+        let mixed_layout = !all(&|n| n.layout == first.layout);
+        let sizes = (all(&|n| n.size_h == first.size_h).then_some(first.size_h), all(&|n| n.size_v == first.size_v).then_some(first.size_v));
         // Frame tidak bisa diputar.
         let spinnable = all(&|n| n.kind != Kind::Frame);
         let title = if same_kind { format!("{} × {}", first.kind.label(), nodes.len()) } else { "Design".to_owned() };
@@ -446,6 +496,14 @@ impl App {
         let units = self.doc.unit_count(&ids);
         let constrained = self.constraints_shown();
         let mut constrain: super::constraints::Pair = (None, None);
+        let mut auto_act: Option<super::autolayout::Act> = None;
+        let mut sized: (Option<Sizing>, Option<Sizing>) = (None, None);
+        let in_auto = ids.iter().all(|id| self.doc.parent_of(*id).and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto()));
+        // The sizes that every selected layer can have.
+        let choices = [true, false].map(|horizontal| {
+            let lists: Vec<Vec<Sizing>> = ids.iter().map(|id| self.sizing_choices(*id, horizontal)).collect();
+            Sizing::ALL.into_iter().filter(|s| lists.iter().all(|l| l.contains(s))).collect::<Vec<_>>()
+        });
         const MIXED: &str = "Mixed — showing the first layer; a change applies to all.";
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -485,6 +543,13 @@ impl App {
                 }
                 flip = flip_buttons(ui);
             });
+            if !pinned {
+                sized = sizing_row(ui, half, sizes, (&choices[0], &choices[1]));
+                if in_auto {
+                    ui.checkbox(&mut n.absolute, "Absolute position").on_hover_text("Left out of the auto layout of their frame: they stay where you put them.");
+                }
+                auto_act = if auto_all { layout_section(ui, &mut n.layout, None, if mixed_layout { MIXED } else { "" }) } else { layout_section(ui, &mut None, None, "") };
+            }
             if let Some(shown) = constrained {
                 constrain = super::constraints::constraints_section(ui, shown, pinned);
             }
@@ -581,7 +646,12 @@ impl App {
             self.set_constraints(constrain);
             return;
         }
-        if n == before {
+        match auto_act {
+            Some(super::autolayout::Act::Add) => return self.add_auto_layout(),
+            Some(super::autolayout::Act::Remove) => return self.remove_auto_layout(),
+            None => {}
+        }
+        if n == before && sized == (None, None) {
             return;
         }
         // Perubahan beruntun pada seleksi yang sama digabung jadi satu langkah undo.
@@ -609,6 +679,33 @@ impl App {
         let paint = n.fill != before.fill || n.gradient != before.gradient;
         for id in ids {
             let Some(t) = self.doc.find_mut(id) else { continue };
+            (t.size_h, t.size_v) = (sized.0.unwrap_or(t.size_h), sized.1.unwrap_or(t.size_v));
+            if n.absolute != before.absolute {
+                t.absolute = n.absolute;
+            }
+            if let (Some(new), Some(old), Some(l)) = (&n.layout, &before.layout, &mut t.layout) {
+                // Only what was changed in the panel; the rest of each layout stays its own.
+                if (new.dir, new.wrap) != (old.dir, old.wrap) {
+                    (l.dir, l.wrap) = (new.dir, new.wrap);
+                }
+                if new.gap != old.gap {
+                    l.gap = new.gap;
+                }
+                if new.row_gap != old.row_gap {
+                    l.row_gap = new.row_gap;
+                }
+                for i in 0..4 {
+                    if new.pad[i] != old.pad[i] {
+                        l.pad[i] = new.pad[i];
+                    }
+                }
+                if new.align != old.align {
+                    l.align = new.align;
+                }
+                if new.cross != old.cross {
+                    l.cross = new.cross;
+                }
+            }
             if n.shadow != before.shadow {
                 t.shadow = n.shadow;
             }
@@ -1350,7 +1447,7 @@ impl eframe::App for App {
             self.title = title;
         }
         // After everything that edits the document, before it is saved.
-        self.sync_components();
+        self.settle_doc();
         self.autosave(ctx);
         self.run_bench(ctx);
     }

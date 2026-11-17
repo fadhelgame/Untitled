@@ -1,7 +1,7 @@
 //! Model dokumen. Node level atas disimpan sebagai `Arc<Node>` supaya snapshot
 //! undo berbagi memori untuk frame yang tidak berubah (ratusan frame tetap murah).
 
-use crate::layout::Constraint;
+use crate::layout::{AutoLayout, Constraint, Sizing};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -351,6 +351,18 @@ pub struct Node {
     pub constrain_h: Constraint,
     #[serde(default, skip_serializing_if = "Constraint::is_default")]
     pub constrain_v: Constraint,
+    /// A frame that places its children itself: in a row, a column or wrapping rows. See `layout.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<AutoLayout>,
+    /// How wide and high this node is: as set, as large as what it holds (a frame with `layout`),
+    /// or as much as the auto layout of the frame around it has left.
+    #[serde(default, skip_serializing_if = "Sizing::is_default")]
+    pub size_h: Sizing,
+    #[serde(default, skip_serializing_if = "Sizing::is_default")]
+    pub size_v: Sizing,
+    /// In a frame with `layout`: left out of it, placed by hand and by its constraints.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub absolute: bool,
     #[serde(default)]
     pub children: Vec<Node>,
 }
@@ -704,6 +716,10 @@ impl Node {
             source: None,
             constrain_h: Constraint::Min,
             constrain_v: Constraint::Min,
+            layout: None,
+            size_h: Sizing::Fixed,
+            size_v: Sizing::Fixed,
+            absolute: false,
             children: Vec::new(),
         }
     }

@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 mod assist;
+mod autolayout;
 pub(crate) mod blend;
 mod builder;
 mod canvas;
@@ -178,6 +179,11 @@ fn scale_node(n: &mut Node, s: f32, ax: f32, ay: f32) {
         q.r = q.r.map(|r| r * s);
     }
     n.blur *= s;
+    if let Some(l) = &mut n.layout {
+        l.gap *= s;
+        l.row_gap *= s;
+        l.pad = l.pad.map(|p| p * s);
+    }
     n.font_size = (n.font_size * s).max(1.0);
     for span in &mut n.spans {
         span.style.size = (span.style.size * s).max(1.0);
@@ -386,6 +392,8 @@ pub struct App {
     about: bool,
     /// The Components window, and what instances were last synced against.
     components: components::Components,
+    /// Where the item being dragged will land in an auto layout: a line, in world coordinates.
+    drop_mark: Option<[Pos2; 2]>,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -473,6 +481,7 @@ impl App {
             crop: None,
             about: false,
             components: Default::default(),
+            drop_mark: None,
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -596,7 +605,7 @@ impl App {
             8 => return self.tidy_up(),
             _ => {}
         }
-        if self.refuse_pinned() {
+        if self.refuse_pinned() || self.refuse_auto_items() {
             return;
         }
         let ids = self.roots();
@@ -629,7 +638,7 @@ impl App {
 
     /// Alt+Shift+H / Alt+Shift+V: equal gaps between the selected objects (a group is one).
     fn distribute(&mut self, horizontal: bool) {
-        if self.sel.is_empty() || self.sel_locked() || self.refuse_pinned() {
+        if self.sel.is_empty() || self.sel_locked() || self.refuse_pinned() || self.refuse_auto_items() {
             return;
         }
         let pre = self.doc.clone();
@@ -642,7 +651,7 @@ impl App {
 
     /// Ctrl+Alt+T: straighten a row or a column, or snap a loose layout into a grid.
     fn tidy_up(&mut self) {
-        if self.sel.is_empty() || self.sel_locked() || self.refuse_pinned() {
+        if self.sel.is_empty() || self.sel_locked() || self.refuse_pinned() || self.refuse_auto_items() {
             return;
         }
         let pre = self.doc.clone();
@@ -1064,6 +1073,7 @@ impl App {
         self.doc.regroup(&mut nodes);
         self.sel.clear();
         for mut n in nodes {
+            let source = n.id;
             // A copy of a main component is an instance of it (see `Doc::settle_copy`).
             if !self.doc.settle_copy(&mut n) {
                 self.doc.reassign_ids(&mut n);
@@ -1075,14 +1085,23 @@ impl App {
             // Where it would come to contain itself, it goes to the top level instead.
             let parent = parent.filter(|_| self.may_enter(&n, parent));
             self.sel.push(n.id);
-            self.doc.insert(n, parent);
+            // In an auto layout it is an item: right after the one it was copied from, or else
+            // where it was put.
+            let at = parent.and_then(|p| self.doc.find(p)).filter(|f| f.is_auto()).map(|f| match f.children.iter().position(|c| c.id == source) {
+                Some(i) => i + 1,
+                None => crate::layout::insert_index(f, &[], cx, cy),
+            });
+            match at {
+                Some(at) => self.doc.insert_at(n, parent, at),
+                None => self.doc.insert(n, parent),
+            }
         }
         self.push_undo(pre);
     }
 
     fn nudge(&mut self, dx: f32, dy: f32) {
         let ids = self.roots();
-        if ids.is_empty() || self.sel_locked() || self.refuse_pinned() {
+        if ids.is_empty() || self.sel_locked() || self.refuse_pinned() || self.swap_items(dx, dy) {
             return;
         }
         let pre = self.doc.clone();
@@ -1454,6 +1473,9 @@ impl App {
                 Key::I if plain => self.toggle_eyedropper(),
                 // Rata: Alt+A/D kiri/kanan, Alt+W/S atas/bawah, Alt+H/V tengah
                 // Alt+Shift+H/V jarak sama rata, Ctrl+Alt+T rapikan, Shift+H/V balik
+                // Shift+A auto layout, Alt+Shift+A lepas
+                Key::A if a && s && !c => self.remove_auto_layout(),
+                Key::A if s && !c && !a => self.add_auto_layout(),
                 Key::H if a && s && !c => self.distribute(true),
                 Key::V if a && s && !c => self.distribute(false),
                 Key::T if c && a => self.tidy_up(),
@@ -1652,6 +1674,16 @@ impl App {
                 if ui.add_enabled(several, egui::Button::new("Tidy up").shortcut_text("Ctrl+Alt+T")).clicked() {
                     ui.close_menu();
                     self.tidy_up();
+                }
+                ui.separator();
+                if ui.add_enabled(has_sel, egui::Button::new("Add auto layout").shortcut_text("Shift+A")).clicked() {
+                    ui.close_menu();
+                    self.add_auto_layout();
+                }
+                let auto = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.is_auto()));
+                if ui.add_enabled(auto, egui::Button::new("Remove auto layout").shortcut_text("Alt+Shift+A")).clicked() {
+                    ui.close_menu();
+                    self.remove_auto_layout();
                 }
                 ui.separator();
                 if ui.add_enabled(has_sel, egui::Button::new("Create component").shortcut_text("Ctrl+Alt+K")).clicked() {
@@ -2374,6 +2406,13 @@ impl App {
                     b.inject.extend((1..=8u32).map(|s| (202 + s, mv(from + (to - from) * (s as f32 / 8.0)))));
                     b.inject.push((212, button(to, false)));
                 }
+                // `KANVAS_BENCH_AUTOLAYOUT=1`: a card, an instance of a button with a longer label
+                // and a row of boxes (see `bench_autolayout`). Later, with the mouse: box A is
+                // dragged past box C; then the arrow keys, undo, and remote commands. The boxes are
+                // printed to stderr beside what they should be. `=drag` stops with the box in the air; `=multi` ends with the two buttons selected.
+                if std::env::var("KANVAS_BENCH_AUTOLAYOUT").is_ok() {
+                    b.ids = self.bench_autolayout();
+                }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
                     let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
@@ -2748,6 +2787,152 @@ impl App {
                         _ => {}
                     }
                 }
+                let auto = b.ids.len() == 11 && std::env::var_os("KANVAS_BENCH_AUTOLAYOUT").is_some();
+                if auto {
+                    let ids = b.ids.clone();
+                    let (card, title, buttons, primary, cancel, chips, pill, inst, label, boxes, first) = (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6], ids[7], ids[8], ids[9], ids[10]);
+                    // The box of a node, from the corner of the frame it is in.
+                    let at = |app: &Self, id: u64| {
+                        let o = app.doc.parent_of(id).and_then(|p| app.doc.find(p)).map_or((0.0, 0.0), |p| (p.x, p.y));
+                        app.doc.find(id).map_or((0.0, 0.0, 0.0, 0.0), |n| (n.x - o.0, n.y - o.1, n.w, n.h))
+                    };
+                    let row = |app: &Self, id: u64| app.doc.find(id).map(|f| f.children.iter().map(|c| format!("{} at {:.0}", c.name, c.x - f.x)).collect::<Vec<_>>()).unwrap_or_default();
+                    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+                    let hold = std::env::var("KANVAS_BENCH_AUTOLAYOUT").is_ok_and(|m| m == "drag");
+                    match b.frame {
+                        264 => {
+                            let (c, t, r, p, k, ch) = (at(self, card), at(self, title), at(self, buttons), at(self, primary), at(self, cancel), at(self, chips));
+                            let text = |app: &Self, frame: u64| app.doc.find(frame).and_then(|f| f.children.first()).map_or((0.0, 0.0), |c| (c.w, c.h));
+                            eprintln!("AUTOLAYOUT card {c:?}, title {t:?}, buttons {r:?}, fill button {p:?}, hug button {k:?}, chips {ch:?}");
+                            eprintln!(
+                                "AUTOLAYOUT card hugs its height ({} = 24 + {} + 16 + {} + 16 + {} + 24): {}",
+                                c.3,
+                                t.3,
+                                r.3,
+                                ch.3,
+                                near(c.3, 24.0 + t.3 + 16.0 + r.3 + 16.0 + ch.3 + 24.0) && c.2 == 360.0
+                            );
+                            eprintln!("AUTOLAYOUT rows fill the card (312 wide at 24): {}", (r.0, r.2, ch.0, ch.2) == (24.0, 312.0, 24.0, 312.0) && near(r.1, 24.0 + t.3 + 16.0));
+                            let (pt, kt) = (text(self, primary), text(self, cancel));
+                            eprintln!(
+                                "AUTOLAYOUT hug button is its label and padding ({} = 32 + {}), fill button takes the rest ({} = 312 - 12 - {}), its label in the middle: {}",
+                                k.2,
+                                kt.0,
+                                p.2,
+                                k.2,
+                                near(k.2, 32.0 + kt.0) && near(k.3, 20.0 + kt.1) && near(p.2, 300.0 - k.2) && near(k.0, p.2 + 12.0) && near(at(self, self.doc.find(primary).map_or(0, |f| f.children[0].id)).0, (p.2 - pt.0) * 0.5)
+                            );
+                            let chip: Vec<(f32, f32, f32, f32)> = self.doc.find(chips).map(|f| f.children.iter().map(|c| (c.x - f.x, c.y - f.y, c.w, c.h)).collect()).unwrap_or_default();
+                            let mut rows: Vec<f32> = chip.iter().map(|c| c.1).collect();
+                            rows.dedup();
+                            let fits = chip.iter().all(|c| c.0 + c.2 <= 312.01) && chip.windows(2).all(|w| w[1].1 > w[0].1 || near(w[1].0, w[0].0 + w[0].2 + 8.0));
+                            eprintln!("AUTOLAYOUT chips {chip:?}: {} rows, each within 312 and 8 apart: {}", rows.len(), fits && rows.len() > 1 && near(ch.3, chip.last().map_or(0.0, |c| c.1 + c.3)));
+                            let (m, i, l) = (at(self, pill), at(self, inst), at(self, label));
+                            let own = self.doc.find(label).map(|n| n.text.clone()).unwrap_or_default();
+                            eprintln!("AUTOLAYOUT main {}x{}, instance {}x{} with \"{own}\" {}x{} at ({}, {}): grows around its label: {}", m.2, m.3, i.2, i.3, l.2, l.3, l.0, l.1, i.2 > m.2 + 50.0 && near(i.2, 36.0 + l.2) && (l.0, l.1) == (18.0, 10.0));
+                            eprintln!("AUTOLAYOUT boxes {:?} in {:?} (want A at 10, B at 80, C at 150 in a frame of 220 x 60)", row(self, boxes), at(self, boxes));
+                            // Drag box A to the right of box C (A is selected: a click would pick the row).
+                            self.sel = vec![first];
+                            let (o, f) = (self.canvas_rect.min, self.doc.find(boxes).map_or((0.0, 0.0), |f| (f.x, f.y)));
+                            let (from, to) = (self.view.to_screen(o, f.0 + 40.0, f.1 + 30.0), self.view.to_screen(o, f.0 + 200.0, f.1 + 36.0));
+                            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                            let mv = egui::Event::PointerMoved;
+                            b.inject.extend([(270, mv(from)), (272, button(from, true))]);
+                            b.inject.extend((1..=8u32).map(|s| (272 + s, mv(from + (to - from) * (s as f32 / 8.0)))));
+                            if !hold {
+                                b.inject.push((286, button(to, false)));
+                            }
+                        }
+                        277 => eprintln!("AUTOLAYOUT halfway through the drag: {:?}, mark {:?}", row(self, boxes), self.drop_mark.is_some()),
+                        284 => eprintln!("AUTOLAYOUT at the end of the drag, button still down: {:?} (want B at 10, C at 80, A in the air), frame {:?}", row(self, boxes), at(self, boxes)),
+                        300 if !hold => {
+                            eprintln!("AUTOLAYOUT after the drag: {:?} (want B at 10, C at 80, A at 150), selected {:?}, undo steps {}", row(self, boxes), self.sel == [first], self.undo.len());
+                            self.do_undo();
+                        }
+                        302 if !hold => {
+                            eprintln!("AUTOLAYOUT drag undone: {:?} (want A at 10, B at 80, C at 150)", row(self, boxes));
+                            self.do_redo();
+                        }
+                        304 if !hold => {
+                            // The arrow keys: A back to the front, one place at a time; up and down do nothing in a row.
+                            self.sel = vec![first];
+                            self.nudge(-1.0, 0.0);
+                            self.nudge(0.0, 1.0);
+                        }
+                        306 if !hold => {
+                            eprintln!("AUTOLAYOUT arrow left: {:?} (want B at 10, A at 80, C at 150)", row(self, boxes));
+                            // A duplicate lands right after its original; a paste goes by where it is put.
+                            let nodes = self.selected_nodes();
+                            self.add_nodes(nodes, vec2(24.0, 24.0), None);
+                        }
+                        308 if !hold => {
+                            eprintln!("AUTOLAYOUT duplicate of A: {:?} (want B at 10, A at 80, A at 150, C at 220)", row(self, boxes));
+                            self.do_undo();
+                            // Resizing by a handle fixes that side: the fill button stops filling.
+                            self.sel = vec![primary];
+                            self.edit_selected(|n| n.absolute = true);
+                        }
+                        310 if !hold => {
+                            eprintln!("AUTOLAYOUT fill button taken out of the layout: buttons {:?}, hug button {:?} (want it at 0)", at(self, buttons), at(self, cancel));
+                            self.do_undo();
+                        }
+                        312 if !hold => {
+                            use serde_json::json;
+                            let stage = self.doc.parent_of(card).unwrap_or_default();
+                            let run = |app: &mut Self, cmd: &str, args: serde_json::Value| {
+                                let answer = app.remote_bench(cmd, &args);
+                                eprintln!("AUTOLAYOUT remote {cmd} {args} -> {}", answer.chars().take(420).collect::<String>());
+                            };
+                            run(self, "create_nodes", json!({ "parent": stage, "nodes": [{ "kind": "frame", "name": "Remote row", "x": 460, "y": 360, "fill": "#e8ecf2", "layout": { "gap": 10, "padding": [10, 10], "cross_align": "center" }, "children": [
+                                { "kind": "rect", "name": "One", "w": 50, "h": 30, "x": 400, "fill": "#0d99ff" },
+                                { "kind": "rect", "name": "Two", "w": 50, "h": 20, "sizing": { "horizontal": "fill" }, "fill": "#14ae5c" },
+                            ] }] }));
+                            let made = self.doc.find(stage).and_then(|s| s.children.iter().find(|c| c.name == "Remote row")).map(|c| (c.id, c.children[1].id)).unwrap_or_default();
+                            eprintln!("AUTOLAYOUT remote row: {:?} {:?} (want 130 x 50 hugging: One at 10, Two at 70)", at(self, made.0), row(self, made.0));
+                            run(self, "update_nodes", json!({ "nodes": [{ "id": made.0, "w": 300 }, { "id": made.1, "x": 3 }] }));
+                            eprintln!("AUTOLAYOUT remote row 300 wide: {:?}, Two {:?} (want Two at 70, 220 wide, 15 down)", at(self, made.0), at(self, made.1));
+                            run(self, "update_nodes", json!({ "nodes": [{ "id": made.0, "layout": { "direction": "vertical", "gap": 4, "width": "hug" } }] }));
+                            eprintln!("AUTOLAYOUT remote column: {:?}, Two {:?} (want 240 x 74: it hugs now, around Two as wide as it was, with One in the middle)", at(self, made.0), at(self, made.1));
+                            run(self, "get_document", json!({ "ids": [made.0] }));
+                            run(self, "update_nodes", json!({ "nodes": [{ "id": made.0, "layout": null }] }));
+                            eprintln!("AUTOLAYOUT remote layout removed: {:?}, layout {:?}, Two {:?}", at(self, made.0), self.doc.find(made.0).map(|n| (n.layout.is_some(), n.size_h, n.size_v)), self.doc.find(made.1).map(|n| (n.size_h, n.x)));
+                            // The right handle of the hug button dragged 30 px outward.
+                            self.sel = vec![cancel];
+                            let (o, n) = (self.canvas_rect.min, self.doc.find(cancel).map_or((0.0, 0.0), |n| (n.x + n.w, n.y + n.h * 0.5)));
+                            let from = self.view.to_screen(o, n.0, n.1);
+                            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                            let mv = egui::Event::PointerMoved;
+                            b.inject.extend([(316, mv(from)), (318, button(from, true))]);
+                            b.inject.extend((1..=6u32).map(|s| (318 + s, mv(from + vec2(5.0 * s as f32, 0.0)))));
+                            b.inject.push((328, button(from + vec2(30.0, 0.0), false)));
+                        }
+                        322 | 332 if !hold => {
+                            let sizes = self.doc.find(cancel).map(|n| (n.size_h, n.size_v));
+                            eprintln!("AUTOLAYOUT hug button {} by its handle: {:?} {sizes:?}, fill button {:?}, zoom {} (want Fixed, Hug; the two still 300 wide together: {})", if b.frame == 322 { "being resized" } else { "resized" }, at(self, cancel), at(self, primary), self.view.zoom, near(at(self, cancel).2 + at(self, primary).2, 300.0));
+                            if b.frame == 332 {
+                                self.do_undo();
+                            }
+                        }
+                        334 if !hold => {
+                            // Typing in the label of the hug button: the row follows while the text is being edited.
+                            eprintln!("AUTOLAYOUT resize undone: hug button {:?} {:?}", at(self, cancel), self.doc.find(cancel).map(|n| n.size_h));
+                            let text = self.doc.find(cancel).map_or(0, |f| f.children[0].id);
+                            self.start_text_edit(text, self.doc.clone());
+                            b.inject.push((338, egui::Event::Text(" all".into())));
+                        }
+                        346 | 352 if !hold => {
+                            let label = self.doc.find(cancel).map(|f| (f.children[0].text.clone(), f.children[0].w));
+                            let ok = label.as_ref().is_some_and(|l| near(at(self, cancel).2, 32.0 + l.1)) && near(at(self, cancel).2 + at(self, primary).2, 300.0);
+                            eprintln!("AUTOLAYOUT {}: label {label:?}, hug button {:?}, fill button {:?}, card {:?}: the button hugs it and the other one gives way: {ok}", if b.frame == 346 { "while typing" } else { "typing done" }, at(self, cancel), at(self, primary), at(self, card));
+                            if b.frame == 346 {
+                                self.finish_text_edit();
+                            } else {
+                                self.sel = if std::env::var("KANVAS_BENCH_AUTOLAYOUT").is_ok_and(|m| m == "multi") { vec![primary, cancel] } else { vec![card] };
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let component = b.ids.len() == 6 && std::env::var_os("KANVAS_BENCH_COMPONENT").is_some();
                 if component {
                     let (main_rect, main_label, wide, own) = (b.ids[1], b.ids[2], b.ids[3], b.ids[4]);
@@ -2832,7 +3017,7 @@ impl App {
                         _ => {}
                     }
                 }
-                let settled = b.frame > if nested { 760 } else if component { 640 } else { 260 };
+                let settled = b.frame > if nested { 760 } else if component { 640 } else if auto { 356 } else { 260 };
                 let ready = !self.fonts.any_loading() && !self.icons.busy() && !self.photos.busy() && !self.library.busy() && settled && (self.fonts.preview_count() >= 8 || b.frame > 700);
                 if !b.shot && (ready || b.frame > 1500) {
                     b.shot = true;

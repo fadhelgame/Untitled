@@ -17,10 +17,11 @@ pub(super) struct Components {
     pub open: bool,
     filter: String,
     focus: bool,
-    /// The document as it was when instances were last brought in line with their mains.
+    /// The document as it was when instances were last brought in line with their mains (and
+    /// its auto layouts laid out, see `App::settle`).
     /// `None`: take the document as it is (just opened, or after undo / redo).
-    base: Option<Doc>,
-    rev: u64,
+    pub base: Option<Doc>,
+    pub rev: u64,
 }
 
 impl Components {
@@ -99,26 +100,6 @@ impl App {
             return false;
         }
         true
-    }
-
-    /// Bring instances in line with their mains. Called once per frame, after everything that
-    /// can edit the document, and does nothing unless the document was committed to since the
-    /// last time (`touch`). Edits commit in different ways (some push the undo step before
-    /// they change anything), so the comparison is against the document of the last call
-    /// rather than against an undo snapshot.
-    pub(super) fn sync_components(&mut self) {
-        if self.components.rev == self.ext.rev && self.components.base.is_some() {
-            return;
-        }
-        if let Some(base) = self.components.base.take() {
-            if self.doc.sync_components(&base) {
-                // Parts whose layer was removed from the main are gone.
-                let doc = &self.doc;
-                self.sel.retain(|id| doc.find(*id).is_some());
-            }
-        }
-        self.components.base = Some(self.doc.clone());
-        self.components.rev = self.ext.rev;
     }
 
     /// Ctrl+Alt+K: the selected frame becomes a main component; anything else is wrapped in one.
@@ -405,9 +386,9 @@ impl App {
         let o = self.canvas_rect.min;
         let wide = self.insert_instance(button_id, Some(self.view.to_screen(o, x + 500.0, y + 240.0))).unwrap_or_default();
         // Each step is a frame of its own for a user; instances are brought in line once per frame.
-        self.sync_components();
+        self.settle_doc();
         self.edit_selected(|n| (n.w, n.h) = (n.w * 2.0, n.h * 2.0));
-        self.sync_components();
+        self.settle_doc();
         let own = self.insert_instance(button_id, Some(self.view.to_screen(o, x + 240.0, y + 620.0))).unwrap_or_default();
         let parts: Vec<u64> = self.doc.find(own).map(|n| n.children.iter().map(|c| c.id).collect()).unwrap_or_default();
         if let [rect, text] = parts[..] {

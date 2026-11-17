@@ -14,7 +14,7 @@ use super::render::{self, PenPt};
 use super::{blend, App, Drag};
 use crate::doc::{b64, Doc, Gradient, Kind, Node, Stop};
 use crate::export;
-use crate::layout::{self, Children, Constraint};
+use crate::layout::{self, Align, AutoLayout, Children, Constraint, Dir, Sizing};
 use crate::fonts::CatalogState;
 use eframe::egui;
 use serde_json::{json, Map, Value};
@@ -274,6 +274,88 @@ fn brief(n: &Node, o: (f32, f32)) -> Value {
     v
 }
 
+const POSITIONED: &str = "x / y of an item of an auto-layout frame are set by that frame and were ignored (items follow the order of `children`; set `absolute: true` on a node to place it by hand).";
+
+/// Was this node (as specified) given a place of its own, without being taken out of the layout?
+fn placed_by_hand(spec: &Value) -> bool {
+    (spec.get("x").is_some() || spec.get("y").is_some()) && spec.get("absolute").and_then(Value::as_bool) != Some(true)
+}
+
+fn parse_sizing(key: &str, v: &Value) -> Result<Sizing, String> {
+    let name = string(key, v)?;
+    Sizing::parse(&name).ok_or_else(|| format!("unknown `{key}` \"{name}\"; use fixed, hug (a frame with `layout`: as large as its items) or fill (an item of an auto-layout frame: the room that is left)"))
+}
+
+/// The auto layout of a frame as the remote API has it, with the frame's own sizes.
+fn layout_json(l: &AutoLayout, n: &Node) -> Value {
+    let mut v = json!({
+        "direction": if l.dir == Dir::Horizontal { "horizontal" } else { "vertical" },
+        "gap": r2(l.gap),
+        "padding": l.pad.iter().map(|p| r2(*p)).collect::<Vec<_>>(),
+        "align": l.align.key(),
+        "cross_align": l.cross.key(),
+        "width": n.size_h.key(),
+        "height": n.size_v.key(),
+    });
+    if l.wrap {
+        v["wrap"] = json!(true);
+        v["row_gap"] = r2(l.row_gap);
+    }
+    v
+}
+
+/// Merge the keys of a `layout` object into the auto layout of frame `n` (a new one is a row
+/// without gap or padding). Result: whether `width` / `height` were among them.
+fn set_layout(n: &mut Node, v: &Value) -> Result<(bool, bool), String> {
+    let m = v.as_object().ok_or("`layout` must be an object like {\"direction\": \"vertical\", \"gap\": 12, \"padding\": 16}, or null to remove the auto layout")?;
+    let mut l = n.layout.clone().unwrap_or_default();
+    let mut sized = (false, false);
+    let place = |key: &str, v: &Value, between: bool| -> Result<Align, String> {
+        let name = string(key, v)?;
+        Align::parse(&name).filter(|a| between || *a != Align::Between).ok_or_else(|| format!("unknown `{key}` \"{name}\"; use start, center{}", if between { ", end or space_between" } else { " or end" }))
+    };
+    for (k, v) in m {
+        match k.as_str() {
+            "direction" => {
+                l.dir = match string(k, v)?.as_str() {
+                    "horizontal" => Dir::Horizontal,
+                    "vertical" => Dir::Vertical,
+                    other => return Err(format!("unknown direction \"{other}\"; use horizontal or vertical")),
+                }
+            }
+            "wrap" => l.wrap = flag(k, v)?,
+            // "auto" is how the Design panel names space between.
+            "gap" if v.as_str() == Some("auto") => l.align = Align::Between,
+            "gap" => l.gap = num(k, v)?.max(0.0),
+            "row_gap" => l.row_gap = num(k, v)?.max(0.0),
+            "padding" => {
+                let side = |v: &Value| num("padding", v).map(|p| p.max(0.0));
+                l.pad = match (v, v.as_array().map(Vec::as_slice)) {
+                    (_, Some([h, v])) => [side(h)?, side(v)?, side(h)?, side(v)?],
+                    (_, Some([a, b, c, d])) => [side(a)?, side(b)?, side(c)?, side(d)?],
+                    (Value::Object(o), _) => {
+                        let mut pad = l.pad;
+                        for (name, v) in o {
+                            let i = ["left", "top", "right", "bottom"].iter().position(|s| s == name).ok_or_else(|| format!("unknown side `{name}` in `padding`; use left, top, right and bottom"))?;
+                            pad[i] = side(v)?;
+                        }
+                        pad
+                    }
+                    (Value::Number(_), _) => [side(v)?; 4],
+                    _ => return Err("`padding` must be a number (all sides), [horizontal, vertical], [left, top, right, bottom] or {left, top, right, bottom}".into()),
+                }
+            }
+            "align" => l.align = place(k, v, true)?,
+            "cross_align" => l.cross = place(k, v, false)?,
+            "width" => (n.size_h, sized.0) = (parse_sizing(k, v)?, true),
+            "height" => (n.size_v, sized.1) = (parse_sizing(k, v)?, true),
+            other => return Err(format!("unknown key `{other}` in `layout`; use direction, wrap, gap, row_gap, padding, align, cross_align, width and height")),
+        }
+    }
+    n.layout = Some(l);
+    Ok(sized)
+}
+
 /// Properti node; nilai bawaan dilewati supaya ringkas. `deep` = sertakan anak dan titik path.
 fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     let mut m = Map::new();
@@ -342,6 +424,14 @@ fn describe(n: &Node, o: (f32, f32), deep: bool) -> Value {
     }
     if !n.constrain_h.is_default() || !n.constrain_v.is_default() {
         put("constraints", json!({ "horizontal": n.constrain_h.key(true), "vertical": n.constrain_v.key(false) }));
+    }
+    match &n.layout {
+        Some(l) => put("layout", layout_json(l, n)),
+        None if n.size_h != Sizing::Fixed || n.size_v != Sizing::Fixed => put("sizing", json!({ "horizontal": n.size_h.key(), "vertical": n.size_v.key() })),
+        None => {}
+    }
+    if n.absolute {
+        put("absolute", json!(true));
     }
     if n.component {
         put("component", json!(true));
@@ -460,7 +550,7 @@ impl App {
             while let Ok(req) = remote.rx.try_recv() {
                 let outcome = self.remote_run(&req.cmd, &req.args);
                 // Instances follow at once, so the next command reads a document that is in line.
-                self.sync_components();
+                self.settle_doc();
                 match outcome {
                     Ok(Outcome::Now(v)) => {
                         let _ = req.reply.send(ok(v));
@@ -494,7 +584,7 @@ impl App {
     /// in that mode). Result: the answer as text; for created / updated nodes just their ids.
     pub(super) fn remote_bench(&mut self, cmd: &str, args: &Value) -> String {
         let outcome = self.remote_run(cmd, args);
-        self.sync_components();
+        self.settle_doc();
         match outcome {
             Ok(Outcome::Now(v)) => v.to_string(),
             Ok(Outcome::Later(After::Nodes { ids, .. }, _)) => format!("ids {ids:?}"),
@@ -633,8 +723,10 @@ impl App {
                 for id in texts {
                     self.measure_text(ctx, id);
                 }
-                // A text measured in a main component has a new size for its instances too.
+                // A text that was measured has a new size for the auto layout it sits in, and
+                // in a main component for its instances too: the answer has the boxes as they end up.
                 self.components.recheck();
+                self.settle_doc();
                 let list: Vec<Value> = ids.iter().filter_map(|id| self.doc.find(*id).map(|n| brief(n, self.origin_of(*id)))).collect();
                 let mut result = json!({ key: list });
                 if !warnings.is_empty() {
@@ -753,10 +845,35 @@ impl App {
             }
             set_world_points(n, &pts);
         }
+        let had_layout = n.layout.is_some();
         for (k, v) in m {
             let k = k.as_str();
             match k {
                 "id" | "points" | "spans" | "parent" => {}
+                "layout" => {
+                    if n.kind != Kind::Frame {
+                        return Err("`layout` only applies to frames".into());
+                    }
+                    if n.instance_of.is_some() || n.source.is_some() {
+                        return Err("the layout of an instance follows its main component; set `layout` there".into());
+                    }
+                    if v.is_null() {
+                        n.layout = None;
+                    } else {
+                        set_layout(n, v)?;
+                    }
+                }
+                "sizing" => {
+                    let s = v.as_object().ok_or("`sizing` must be an object like {\"horizontal\": \"fill\", \"vertical\": \"fixed\"}")?;
+                    for (axis, value) in s {
+                        match axis.as_str() {
+                            "horizontal" => n.size_h = parse_sizing(axis, value)?,
+                            "vertical" => n.size_v = parse_sizing(axis, value)?,
+                            other => return Err(format!("unknown key `{other}` in `sizing`; use horizontal and vertical")),
+                        }
+                    }
+                }
+                "absolute" => n.absolute = flag(k, v)?,
                 "kind" | "children" | "instance_of" if creating => {}
                 "instance_of" => return Err("`instance_of` can't be changed; create a new instance instead".into()),
                 "component" => {
@@ -897,6 +1014,19 @@ impl App {
                 other => return Err(format!("unknown property `{other}`")),
             }
         }
+        // A size that is given is the size, unless the same call says how that side is sized;
+        // a new auto layout hugs its items on the sides that were not given one.
+        for (horizontal, size, axis, side) in [(true, "w", "horizontal", "width"), (false, "h", "vertical", "height")] {
+            let said = m.get("sizing").is_some_and(|s| s.get(axis).is_some()) || m.get("layout").is_some_and(|l| l.get(side).is_some());
+            if said {
+                continue;
+            }
+            if m.contains_key(size) {
+                n.set_sizing(horizontal, Sizing::Fixed);
+            } else if n.layout.is_some() && !had_layout {
+                n.set_sizing(horizontal, Sizing::Hug);
+            }
+        }
         if let Some(v) = m.get("spans") {
             if n.kind != Kind::Text {
                 return Err("`spans` only applies to text nodes".into());
@@ -993,6 +1123,9 @@ impl App {
                         let c = self.build(c, (n.x, n.y), true, notes).map_err(|e| format!("children[{i}]: {e}"))?;
                         n.children.push(c);
                     }
+                    if n.layout.is_some() && list.iter().any(placed_by_hand) && !notes.warnings.iter().any(|w| w == POSITIONED) {
+                        notes.warnings.push(POSITIONED.into());
+                    }
                 }
             }
             _ => {}
@@ -1062,6 +1195,9 @@ impl App {
         let specs = args.get("nodes").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or("`nodes` must be a non-empty array")?;
         let pre = self.doc.clone();
         let mut notes = Notes::default();
+        if parent.and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto()) && specs.iter().any(placed_by_hand) {
+            notes.warnings.push(POSITIONED.into());
+        }
         let mut ids = Vec::with_capacity(specs.len());
         for (i, spec) in specs.iter().enumerate() {
             match self.build(spec, o, parent.is_some(), &mut notes).and_then(|n| self.may_hold(&n, parent).map(|_| n)) {
@@ -1125,7 +1261,7 @@ impl App {
             return Err("a frame can't be moved into itself or into something inside it".into());
         }
         if n.source.is_some() {
-            let fixed = ["x", "y", "w", "h", "rotation", "name", "points", "closed", "wrap", "parent", "component", "constraints"];
+            let fixed = ["x", "y", "w", "h", "rotation", "name", "points", "closed", "wrap", "parent", "component", "constraints", "layout", "sizing", "absolute"];
             if let Some(k) = m.keys().find(|k| fixed.contains(&k.as_str())) {
                 return Err(format!("node {id} is part of an instance: `{k}` follows the main component (only its look and text can be changed). Edit the main component, or detach the instance."));
             }
@@ -1135,6 +1271,10 @@ impl App {
         }
         let was = n.clone();
         self.apply(&mut n, m, o, false, notes)?;
+        let item = !n.absolute && target.and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto());
+        if item && (m.contains_key("x") || m.contains_key("y")) && !notes.warnings.iter().any(|w| w == POSITIONED) {
+            notes.warnings.push(POSITIONED.into());
+        }
         if n.kind == Kind::Frame && (n.w, n.h) != (was.w, was.h) {
             // A resized frame lays out what it holds, unless asked to leave it where it is.
             let keep = m.get("keep_children").is_some_and(|v| v.as_bool() == Some(true));
@@ -1181,6 +1321,11 @@ impl App {
         if !matches!(action, "reset") {
             if let Some(id) = ids.iter().find(|id| self.doc.pinned(**id)) {
                 return Err(format!("node {id} is part of an instance: its place, order and grouping follow the main component (to mirror what it shows, set flip_h / flip_v with update_nodes)"));
+            }
+        }
+        if matches!(action, "distribute_h" | "distribute_v" | "tidy") {
+            if let Some(id) = ids.iter().find(|id| self.doc.auto_item(**id)) {
+                return Err(format!("node {id} is an item of an auto-layout frame, which places it: change the `layout` of that frame (gap, align) instead, or set `absolute: true` on the node"));
             }
         }
         let pre = self.doc.clone();
@@ -1453,6 +1598,36 @@ mod tests {
         assert_eq!(describe(&n, (0.0, 0.0), true)["constraints"], json!({ "horizontal": "left_right", "vertical": "bottom" }));
         n.constrain_v = Constraint::Min;
         assert_eq!(describe(&n, (0.0, 0.0), true)["constraints"], json!({ "horizontal": "left_right", "vertical": "top" }));
+    }
+
+    #[test]
+    fn auto_layout_is_read_and_described() {
+        let mut f = Node::new(1, Kind::Frame, 0.0, 0.0);
+        assert_eq!((describe(&f, (0.0, 0.0), true)["layout"].clone(), describe(&f, (0.0, 0.0), true)["sizing"].clone()), (Value::Null, Value::Null));
+        // A new layout is a row; only what is given changes after that.
+        assert_eq!(set_layout(&mut f, &json!({ "gap": 12, "padding": [16, 8], "cross_align": "center", "height": "hug" })), Ok((false, true)));
+        let l = f.layout.clone().unwrap();
+        assert_eq!((l.dir, l.gap, l.pad, l.align, l.cross, f.size_v), (Dir::Horizontal, 12.0, [16.0, 8.0, 16.0, 8.0], Align::Start, Align::Center, Sizing::Hug));
+        assert_eq!(set_layout(&mut f, &json!({ "direction": "vertical", "gap": "auto", "padding": { "top": 4 }, "wrap": true, "row_gap": 6, "width": "fill" })), Ok((true, false)));
+        let l = f.layout.clone().unwrap();
+        assert_eq!((l.dir, l.gap, l.pad, l.align, l.wrap, l.row_gap, f.size_h), (Dir::Vertical, 12.0, [16.0, 4.0, 16.0, 8.0], Align::Between, true, 6.0, Sizing::Fill));
+        assert_eq!(
+            describe(&f, (0.0, 0.0), true)["layout"],
+            json!({ "direction": "vertical", "wrap": true, "gap": 12.0, "row_gap": 6.0, "padding": [16.0, 4.0, 16.0, 8.0], "align": "space_between", "cross_align": "center", "width": "fill", "height": "hug" })
+        );
+        set_layout(&mut f, &json!({ "padding": 5, "align": "end" })).unwrap();
+        assert_eq!((f.layout.as_ref().unwrap().pad, f.layout.as_ref().unwrap().align), ([5.0; 4], Align::End));
+        set_layout(&mut f, &json!({ "padding": [1, 2, 3, 4] })).unwrap();
+        assert_eq!(f.layout.as_ref().unwrap().pad, [1.0, 2.0, 3.0, 4.0]);
+        for bad in [json!({ "direction": "diagonal" }), json!({ "cross_align": "space_between" }), json!({ "width": "wide" }), json!({ "padding": "lots" }), json!({ "spacing": 3 }), json!(7)] {
+            assert!(set_layout(&mut f.clone(), &bad).is_err(), "{bad}");
+        }
+        // An item says how it is sized, and whether it is left out of the layout.
+        let mut item = Node::new(2, Kind::Rect, 0.0, 0.0);
+        (item.size_h, item.absolute) = (Sizing::Fill, true);
+        let d = describe(&item, (0.0, 0.0), true);
+        assert_eq!((d["sizing"].clone(), d["absolute"].clone(), d["layout"].clone()), (json!({ "horizontal": "fill", "vertical": "fixed" }), json!(true), Value::Null));
+        assert!(placed_by_hand(&json!({ "x": 5 })) && !placed_by_hand(&json!({ "x": 5, "absolute": true })) && !placed_by_hand(&json!({ "w": 5 })));
     }
 
     #[test]

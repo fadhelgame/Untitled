@@ -7,10 +7,10 @@
 //! property of an instance follows only if it still had the `old` value; anything else was
 //! changed by the user and stays (see `Node::follow`). Position, size and structure are not
 //! overridable: they are rebuilt from the main every time, laid out in the box of the instance
-//! by the constraints that the layers have in the main (see `layout.rs`).
+//! by the constraints that the layers have in the main, or by its auto layout (see `layout.rs`).
 
 use crate::doc::{Doc, Kind, Node};
-use crate::layout::{self, Rect};
+use crate::layout::{self, Rect, Sizing};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -54,7 +54,7 @@ node_fields! {
         fill_style, stroke_style, type_style,
     ],
     by_hand: [text, spans],
-    fixed: [id, name, kind, x, y, w, h, rotation, wrap, points, closed, holes, group, clip, children, component, instance_of, source, constrain_h, constrain_v],
+    fixed: [id, name, kind, x, y, w, h, rotation, wrap, points, closed, holes, group, clip, children, component, instance_of, source, constrain_h, constrain_v, layout, size_h, size_v, absolute],
 }
 
 impl Node {
@@ -115,11 +115,17 @@ impl Fit {
     /// Put `part` where `main` (the node it mirrors) lands in the instance: by the constraints
     /// of `main`, as the frame around it goes from the box `from` it has in the main to the box
     /// `to` it has here. Result: the box of the part (before mirroring), for what it holds.
-    fn place(part: &mut Node, main: &Node, from: Rect, to: Rect) -> Rect {
+    /// `item`: the frame lays its items out itself, so the part only comes along with the size
+    /// it has in the main; its place follows when the instance is laid out.
+    fn place(part: &mut Node, main: &Node, from: Rect, to: Rect, item: bool) -> Rect {
         let mut g = Node::new(0, main.kind, main.x, main.y);
         (g.w, g.h, g.rotation, g.wrap, g.align) = (main.w, main.h, main.rotation, main.wrap, main.align);
-        (g.constrain_h, g.constrain_v) = (main.constrain_h, main.constrain_v);
-        layout::reflow(&mut g, from, to);
+        if item {
+            g.translate(to.0 - from.0, to.1 - from.1);
+        } else {
+            (g.constrain_h, g.constrain_v) = (main.constrain_h, main.constrain_v);
+            layout::reflow(&mut g, from, to);
+        }
         if main.kind == Kind::Text && part.own_text(main) {
             // Its size comes from its own content; keep that, anchored where the text aligns.
             if main.wrap {
@@ -166,7 +172,8 @@ struct Rebuild<'a> {
 
 impl Rebuild<'_> {
     /// The part for `main`, a layer of a frame that has the box `from` in the main and `to` here.
-    fn part(&mut self, main: &Node, from: Rect, to: Rect) -> Node {
+    /// `auto`: that frame has auto layout.
+    fn part(&mut self, main: &Node, from: Rect, to: Rect, auto: bool) -> Node {
         let mut part = match self.pool.remove(&main.id) {
             Some(mut part) => {
                 // Compare with the main as the main has it: unmirrored.
@@ -188,6 +195,8 @@ impl Rebuild<'_> {
         part.clip = main.clip;
         part.wrap = main.wrap;
         (part.constrain_h, part.constrain_v) = (main.constrain_h, main.constrain_v);
+        part.layout.clone_from(&main.layout);
+        (part.size_h, part.size_v, part.absolute) = (main.size_h, main.size_v, main.absolute);
         part.closed = main.closed;
         part.points.clone_from(&main.points);
         part.holes.clone_from(&main.holes);
@@ -207,9 +216,9 @@ impl Rebuild<'_> {
                 }
             },
         };
-        let at = Fit::place(&mut part, main, from, to);
+        let at = Fit::place(&mut part, main, from, to, auto && !main.absolute);
         self.fit.mirror(&mut part);
-        part.children = main.children.iter().map(|c| self.part(c, (main.x, main.y, main.w, main.h), at)).collect();
+        part.children = main.children.iter().map(|c| self.part(c, (main.x, main.y, main.w, main.h), at, main.is_auto())).collect();
         part
     }
 }
@@ -233,6 +242,17 @@ fn sync_instance(inst: &mut Node, old: &HashMap<u64, &Node>, new: &Node, next_id
         }
         inst.follow(old, new);
     }
+    // The layout is the main's. Of the sizes only "fill" is the instance's own: that is about
+    // the frame it sits in.
+    inst.layout.clone_from(&new.layout);
+    for horizontal in [true, false] {
+        let own = match (new.sizing(horizontal), inst.sizing(horizontal)) {
+            (_, Sizing::Fill) => Sizing::Fill,
+            (Sizing::Hug, _) => Sizing::Hug,
+            _ => Sizing::Fixed,
+        };
+        inst.set_sizing(horizontal, own);
+    }
     let mut pool = HashMap::new();
     for c in std::mem::take(&mut inst.children) {
         drain(c, &mut pool);
@@ -247,7 +267,16 @@ fn sync_instance(inst: &mut Node, old: &HashMap<u64, &Node>, new: &Node, next_id
     let flip = (inst.flip_h != new.flip_h, inst.flip_v != new.flip_v);
     let (from, to) = ((new.x, new.y, new.w, new.h), (inst.x, inst.y, inst.w, inst.h));
     let mut rebuild = Rebuild { old, pool, fit: Fit { to, flip }, groups, next_id, names };
-    inst.children = new.children.iter().map(|c| rebuild.part(c, from, to)).collect();
+    inst.children = new.children.iter().map(|c| rebuild.part(c, from, to, new.is_auto())).collect();
+    // A flipped instance of a main with auto layout runs the other way.
+    for (flipped, horizontal) in [(flip.0, true), (flip.1, false)] {
+        if flipped {
+            layout::flip_layout(inst, horizontal);
+        }
+    }
+    // A main with auto layout: the instance places its parts itself, around what they hold here
+    // (a longer label makes a button that hugs it grow).
+    layout::settle(inst);
 }
 
 impl Doc {

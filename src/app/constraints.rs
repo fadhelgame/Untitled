@@ -12,11 +12,12 @@ const PINNED: &str = "Follows the main component: set the constraints of its lay
 
 impl App {
     /// What the Constraints section shows: the constraints of the selection, when all of it
-    /// sits directly in a frame. Top-level layers have nothing to be constrained to.
+    /// sits directly in a frame, placed by hand. Top-level layers have nothing to be constrained to.
     pub(super) fn constraints_shown(&self) -> Option<Pair> {
         let nodes: Vec<&Node> = self.sel.iter().filter_map(|id| self.doc.find(*id)).collect();
         let first = nodes.first()?;
-        if self.sel.iter().any(|id| self.doc.parent_of(*id).is_none()) {
+        // An item of an auto layout is placed by its frame: it has nothing to be pinned to either.
+        if self.sel.iter().any(|id| self.doc.parent_of(*id).is_none() || self.doc.auto_item(*id)) {
             return None;
         }
         let same = |f: &dyn Fn(&Node) -> Constraint| nodes.iter().all(|n| f(n) == f(first)).then(|| f(first));

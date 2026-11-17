@@ -84,6 +84,7 @@ impl Node {
         for c in &mut self.children {
             c.mirror(axis, horizontal);
         }
+        crate::layout::flip_layout(self, horizontal);
     }
 
     /// Before the node becomes a path: its flip moves into the gradient, the flags go.
