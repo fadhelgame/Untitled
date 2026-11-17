@@ -1300,6 +1300,38 @@ impl Node {
         }
         self.spans.retain(|s| s.start < s.end);
     }
+
+    /// Replace the characters [start, end) (character indices) of the text with `with`, and
+    /// move the styled ranges along. The new characters take the style of the first character
+    /// they replace; a range that lay wholly inside what was replaced is gone. Unlike
+    /// `sync_spans`, which has to guess one edit from two texts, this knows exactly what
+    /// changed, so several replacements in one text can be applied one after the other (from
+    /// the last to the first, so the indices of the earlier ones stay valid).
+    pub fn replace_range(&mut self, start: usize, end: usize, with: &str) {
+        let len = self.text.chars().count();
+        let (a, b) = (start.min(len), end.min(len));
+        if a > b {
+            return;
+        }
+        let byte = |i: usize| self.text.char_indices().nth(i).map_or(self.text.len(), |(at, _)| at);
+        let (from, to) = (byte(a), byte(b));
+        self.text.replace_range(from..to, with);
+        let added = with.chars().count();
+        // Where a boundary of a styled range ends up.
+        let place = |i: usize| {
+            if i <= a {
+                i
+            } else if i < b {
+                a + added
+            } else {
+                i - (b - a) + added
+            }
+        };
+        for s in &mut self.spans {
+            (s.start, s.end) = (place(s.start), place(s.end));
+        }
+        self.spans.retain(|s| s.start < s.end);
+    }
 }
 
 /// Color style: satu warna bernama. Objek yang memakainya menyimpan id-nya di `fill_style` /

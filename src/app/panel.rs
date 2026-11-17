@@ -75,6 +75,8 @@ impl App {
                     "Ctrl+V         paste at the pointer",
                     "Ctrl+Shift+V   paste in place",
                     "Ctrl+Shift+H   show/hide",
+                    "Ctrl+F         find in text",
+                    "Ctrl+H         find and replace",
                     "Ctrl+U         underline text",
                     "Ctrl+Shift+X   strikethrough text",
                     "Ctrl+Alt+G     clipping mask",
@@ -1520,6 +1522,7 @@ impl eframe::App for App {
         self.photos_window(ctx);
         self.library_window(ctx);
         self.components_window(ctx);
+        self.find_window(ctx);
         self.eyedropper(ctx);
         self.about_window(ctx);
 

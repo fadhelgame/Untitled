@@ -229,6 +229,9 @@ impl App {
             );
         }
 
+        // Under the selection outlines: what Find and replace found.
+        self.paint_find(&ctx, &painter);
+
         // --- overlay: hover, seleksi, pegangan, marquee ---
         let idle = matches!(self.drag, Drag::None);
         if idle && hovered && self.pointer_tool() && self.editing.is_none() && self.crop.is_none() {

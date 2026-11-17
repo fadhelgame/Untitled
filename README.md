@@ -129,6 +129,8 @@ Every screenshot here is the real app.
       Change font, weight, size, color, italics, <b>underline or strikethrough</b> for <b>just the selected characters</b>, and set line height, letter spacing and alignment (left, center, right or <b>justified</b>) for the whole block.
       <br><br>
       Turn a text into a <b>bulleted or numbered list</b>: every paragraph gets its marker and wrapped lines hang under their own text. Drag the top or bottom handle of a paragraph to give it a <b>fixed height</b>, then align its lines to the top, middle or bottom of the box.
+      <br><br>
+      <b>Find and replace</b> (<code>Ctrl+F</code> / <code>Ctrl+H</code>) searches the text of every layer on this page, on all pages or in the selection, with <i>Match case</i> and <i>Whole word</i>. Step through the matches and the canvas follows, with every match highlighted; replace one at a time or all at once, as a single undo step, and styled characters keep their style.
     </td>
   </tr>
   <tr>
@@ -230,6 +232,7 @@ Every screenshot here is the real app.
 | | | Arrow keys on an auto-layout item | Swap it with its neighbour |
 | | | `Shift+X` | Swap fill and stroke |
 | | | `Ctrl+U` / `Ctrl+Shift+X` | Underline / strikethrough (the selected characters while editing a text, otherwise the whole text) |
+| | | `Ctrl+F` / `Ctrl+H` | Find in text layers / find and replace (`Enter` / `Shift+Enter` next / previous match, `Esc` closes) |
 | | | `Ctrl+V` | Paste at the pointer |
 | | | `Ctrl+Shift+V` | Paste in place (same position, in the frame under the pointer) |
 | | | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
@@ -240,7 +243,7 @@ On macOS, use `Cmd` wherever this table says `Ctrl`. While resizing, hold `Shift
 
 Kanvas ships with `kanvas-mcp`, a small [Model Context Protocol](https://modelcontextprotocol.io) server. It connects an AI assistant such as Claude to the document that is open in the app, over a local, token-protected connection that never leaves your computer.
 
-The assistant gets 13 tools: `get_document`, `create_nodes`, `update_nodes`, `delete_nodes`, `arrange`, `select_nodes`, `screenshot`, `export`, `pages`, `library`, `file`, `history` and `list_fonts`. Every change appears on your canvas immediately and is one undo step.
+The assistant gets 14 tools: `get_document`, `create_nodes`, `update_nodes`, `delete_nodes`, `arrange`, `select_nodes`, `screenshot`, `export`, `pages`, `replace_text`, `library`, `file`, `history` and `list_fonts`. Every change appears on your canvas immediately and is one undo step.
 
 Get `kanvas-mcp` first:
 

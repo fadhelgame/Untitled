@@ -6,6 +6,7 @@ mod component;
 mod doc;
 mod export;
 mod file;
+mod find;
 mod fonts;
 mod layout;
 

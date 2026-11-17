@@ -17,6 +17,7 @@ mod components;
 mod constraints;
 mod corners;
 mod crop;
+mod find;
 mod home;
 mod icons;
 mod library;
@@ -394,6 +395,8 @@ pub struct App {
     components: components::Components,
     /// Where the item being dragged will land in an auto layout: a line, in world coordinates.
     drop_mark: Option<[Pos2; 2]>,
+    /// The Find and replace window and its matches.
+    find: find::Find,
 }
 
 /// Warna dokumen → warna egui. Alpha dikalikan di ruang gamma, sama dengan cara egui (dan hasil
@@ -484,6 +487,7 @@ impl App {
             about: false,
             components: Default::default(),
             drop_mark: None,
+            find: Default::default(),
         };
         app.home = app.bench.is_none();
         if app.bench.is_none() {
@@ -1214,6 +1218,7 @@ impl App {
         self.fit_pending = true;
         self.components.rebase();
         self.pages.reset();
+        self.find.reset();
         self.warm_fonts();
     }
 
@@ -1381,6 +1386,22 @@ impl App {
                 self.ext.picker.eyedrop = None;
             }
             return;
+        }
+
+        // Ctrl+F find, Ctrl+H replace: also while typing (in a text on the canvas, or in the
+        // window itself, to move between its fields), so they are taken before any text field
+        // sees them (where Ctrl+H would delete a character). Without Shift or Alt only, which
+        // `consume_key` does not tell apart: Ctrl+Shift+H is show / hide.
+        let (find, replace) = ctx.input_mut(|i| {
+            let mut take = |key: Key| {
+                let before = i.events.len();
+                i.events.retain(|e| !matches!(e, egui::Event::Key { key: k, pressed: true, modifiers: m, .. } if *k == key && m.command && !m.shift && !m.alt));
+                i.events.len() != before
+            };
+            (take(Key::F), take(Key::H))
+        });
+        if find || replace {
+            self.open_find(replace);
         }
 
         // Ctrl+U underline, Ctrl+Shift+X strikethrough: also while a text is being edited (then
@@ -1587,6 +1608,8 @@ impl App {
                     }
                 }
                 Key::Delete | Key::Backspace => self.delete_selection(),
+                // Esc closes the Find and replace window first; the selection stays.
+                Key::Escape if self.find_escape() => {}
                 Key::Escape => {
                     self.sel.clear();
                     self.tool = Tool::Select;
@@ -1695,6 +1718,15 @@ impl App {
                 if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
                     ui.close_menu();
                     self.delete_selection();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Find…").shortcut_text("Ctrl+F")).clicked() {
+                    ui.close_menu();
+                    self.open_find(false);
+                }
+                if ui.add(egui::Button::new("Find and replace…").shortcut_text("Ctrl+H")).clicked() {
+                    ui.close_menu();
+                    self.open_find(true);
                 }
                 ui.separator();
                 if ui.add(egui::Button::new("Group").shortcut_text("Ctrl+G")).clicked() {
@@ -2511,6 +2543,13 @@ impl App {
                         b.inject.extend([(220, key(true)), (222, key(false))]);
                     }
                 }
+                // `KANVAS_BENCH_FIND=<n>`: texts with the word "kanvas" in them (see `bench_find`),
+                // the Find and replace window open on that word, and <n> steps to the next match.
+                // Other modes (`replace`, `one`, `all`, `selection`, `keys`, `esc`, `far`, `many`)
+                // are described at `bench_find_frame`, which drives them on later frames.
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_FIND") {
+                    self.bench_find(&mode);
+                }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
                     let ids: Vec<u64> = self.doc.nodes.iter().filter(|n| n.name == "Feature demo").flat_map(|n| n.children.iter().map(|c| c.id)).collect();
@@ -3114,6 +3153,9 @@ impl App {
                         }
                         _ => {}
                     }
+                }
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_FIND") {
+                    self.bench_find_frame(ctx, &mode, b.frame, &mut b.inject);
                 }
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_TYPO") {
                     if (250..=255).contains(&b.frame) {

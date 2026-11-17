@@ -41,6 +41,8 @@ struct Request {
 enum After {
     /// Ukur ulang teks lalu laporkan node (`key` = "created" / "updated").
     Nodes { key: &'static str, ids: Vec<u64>, warnings: Vec<String> },
+    /// `replace_text`: measure the texts that changed, then report the counts.
+    Replaced { count: usize, ids: Vec<u64> },
     Shot { id: Option<u64>, max: f32 },
     Export { id: Option<u64>, path: PathBuf, scale: f32 },
 }
@@ -610,6 +612,7 @@ impl App {
         match outcome {
             Ok(Outcome::Now(v)) => v.to_string(),
             Ok(Outcome::Later(After::Nodes { ids, .. }, _)) => format!("ids {ids:?}"),
+            Ok(Outcome::Later(After::Replaced { count, ids }, _)) => format!("replaced {count} in {} layers", ids.len()),
             Ok(Outcome::Later(..)) => "(answers later)".into(),
             Err(e) => format!("ERROR: {e}"),
         }
@@ -617,7 +620,7 @@ impl App {
 
     fn remote_run(&mut self, cmd: &str, args: &Value) -> Result<Outcome, String> {
         // Perintah yang mengubah dokumen: akhiri dulu mode edit teks / titik path.
-        if matches!(cmd, "create_nodes" | "update_nodes" | "delete_nodes" | "arrange" | "history" | "file" | "pages") {
+        if matches!(cmd, "create_nodes" | "update_nodes" | "delete_nodes" | "arrange" | "history" | "file" | "pages" | "replace_text") {
             self.finish_text_edit();
             self.ext.path_edit = None;
         }
@@ -633,6 +636,7 @@ impl App {
             "library" => self.remote_library(args).map(Outcome::Now),
             "file" => self.remote_file(args).map(Outcome::Now),
             "list_fonts" => self.remote_fonts(args).map(Outcome::Now),
+            "replace_text" => self.remote_replace(args),
             "screenshot" => {
                 let id = self.target(args)?;
                 let max = args.get("max_size").map(|v| num("max_size", v)).transpose()?.unwrap_or(1024.0).clamp(64.0, 2048.0);
@@ -756,6 +760,15 @@ impl App {
                     result["warnings"] = json!(warnings);
                 }
                 Ok(ok(result))
+            }
+            After::Replaced { count, ids } => {
+                // The texts were replaced when the command came in; their boxes follow here,
+                // and with them the auto layouts and instances around them.
+                self.find_measure(ctx, &ids);
+                self.components.recheck();
+                self.settle_doc();
+                let list: Vec<Value> = ids.iter().filter_map(|id| self.doc.find(*id).map(|n| brief(n, self.origin_of(*id)))).collect();
+                Ok(ok(json!({ "replaced": count, "layers": ids.len(), "updated": list })))
             }
             After::Shot { id, max } => {
                 let (svg, w, h) = export::to_svg(&self.doc, id, &mut self.fonts, ctx).ok_or("nothing to render: the document is empty")?;
@@ -1345,6 +1358,23 @@ impl App {
             *slot = n;
         }
         Ok(id)
+    }
+
+    /// `replace_text`: find and replace in the text layers, as one undo step.
+    fn remote_replace(&mut self, args: &Value) -> Result<Outcome, String> {
+        let query = args.get("query").and_then(Value::as_str).filter(|q| !q.is_empty()).ok_or("`query` must be a non-empty string")?;
+        let with = args.get("replacement").and_then(Value::as_str).ok_or("`replacement` must be a string (\"\" removes the matches)")?;
+        let on = |key: &str| args.get(key).map(|v| flag(key, v)).transpose().map(|v| v.unwrap_or(false));
+        let opt = crate::find::Options { match_case: on("match_case")?, whole_word: on("whole_word")? };
+        let all = match args.get("scope").and_then(Value::as_str).unwrap_or("page") {
+            "page" => false,
+            "all" => true,
+            other => return Err(format!("unknown scope \"{other}\"; use page or all")),
+        };
+        let (count, ids) = self.replace_text(query, with, opt, all);
+        self.home = false;
+        self.status = format!("Remote: replaced {count} match{} in {} layer{}.", if count == 1 { "" } else { "es" }, ids.len(), if ids.len() == 1 { "" } else { "s" });
+        Ok(Outcome::Later(After::Replaced { count, ids }, Vec::new()))
     }
 
     fn remote_delete(&mut self, args: &Value) -> Result<Value, String> {
