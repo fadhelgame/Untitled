@@ -3,6 +3,7 @@
 mod app;
 mod doc;
 mod export;
+mod file;
 mod fonts;
 
 use eframe::egui;

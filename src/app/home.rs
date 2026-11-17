@@ -3,6 +3,7 @@
 use super::{theme, App, Drag, ACCENT, CANVAS_BG};
 use crate::doc::Doc;
 use crate::export;
+use crate::file::{self, Stored};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Modifiers, Rect, Sense, Stroke, StrokeKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -60,47 +61,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
-/// Write the document to `path`. The JSON is streamed into a temporary file that then replaces
-/// the old one, so a large document is never held in memory twice and an interrupted save
-/// leaves the old file intact. Safe to call from any thread.
-pub(super) fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let write = || -> Result<(), String> {
-        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
-        serde_json::to_writer(&mut out, doc).map_err(|e| e.to_string())?;
-        drop(out.into_inner().map_err(|e| e.to_string())?);
-        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
-    };
-    write().inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
-}
-
-/// Read a document from `path`. Safe to call from any thread.
-pub(super) fn read_doc(path: &Path) -> Result<Doc, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let mut doc: Doc = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    // New ids must not collide with the ids in the file.
-    doc.next_id = doc.next_id.max(doc.max_node_id());
-    doc.fix_pages();
-    Ok(doc)
-}
-
 /// A save running on another thread.
 struct Saving {
     path: PathBuf,
     /// `Files::version` of the document being written.
     version: u64,
-    rx: mpsc::Receiver<Result<(), String>>,
+    rx: mpsc::Receiver<Result<Stored, String>>,
 }
 
 /// A file being read and parsed on another thread.
 struct Loading {
     path: PathBuf,
-    rx: mpsc::Receiver<Result<Doc, String>>,
+    rx: mpsc::Receiver<Result<(Doc, Option<Stored>), String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -124,6 +96,8 @@ pub(super) struct Files {
     /// still matches what is on screen.
     pub version: u64,
     saving: Option<Saving>,
+    /// The file last read or written, and what it holds; lets the next save append to it.
+    stored: Option<(PathBuf, Stored)>,
     /// Save as soon as possible (Ctrl+S), without waiting for the auto-save pause.
     asap: bool,
     loading: Option<Loading>,
@@ -148,6 +122,7 @@ impl Files {
             last_change: Instant::now(),
             version: 0,
             saving: None,
+            stored: None,
             asap: false,
             loading: None,
             prompt: None,
@@ -226,7 +201,8 @@ impl App {
     /// two writers never share the temporary file.
     pub(super) fn write_doc(&mut self, path: &Path) -> Result<(), String> {
         self.save_wait();
-        save_doc(&self.doc, path)?;
+        let stored = file::save(&self.doc, path, None)?;
+        self.files.stored = Some((path.to_owned(), stored));
         self.files.asap = false;
         self.path = Some(path.to_owned());
         self.dirty = false;
@@ -281,8 +257,9 @@ impl App {
     fn start_save(&mut self, path: PathBuf) {
         let (tx, rx) = mpsc::channel();
         let (doc, ctx, to) = (self.doc.clone(), self.files.ctx.clone(), path.clone());
+        let known = self.stored(&path).cloned();
         std::thread::spawn(move || {
-            let _ = tx.send(save_doc(&doc, &to));
+            let _ = tx.send(file::save(&doc, &to, known.as_ref()));
             ctx.request_repaint();
         });
         self.files.saving = Some(Saving { path, version: self.files.version, rx });
@@ -309,13 +286,19 @@ impl App {
         }
     }
 
-    fn saved(&mut self, job: Saving, result: Result<(), String>) {
+    /// What is known about the file at `path`, if it is the one last read or written.
+    fn stored(&self, path: &Path) -> Option<&Stored> {
+        self.files.stored.as_ref().filter(|(p, _)| p == path).map(|(_, s)| s)
+    }
+
+    fn saved(&mut self, job: Saving, result: Result<Stored, String>) {
         // The user moved on to another file in the meantime: nothing to update here.
         if self.path.as_deref() != Some(job.path.as_path()) {
             return;
         }
         match result {
-            Ok(()) => {
+            Ok(stored) => {
+                self.files.stored = Some((job.path.clone(), stored));
                 // Changes made while the file was being written are saved by the next round.
                 if job.version == self.files.version {
                     self.dirty = false;
@@ -347,7 +330,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (ctx, from) = (self.files.ctx.clone(), path.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(read_doc(&from));
+            let _ = tx.send(file::read(&from));
             ctx.request_repaint();
         });
         self.files.loading = Some(Loading { path, rx });
@@ -357,14 +340,15 @@ impl App {
     pub(super) fn load_now(&mut self, path: PathBuf) -> bool {
         let path = std::path::absolute(&path).unwrap_or(path);
         self.files.loading = None;
-        let result = read_doc(&path);
+        let result = file::read(&path);
         self.finish_load(path, result)
     }
 
-    fn finish_load(&mut self, path: PathBuf, result: Result<Doc, String>) -> bool {
+    fn finish_load(&mut self, path: PathBuf, result: Result<(Doc, Option<Stored>), String>) -> bool {
         match result {
-            Ok(doc) => {
+            Ok((doc, stored)) => {
                 self.doc = doc;
+                self.files.stored = stored.map(|s| (path.clone(), s));
                 self.status = format!("Opened: {}", path.display());
                 self.opened(&path);
                 self.path = Some(path);
@@ -419,7 +403,8 @@ impl App {
         let Some(path) = self.path.clone() else { return true };
         // A background save that is about to finish may already hold everything.
         self.save_wait();
-        if self.dirty {
+        // Leaving is also the moment to drop the old versions that appended saves left in the file.
+        if self.dirty || self.stored(&path).is_some_and(Stored::garbage) {
             if let Err(e) = self.write_doc(&path) {
                 self.status = format!("Couldn't save: {e}");
                 return false;
@@ -697,32 +682,4 @@ fn card(
         }
     });
     act
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::doc::{Kind, Node};
-
-    #[test]
-    fn save_and_read_round_trip() {
-        let mut doc = Doc::default();
-        let image = doc.add_asset(vec![7; 3000]);
-        let mut frame = Node::new(doc.alloc_id(), Kind::Frame, 0.0, 0.0);
-        frame.children.push(Node::new(doc.alloc_id(), Kind::Rect, 10.0, 10.0));
-        doc.insert(frame, None);
-        let path = std::env::temp_dir().join(format!("kanvas_test_save_{}.kanvas", std::process::id()));
-        save_doc(&doc, &path).unwrap();
-        // Saving again replaces the file and leaves no temporary file behind.
-        save_doc(&doc, &path).unwrap();
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        assert!(!Path::new(&tmp).exists());
-        let back = read_doc(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(back.count(), 2);
-        assert_eq!(back.nodes[0].children, doc.nodes[0].children);
-        assert_eq!(back.assets[&image].bytes, vec![7; 3000]);
-        assert!(read_doc(&path).is_err());
-    }
 }
