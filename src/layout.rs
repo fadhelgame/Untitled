@@ -790,12 +790,22 @@ impl Doc {
 
     /// `settle_layout` for the top-level nodes of this page that hold one of `ids`: what a drag
     /// or the text being typed can have changed.
+    ///
+    /// This runs several times per frame while something is dragged or typed (after the
+    /// pointer was handled, and again at the end of the frame), and laying a top-level node
+    /// out means copying it and comparing the copy with it. A node that was laid out by the
+    /// last call and has not changed since is left alone (see `Doc::settled`).
     pub fn settle_around(&mut self, ids: &[u64], lifted: &[u64]) -> bool {
+        let mut tops: Vec<usize> = ids.iter().filter_map(|id| self.find_top(*id).map(|found| found.0)).collect();
+        tops.sort_unstable();
+        tops.dedup();
         let mut changed = false;
-        for top in &mut self.nodes {
-            if ids.iter().any(|id| top.find(*id).is_some()) {
-                changed |= settle_top(top, lifted);
+        for i in tops {
+            if self.settled(&self.nodes[i], lifted, false) {
+                continue;
             }
+            changed |= settle_top(&mut self.nodes[i], lifted);
+            self.settled(&self.nodes[i], lifted, true);
         }
         changed
     }

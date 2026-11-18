@@ -86,11 +86,37 @@ impl super::App {
             let mut jpg = Vec::new();
             let big = test_picture(4000, 3000);
             let _ = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90).encode(&big, 4000, 3000, image::ExtendedColorType::Rgb8);
+            // `KANVAS_BENCH_ADJUST_FX=shadow|cutout|blur|frame`: the photo has a drop shadow (as
+            // a JPEG, or `cutout`: as a PNG with see-through corners, whose shadow is made from
+            // its pixels) or a layer blur (textures made from the export's SVG), or lies in a
+            // top-level frame (whose meshes are kept: see `render::frame_cached`).
+            let fx = std::env::var("KANVAS_BENCH_ADJUST_FX").unwrap_or_default();
+            if fx == "cutout" {
+                let mut cut = image::DynamicImage::ImageRgb8(big).into_rgba8();
+                for (px, py, p) in cut.enumerate_pixels_mut() {
+                    let (dx, dy) = (px as f32 / 2000.0 - 1.0, py as f32 / 1500.0 - 1.0);
+                    p[3] = if dx * dx + dy * dy > 1.0 { 0 } else { 255 };
+                }
+                jpg.clear();
+                let _ = cut.write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Png);
+            }
             let asset = self.doc.add_asset(jpg);
             let mut n = Node::new(self.doc.alloc_id(), Kind::Image, x, y);
             (n.name, n.w, n.h, n.image, n.stroke_w) = ("Large photo".into(), 1200.0, 900.0, Some(asset), 0.0);
             let id = n.id;
-            self.doc.insert(n, None);
+            match fx.as_str() {
+                "shadow" | "cutout" => n.shadow = Some(Shadow { x: 0.0, y: 12.0, blur: 24.0, color: [0, 0, 0, 140] }),
+                "blur" => n.blur = 6.0,
+                _ => {}
+            }
+            let parent = (fx == "frame").then(|| {
+                let mut f = Node::new(self.doc.alloc_id(), Kind::Frame, x - 100.0, y - 100.0);
+                (f.name, f.w, f.h, f.fill) = ("Photo frame".into(), 1400.0, 1100.0, Some([250, 250, 250, 255]));
+                let frame = f.id;
+                self.doc.insert(f, None);
+                frame
+            });
+            self.doc.insert(n, parent);
             self.zoom_to((x - 20.0, y - 20.0, x + 1220.0, y + 920.0), 32.0);
             self.fit_pending = false;
             self.sel = vec![id];
@@ -277,7 +303,10 @@ impl super::App {
                 eprintln!("ADJUST drag of 200 steps on 12 MP: frame avg {:.2} ms, p95 {:.2} ms, max {:.2} ms; frame to frame avg {:.2} ms, p95 {:.2} ms, max {:.2} ms", own.0, own.1, own.2, between.0, between.1, between.2);
                 eprintln!("ADJUST after 200 steps (finished, live, sources, MB), all textures: {:?}", textures(self));
             }
-            270 => eprintln!("ADJUST a second after the drag: {:?}", textures(self)),
+            270 | 330 => {
+                let top = self.doc.parent_of(id).unwrap_or(id);
+                eprintln!("ADJUST {} frames after the drag: {:?}; the kept meshes of its frame draw a preview texture: {:?}", at - 210, textures(self), self.ext.kept_preview(top));
+            }
             _ => {}
         }
     }

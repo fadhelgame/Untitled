@@ -30,6 +30,62 @@ struct Stage {
     stopped: bool,
     /// ...and the area that is wanted (nodes outside of it are left out).
     cull: Option<(f32, f32, f32, f32)>,
+    /// Only the shape of things is wanted (the source of a drop shadow): image adjustments,
+    /// which leave the alpha alone, are left out.
+    silhouette: bool,
+    /// Images are not written out but set aside (see `Images`).
+    later: Option<Images>,
+}
+
+/// The images of an SVG that was made for a texture of the canvas (`shadow_svg`, `blur_svg`).
+/// Turning an image into a data URI takes a while for a photo, more so with adjustments (its
+/// pixels are decoded, adjusted and encoded again), so the SVG is first written with a mark
+/// for each image, and `fill` puts the images in on the thread that renders it.
+#[derive(Default)]
+pub struct Images(Vec<(u64, std::sync::Arc<Asset>, Option<crate::adjust::Adjust>)>);
+
+/// Encloses the index of an image in an SVG whose images come later. (Not a character that
+/// an SVG can hold otherwise.)
+const LATER: char = '\u{1}';
+
+impl Images {
+    /// `svg` with its images in place.
+    pub fn fill(&self, svg: String) -> String {
+        if self.0.is_empty() {
+            return svg;
+        }
+        let mut out = String::with_capacity(svg.len());
+        for (i, part) in svg.split(LATER).enumerate() {
+            match part.parse::<usize>().ok().and_then(|at| self.0.get(at)).filter(|_| i % 2 == 1) {
+                Some((id, asset, adjust)) => out.push_str(&image_href(*id, asset, *adjust)),
+                None => out.push_str(part),
+            }
+        }
+        out
+    }
+}
+
+/// Run `write` with the images set aside. Result: the images it met.
+fn images_later(write: impl FnOnce()) -> Images {
+    stage(|s| s.later = Some(Images::default()));
+    write();
+    stage(|s| s.later.take()).unwrap_or_default()
+}
+
+/// The `href` of the image of `n`: the image itself (see `image_href`), or its mark when the
+/// images of this SVG come later.
+fn node_href(n: &Node, id: u64, asset: &std::sync::Arc<Asset>) -> std::sync::Arc<str> {
+    // (Under a colour overlay only the alpha shows, which adjustments leave alone.)
+    let adjust = n.adjustment().filter(|_| n.fill.is_none() && !stage(|s| s.silhouette));
+    let mark = stage(|s| {
+        let later = s.later.as_mut()?;
+        later.0.push((id, asset.clone(), adjust));
+        Some(format!("{LATER}{}{LATER}", later.0.len() - 1))
+    });
+    match mark {
+        Some(mark) => mark.into(),
+        None => image_href(id, asset, adjust),
+    }
 }
 
 thread_local! {
@@ -451,13 +507,14 @@ fn blur_group<T: AsRef<Node>>(out: &mut String, nodes: &[T], assets: &Assets, fo
 
 /// SVG satu rangkaian layer blur (sudah buram), untuk tekstur di canvas. Blend mode bersama tidak
 /// ikut: canvas yang mengerjakannya. Hasil: (svg, area dunia yang dicakup).
-pub fn blur_svg<T: AsRef<Node>>(nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32))> {
+/// Its images are still to be put in (`Images::fill`).
+pub fn blur_svg<T: AsRef<Node>>(nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32), Images)> {
     let region = blur_region(nodes)?;
     let (w, h) = (region.2 - region.0, region.3 - region.1);
     let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{} {} {w} {h}">"#, region.0, region.1);
-    blur_group(&mut out, nodes, assets, fonts, ctx, false);
+    let images = images_later(|| blur_group(&mut out, nodes, assets, fonts, ctx, false));
     out.push_str("</svg>");
-    Some((out, region))
+    Some((out, region, images))
 }
 
 /// Jarak aman di sekeliling objek supaya bayangannya tidak terpotong.
@@ -680,16 +737,20 @@ fn node_fx(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManager,
 
 /// SVG yang hanya berisi bayangan satu rangkaian (satu node, atau anggota group yang berbayangan
 /// bersama), untuk tekstur bayangan di canvas. Hasil: (svg, area dunia yang dicakup).
-pub fn shadow_svg<T: AsRef<Node>>(nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32))> {
+/// Its images are still to be put in (`Images::fill`); they are there for their alpha only,
+/// so without their adjustments.
+pub fn shadow_svg<T: AsRef<Node>>(nodes: &[T], assets: &Assets, fonts: &mut FontManager, ctx: &egui::Context) -> Option<(String, (f32, f32, f32, f32), Images)> {
     let region = shadow_region(nodes)?;
     let (w, h) = (region.2 - region.0, region.3 - region.1);
     let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="{} {} {w} {h}">"#, region.0, region.1);
-    match nodes {
+    stage(|s| s.silhouette = true);
+    let images = images_later(|| match nodes {
         [n] => node_fx(&mut out, n.as_ref(), assets, fonts, ctx, Fx::ShadowOnly),
         _ => shadow_group(&mut out, nodes, assets, fonts, ctx, true),
-    }
+    });
+    stage(|s| s.silhouette = false);
     out.push_str("</svg>");
-    Some((out, region))
+    Some((out, region, images))
 }
 
 /// Opens the group that mirrors a flipped node about the centre of its box (`Node::flips`).
@@ -823,8 +884,7 @@ fn node_body(out: &mut String, n: &Node, assets: &Assets, fonts: &mut FontManage
                 r#"<image x="{ix0}" y="{iy0}" width="{}" height="{}" preserveAspectRatio="none"{clip}{overlay} href="{}"/>"#,
                 ix1 - ix0,
                 iy1 - iy0,
-                // (Under a colour overlay only the alpha shows, which adjustments leave alone.)
-                image_href(asset_id, asset, n.adjustment().filter(|_| n.fill.is_none()))
+                node_href(n, asset_id, asset)
             );
             inner_fx(out, n, fonts, ctx, Inner::Flipped);
             stroke_rect(out, n, r);
@@ -1649,7 +1709,8 @@ mod tests {
         assert_eq!(at(130, 90), [200, 200, 200, 255]);
         assert_eq!(at(110, 90), [0, 0, 0, 255]);
         // Tekstur canvas: hanya bayangannya, mencakup seluruh group.
-        let (only, region) = shadow_svg(&doc.nodes[1..3], &doc.assets, &mut fonts, &ctx).unwrap();
+        let (only, region, images) = shadow_svg(&doc.nodes[1..3], &doc.assets, &mut fonts, &ctx).unwrap();
+        let only = images.fill(only);
         assert!(region.0 < 50.0 && region.2 > 170.0);
         assert_eq!(only.matches("<rect").count(), 2);
         // Anggota yang bayangannya berbeda keluar dari bayangan bersama.
@@ -1707,6 +1768,39 @@ mod tests {
         let mut out = String::new();
         node_body(&mut out, &rect, &Default::default(), &mut fonts, &ctx);
         assert!(out.contains(r#"<path d="M7.000 0.000C"#) && out.contains(r#"stroke-dasharray="2 2""#), "{out}");
+    }
+
+    #[test]
+    fn canvas_shadow_and_blur_leave_their_images_for_later() {
+        let ctx = context();
+        let mut fonts = FontManager::new(&ctx);
+        let mut doc = Doc::default();
+        // A PNG with a see-through pixel (so its shadow is made from its pixels), adjusted.
+        let mut png = Vec::new();
+        let pixels = image::RgbaImage::from_fn(4, 4, |x, _| image::Rgba([200, 40, 40, if x == 0 { 0 } else { 255 }]));
+        image::DynamicImage::ImageRgba8(pixels).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let asset = doc.add_asset(png);
+        let mut n = Node::new(doc.alloc_id(), Kind::Image, 0.0, 0.0);
+        (n.w, n.h, n.image, n.stroke_w, n.blur) = (40.0, 40.0, Some(asset), 0.0, 4.0);
+        n.shadow = Some(Shadow { x: 2.0, y: 2.0, blur: 4.0, color: [0, 0, 0, 255] });
+        n.adjust = Some(crate::adjust::Adjust { exposure: 50.0, ..Default::default() });
+        doc.insert(n, None);
+        let plain = image_href(asset, &doc.assets[&asset], None);
+        let adjusted = image_href(asset, &doc.assets[&asset], doc.nodes[0].adjust);
+        assert_ne!(plain, adjusted);
+        // The shadow: written with a mark for the image, which is put in without the
+        // adjustment (only its alpha shows). The export has the adjusted image.
+        let (svg, _, images) = shadow_svg(&doc.nodes[..], &doc.assets, &mut fonts, &ctx).unwrap();
+        assert!(!svg.contains("base64") && svg.contains(LATER));
+        let filled = images.fill(svg);
+        assert!(filled.contains(&*plain) && !filled.contains(LATER));
+        // The layer blur shows the colours: the adjusted image, also put in later.
+        let (svg, _, images) = blur_svg(&doc.nodes[..], &doc.assets, &mut fonts, &ctx).unwrap();
+        assert!(!svg.contains("base64"));
+        assert!(images.fill(svg).contains(&*adjusted));
+        // Neither leaves anything behind for an export, which has its images in place.
+        let (svg, _, _) = to_svg(&doc, None, &mut fonts, &ctx).unwrap();
+        assert!(svg.contains(&*adjusted) && !svg.contains(LATER));
     }
 
     #[test]

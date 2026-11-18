@@ -9,8 +9,12 @@ use super::{App, Bench};
 use eframe::egui::{self, vec2};
 use std::time::Instant;
 
-/// Frames per timed phase.
-const LEN: u32 = 120;
+/// Frames per timed phase (`KANVAS_PERF_LEN` sets another number: caches that let go of what
+/// was not used for some hundred frames only show in a longer run).
+fn len() -> u32 {
+    static LEN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEN.get_or_init(|| std::env::var("KANVAS_PERF_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(120).max(40))
+}
 /// Longest wait for images, in frames.
 const LOAD_MAX: u32 = 6000;
 const PHASES: [&str; 6] = ["load", "still", "pan", "zoom", "drag", "after"];
@@ -50,6 +54,8 @@ pub(super) struct State {
     /// Sum of `parts` over the phase.
     total: [f32; 6],
     counts: [u64; 2],
+    /// Text layouts built over the phase.
+    layouts: u64,
     fill: f32,
     slow: String,
 
@@ -72,6 +78,28 @@ fn line(name: &str, samples: &[f32], extra: &str) -> String {
     let avg = s.iter().sum::<f32>() / s.len().max(1) as f32;
     let slow = s.iter().filter(|v| **v > 16.7).count();
     format!("{name:<6} frames={:<5} avg_ms={avg:<7.2} p50_ms={:<7.2} p95_ms={:<7.2} max_ms={:<8.2} over_16ms={slow}{extra}\n", s.len(), at(50), at(95), s.last().copied().unwrap_or(0.0))
+}
+
+/// `KANVAS_PERF_IDLE=<seconds>` (without `--bench`): counts the frames the app paints while
+/// nothing happens. Called once per frame. After half the time (the document has loaded, its
+/// textures have arrived) the frames of the other half are counted and printed, and the app
+/// exits. An app at rest paints none: a number that keeps up with the display is a repaint loop.
+pub(crate) fn idle_frame() {
+    static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STARTED.call_once(|| {
+        let Some(secs) = std::env::var("KANVAS_PERF_IDLE").ok().and_then(|v| v.parse::<f32>().ok()) else { return };
+        std::thread::spawn(move || {
+            let half = std::time::Duration::from_secs_f32(secs.max(1.0) * 0.5);
+            std::thread::sleep(half);
+            let before = FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(half);
+            let painted = FRAMES.load(std::sync::atomic::Ordering::Relaxed) - before;
+            eprintln!("IDLE {painted} frames painted in {:.1} s at rest ({:.1} per second)", half.as_secs_f32(), painted as f32 / half.as_secs_f32());
+            std::process::exit(0);
+        });
+    });
 }
 
 impl App {
@@ -104,7 +132,7 @@ impl App {
         }
         let p = &mut b.perf;
         let at = frame - p.mark;
-        if at == LEN - 20 && matches!(PHASES[p.phase], "still" | "pan" | "zoom" | "drag" | "after") && std::env::var_os("KANVAS_PERF_SHOT").is_some() {
+        if at == len() - 20 && matches!(PHASES[p.phase], "still" | "pan" | "zoom" | "drag" | "after") && std::env::var_os("KANVAS_PERF_SHOT").is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
         // `frame_ms` is the cost of the frame before this one.
@@ -121,6 +149,7 @@ impl App {
             *sum += v;
         }
         p.counts = std::array::from_fn(|i| COUNT[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+        p.layouts += p.counts[0];
         p.fill = ctx.fonts(|f| f.font_atlas_fill_ratio());
         let center = self.canvas_rect.center();
         let done = match PHASES[p.phase] {
@@ -128,16 +157,16 @@ impl App {
                 p.quiet = if self.ext.busy() + self.fonts.pending() == 0 { p.quiet + 1 } else { 0 };
                 p.quiet >= 30 || at > LOAD_MAX
             }
-            "still" | "after" => at > LEN,
+            "still" | "after" => at > len(),
             "pan" => {
                 let base = *p.base.get_or_insert(self.view);
-                let t = at as f32 / LEN as f32 * std::f32::consts::TAU;
+                let t = at as f32 / len() as f32 * std::f32::consts::TAU;
                 self.view.pan = base.pan + vec2(t.cos() - 1.0, t.sin()) * 300.0;
-                at > LEN
+                at > len()
             }
             "zoom" => {
-                self.zoom_at(center, if at <= LEN / 2 { 1.03 } else { 1.0 / 1.03 });
-                at > LEN
+                self.zoom_at(center, if at <= len() / 2 { 1.03 } else { 1.0 / 1.03 });
+                at > len()
             }
             _ => {
                 if at == 0 {
@@ -148,14 +177,14 @@ impl App {
                         let from = self.view.to_screen(self.canvas_rect.min, x, y);
                         let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
                         b.inject.extend([(frame + 1, egui::Event::PointerMoved(from)), (frame + 3, button(from, true))]);
-                        for i in 0..LEN - 12 {
-                            let t = i as f32 / (LEN - 12) as f32 * std::f32::consts::TAU;
+                        for i in 0..len() - 12 {
+                            let t = i as f32 / (len() - 12) as f32 * std::f32::consts::TAU;
                             b.inject.push((frame + 5 + i, egui::Event::PointerMoved(from + vec2(1.0 - t.cos(), t.sin()) * 60.0)));
                         }
-                        b.inject.push((frame + LEN - 4, button(from, false)));
+                        b.inject.push((frame + len() - 4, button(from, false)));
                     }
                 }
-                at > LEN
+                at > len()
             }
         };
         if !done {
@@ -173,7 +202,7 @@ impl App {
         }
         let n = p.samples.len().max(1) as f32;
         let parts: Vec<String> = PARTS.iter().zip(std::mem::take(&mut p.total)).take(5).map(|(name, v)| format!("{name}={:.2}", v / n)).collect();
-        let extra = format!("{extra} | avg {}", parts.join(" "));
+        let extra = format!("{extra} | avg {} | layouts={}", parts.join(" "), std::mem::take(&mut p.layouts));
         p.report += &line(PHASES[p.phase], &p.samples, &extra);
         if std::env::var_os("KANVAS_PERF_SERIES").is_some() {
             p.report += &format!("  series: {}
@@ -197,6 +226,21 @@ impl App {
                 self.canvas_rect.height(),
                 ctx.pixels_per_point()
             );
+            // `KANVAS_PERF_UNDO=<n>`: n edits, each an undo step, of one top-level layer after
+            // the other; then the app holds still for a moment before it closes, so that its
+            // memory can be read from outside with the steps in it.
+            if let Some(n) = std::env::var("KANVAS_PERF_UNDO").ok().and_then(|v| v.parse::<usize>().ok()) {
+                for i in 0..n {
+                    let Some(id) = self.doc.nodes.get(i % self.doc.nodes.len().max(1)).map(|t| t.id) else { break };
+                    let pre = self.doc.clone();
+                    if let Some(node) = self.doc.find_mut(id) {
+                        node.translate(1.0, 0.0);
+                    }
+                    self.push_undo(pre);
+                }
+                p.report += &format!("undo steps={}\n", self.undo.len());
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+            }
             let kept = self.ext.kept();
             let head = format!("{head}kept_frames={} pieces={} vertices={} not_kept={}
 ", kept.0, kept.1, kept.2, kept.3);

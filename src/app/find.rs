@@ -160,7 +160,7 @@ impl App {
     }
 
     /// Enter / Shift+Enter: to the next or the previous match, around the ends.
-    fn find_step(&mut self, forward: bool) {
+    fn find_step(&mut self, ctx: &egui::Context, forward: bool) {
         self.finish_text_edit();
         self.find_refresh();
         let n = self.find.matches.len();
@@ -173,12 +173,12 @@ impl App {
             (Some(i), true) => (i + 1) % n,
             (Some(i), false) => (i + n - 1) % n,
         };
-        self.find_show(i);
+        self.find_show(ctx, i);
     }
 
     /// Make match `i` the current one: go to its page, select its layer, open the frames
     /// around it in the Layers panel and bring it into view.
-    fn find_show(&mut self, i: usize) {
+    fn find_show(&mut self, ctx: &egui::Context, i: usize) {
         let Some(m) = self.find.matches.get(i).copied() else { return };
         if m.page != self.doc.page {
             self.go_page(m.page);
@@ -190,17 +190,18 @@ impl App {
         self.find.current = self.find.matches.iter().position(|x| *x == m);
         self.expanded.extend(self.doc.ancestors(m.id));
         self.sel = vec![m.id];
-        self.find_reveal(m.id);
+        self.find_reveal(ctx, m);
     }
 
     /// Bring a layer into view. A layer that is in view already, and not under the window,
     /// leaves the view alone. One that fits the canvas at the current zoom is panned to: just
     /// far enough when a part of it shows already, to the middle otherwise. The view zooms out
     /// when the layer does not fit, and zooms in (to 100% at most) only when its text would be
-    /// too small to read.
-    fn find_reveal(&mut self, id: u64) {
-        let Some(n) = self.doc.find(id) else { return };
-        let (b, size) = (n.aabb(), n.max_size());
+    /// too small to read. A text that is larger than the view where it can be read (a long
+    /// paragraph) is not shown as a whole: the lines of the match `m` in it are.
+    fn find_reveal(&mut self, ctx: &egui::Context, m: Match) {
+        let Some(n) = self.doc.find(m.id) else { return };
+        let (mut b, size) = (n.aabb(), n.max_size());
         let canvas = self.canvas_rect;
         // (The toolbar lies over the bottom of the canvas.)
         let mut room = Rect::from_min_max(canvas.min + vec2(48.0, 48.0), canvas.max - vec2(48.0, 104.0));
@@ -208,6 +209,30 @@ impl App {
         let window = self.find.rect.filter(|w| w.intersects(canvas));
         if let Some(w) = window.filter(|w| w.bottom() + 24.0 < canvas.center().y) {
             room.min.y = w.bottom() + 24.0;
+        }
+        // The zoom at which the text can be read (as below): does the whole box fit there?
+        let readable = self.view.zoom.max((7.0 / size.max(1e-3)).min(1.0));
+        if n.kind == Kind::Text && n.on_path.is_none() && !n.text.is_empty() && ((b.2 - b.0) * readable > room.width() || (b.3 - b.1) * readable > room.height()) {
+            use egui::text::CCursor;
+            let f = (200.0 / size.max(1e-3)).min(1.0);
+            let layout = render::layout_text(ctx, n, &n.text, &mut self.fonts, f, 1.0, true);
+            let off = render::text_offset(n, &layout, f) / f;
+            let g = &layout.galley;
+            let (ca, cb) = (g.from_ccursor(CCursor::new(m.start)), g.from_ccursor(CCursor::new(m.end)));
+            let (ra, rb) = (g.pos_from_cursor(&ca), g.pos_from_cursor(&cb));
+            // From the first line of the match to its last; across, the match itself when it
+            // is on one line, else the width of the text.
+            let (left, right) = if ca.rcursor.row == cb.rcursor.row { (ra.left().min(rb.left()), ra.left().max(rb.left())) } else { (g.rect.left(), g.rect.right()) };
+            let at = |x: f32, y: f32| (n.x + off.x + x / f, n.y + off.y + y / f);
+            let ((x0, y0), (x1, y1)) = (at(left, ra.top().min(rb.top())), at(right, ra.bottom().max(rb.bottom())));
+            // As the node is drawn: mirrored about the centre of its box, then rotated.
+            let ((cx, cy), (flip_h, flip_v)) = (n.center(), n.flips());
+            let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| {
+                let (x, y) = (if flip_h { 2.0 * cx - x } else { x }, if flip_v { 2.0 * cy - y } else { y });
+                crate::doc::rotate(x, y, cx, cy, n.rotation)
+            });
+            let pad = size * 0.5;
+            b = corners.iter().fold((f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY), |b, p| (b.0.min(p.0 - pad), b.1.min(p.1 - pad), b.2.max(p.0 + pad), b.3.max(p.1 + pad)));
         }
         let (bw, bh) = ((b.2 - b.0).max(1.0), (b.3 - b.1).max(1.0));
         let z = self.view.zoom;
@@ -288,7 +313,7 @@ impl App {
         self.finish_text_edit();
         self.find_refresh();
         let Some((i, m)) = self.find.current.and_then(|i| Some((i, *self.find.matches.get(i)?))) else {
-            return self.find_step(true);
+            return self.find_step(ctx, true);
         };
         let (query, opt, with) = (self.find.query.clone(), self.find.opt, self.find.with.clone());
         let (count, changed, removed) = self.replace_matches(&[m], &query, opt, &with);
@@ -315,7 +340,7 @@ impl App {
             self.status = "Replaced 1 match. That was the last one.".into();
         } else {
             self.status = format!("Replaced 1 match. {left} left.");
-            self.find_show(if next < left { next } else { 0 });
+            self.find_show(ctx, if next < left { next } else { 0 });
         }
         if removed > 0 {
             self.status.push_str(" The text was left empty, so its layer was removed.");
@@ -432,7 +457,7 @@ impl App {
             }
         }
         if let Some(forward) = step {
-            self.find_step(forward);
+            self.find_step(ctx, forward);
         }
         if replace_all {
             self.find_replace_all(ctx);
@@ -633,6 +658,15 @@ impl App {
         self.tool = Tool::Select;
         self.find.query = "kanvas".into();
         match mode {
+            // `tall`: a text of 300 lines with one match far down, where the whole text would
+            // only fit the view too small to read: the step goes to the lines of the match.
+            "tall" => {
+                let lines: String = (0..300).map(|i| if i == 250 { "Line 250 has the needle in it.\n".to_owned() } else { format!("Line {i} of a long text with nothing to find in it.\n") }).collect();
+                let mut n = Node::new(self.doc.alloc_id(), Kind::Text, x + 1200.0, y);
+                (n.name, n.text, n.font_size, n.fill, n.wrap, n.w, n.h) = ("Tall".into(), lines, 16.0, Some([235, 235, 240, 255]), true, 420.0, 5800.0);
+                self.doc.insert(n, None);
+                self.find.query = "needle".into();
+            }
             "keys" => self.find.query.clear(),
             "all" => self.find.scope = Where::All,
             "selection" => {
@@ -670,7 +704,7 @@ impl App {
         };
         let steps: u32 = mode.parse().unwrap_or(0);
         if (215..215 + steps * 3).contains(&frame) && (frame - 215) % 3 == 0 {
-            self.find_step(true);
+            self.find_step(ctx, true);
         }
         match (mode, frame) {
             ("replace", 215) => {
@@ -690,13 +724,13 @@ impl App {
             }
             ("one", 215) => {
                 self.find.with = "Kanvas Pro".into();
-                self.find_step(true);
+                self.find_step(ctx, true);
             }
             ("one", 220 | 225) => self.find_replace_one(ctx),
-            ("all", 215) => self.find_step(false),
-            ("selection" | "far", 215) => {
+            ("all", 215) => self.find_step(ctx, false),
+            ("selection" | "far" | "tall", 215) => {
                 eprintln!("FIND zoom before the step: {:.3}", self.view.zoom);
-                self.find_step(true);
+                self.find_step(ctx, true);
             }
             ("keys", 200) => {
                 inject.extend(key(212, Key::F, Modifiers::COMMAND));

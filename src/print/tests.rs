@@ -657,3 +657,23 @@ fn bitmaps_in_a_vector_pdf_have_a_sensible_resolution() {
     assert!(close(super::raster_scale(300.0), 1.0));
     assert!(close(super::raster_scale(600.0), 0.5));
 }
+
+#[test]
+fn flattened_page_is_capped_by_area() {
+    // An A4 page at 72 px per inch: 300 dpi as asked for.
+    let print = Print { flatten: true, ..Default::default() };
+    assert!(close(flatten_scale(595.0, 842.0, &print), 300.0 / 72.0));
+    // A page of 12000 × 12000 px at 300 px per inch would be 144 megapixels: fewer pixels.
+    let print = Print { flatten: true, ppi: 300.0, ..Default::default() };
+    let scale = flatten_scale(12000.0, 12000.0, &print);
+    assert!(scale < 1.0 && (12000.0 * scale).powi(2) <= FLATTEN_PIXELS * 1.001, "{scale}");
+    // The samples of a small page: three bytes a pixel on white, four in CMYK.
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="5" height="10" fill="#ff0000"/></svg>"##;
+    let print = Print { flatten: true, ..Default::default() };
+    let (rgb, w, h, lower) = flatten(svg, 10.0, 10.0, &print, None).unwrap();
+    assert_eq!((rgb.len(), lower), ((w * h * 3) as usize, None));
+    assert_eq!((&rgb[..3], &rgb[rgb.len() - 3..]), (&[255, 0, 0][..], &[255, 255, 255][..]));
+    let (cmyk, w, h, _) = flatten(svg, 10.0, 10.0, &print, Some(&Colour::naive())).unwrap();
+    assert_eq!(cmyk.len(), (w * h * 4) as usize);
+    assert_eq!((&cmyk[..4], &cmyk[cmyk.len() - 4..]), (&[0, 255, 255, 0][..], &[0, 0, 0, 0][..]));
+}

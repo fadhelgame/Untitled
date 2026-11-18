@@ -991,6 +991,19 @@ impl Node {
         out
     }
 
+    /// A box around one contour, in world coordinates: around its points and their handles,
+    /// which a curve never leaves (and rounded corners only cut short).
+    fn contour_box(&self, points: &[PathPoint]) -> (f32, f32, f32, f32) {
+        let mut b = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for p in points {
+            for (x, y) in [(p.x, p.y), (p.x + p.hin[0], p.y + p.hin[1]), (p.x + p.hout[0], p.y + p.hout[1])] {
+                let (x, y) = (self.x + x * self.w, self.y + y * self.h);
+                b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+            }
+        }
+        b
+    }
+
     fn flatten(&self, points: &[PathPoint], closed: bool, segs: usize) -> Vec<(f32, f32)> {
         self.flatten_by(points, closed, &|_| segs.max(2))
     }
@@ -1055,11 +1068,22 @@ impl Node {
                 if px < x0 - pad || px > x1 + pad || py < y0 - pad || py > y1 + pad {
                     return false;
                 }
-                let contours = self.contours(10);
-                if contours[0].len() < 2 {
+                if self.points.len() < 2 {
                     return false;
                 }
-                if self.closed && self.fill.is_some() {
+                // Only the contours the point can have to do with are flattened: one whose box
+                // is not crossed by the ray to the right of the point (the inside test below)
+                // and is not within reach of the point (the edge test) changes nothing. A path
+                // of many contours, such as outlined text, is mostly those.
+                let filled = self.closed && self.fill.is_some();
+                let limit = tol + self.stroke_w * 0.5;
+                let near = |points: &[PathPoint]| {
+                    let (bx0, by0, bx1, by1) = self.contour_box(points);
+                    py >= by0 - limit && py <= by1 + limit && px <= bx1 + limit && (px >= bx0 - limit || filled)
+                };
+                let mut contours = vec![if near(&self.points) { self.flatten(&self.points, self.closed, 10) } else { Vec::new() }];
+                contours.extend(self.holes.iter().map(|h| if near(h) { self.flatten(h, true, 10) } else { Vec::new() }));
+                if filled {
                     // Uji titik-dalam-poligon (even-odd) atas semua kontur.
                     let mut inside = false;
                     for pts in &contours {
@@ -1080,7 +1104,6 @@ impl Node {
                         return true;
                     }
                 }
-                let limit = tol + self.stroke_w * 0.5;
                 contours.iter().enumerate().any(|(c, pts)| {
                     let m = pts.len();
                     if m < 2 {
@@ -1550,7 +1573,75 @@ pub struct Doc {
     /// Text styles: gaya teks bernama yang dipakai bersama.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_styles: Vec<TypeStyle>,
+    /// The print settings of the export (bleed, resolution, crop marks, CMYK, flattening, ICC
+    /// profile). Left out of the file while nothing is set.
+    #[serde(default, skip_serializing_if = "crate::print::Print::is_default")]
+    pub print: crate::print::Print,
+    /// Where the nodes of the current page are, for `find` and its like (see `Index`).
+    #[serde(skip)]
+    index: Index,
 }
+
+/// Where every node of the current page is, by its id, so `Doc::find`, `locate`, `parent_of`
+/// and the rest need not walk the whole page for each id (with thousands of layers selected
+/// the panels ask thousands of times per frame).
+///
+/// It is made by `Doc::reindex`, which the app calls once per frame, and never trusted
+/// blindly: what it says about a node holds for the top-level `Arc` it was read from, and is
+/// used only while the document still has that very `Arc` in that place. The index keeps a
+/// `Weak` to each, which makes that test sound: a top-level node cannot be changed in place
+/// while a `Weak` to it exists (`Arc::make_mut` moves it to a new allocation then), and the
+/// allocation is not reused while the `Weak` is held. Whatever the index cannot answer is
+/// looked up the slow way, so a document that was just edited, or a copy of one (a copy starts
+/// without an index), behaves as before.
+#[derive(Default)]
+pub struct Index(std::sync::Mutex<IndexData>);
+
+impl Clone for Index {
+    fn clone(&self) -> Self {
+        Index::default()
+    }
+}
+
+#[derive(Default)]
+struct IndexData {
+    /// The top-level nodes the entries were read from, and the ids found in each.
+    tops: Vec<std::sync::Weak<Node>>,
+    ids: Vec<Vec<u64>>,
+    /// Per id: the index of its top-level node, its parent, and its place among the children
+    /// of that parent (for a top-level node: among the top-level nodes).
+    map: IdMap<(u32, Option<u64>, u32)>,
+    /// A new number whenever `reindex` finds the page changed.
+    stamp: u64,
+    /// The top-level nodes `settle_around` laid out last, and with what lifted (see `Doc::settled`).
+    settled: Vec<(std::sync::Weak<Node>, Vec<u64>)>,
+}
+
+/// A map from node ids. Ids are numbers handed out one after the other, so one multiplication
+/// spreads them well enough, and looking one up costs a fraction of the default hasher.
+type IdMap<T> = HashMap<u64, T, std::hash::BuildHasherDefault<IdHasher>>;
+
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, id: u64) {
+        self.0 = (id ^ (id >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+    }
+}
+
+/// The deepest path the index answers for; deeper nodes are found the slow way.
+const INDEX_DEPTH: usize = 16;
 
 impl Doc {
     pub fn color_style(&self, id: u64) -> Option<&ColorStyle> {
@@ -1821,9 +1912,124 @@ impl Doc {
         key
     }
 
+    /// Bring the index of the current page up to date (see `Index`). Cheap when nothing
+    /// changed; otherwise only the top-level nodes that changed are read again.
+    /// Result: a number that is the same for as long as the nodes of the page stay as they
+    /// are, from one call to the next (what was made for it can be kept until it changes).
+    pub fn reindex(&self) -> u64 {
+        let mut guard = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
+        let ix = &mut *guard;
+        let n = self.nodes.len();
+        let stale: Vec<usize> = (0..n).filter(|i| ix.tops.get(*i).map(std::sync::Weak::as_ptr) != Some(Arc::as_ptr(&self.nodes[*i]))).collect();
+        if stale.is_empty() && ix.tops.len() == n {
+            return ix.stamp;
+        }
+        // (A number no other document has had either: a copy that takes this one's place, as
+        // on undo, starts without an index and must not come to a number seen before.)
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        ix.stamp = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for i in stale.iter().copied().chain(n..ix.tops.len()) {
+            let Some(ids) = ix.ids.get_mut(i) else { continue };
+            for id in std::mem::take(ids) {
+                if ix.map.get(&id).is_some_and(|e| e.0 == i as u32) {
+                    ix.map.remove(&id);
+                }
+            }
+        }
+        ix.tops.resize(n, std::sync::Weak::new());
+        ix.ids.resize(n, Vec::new());
+        fn add(n: &Node, top: u32, parent: Option<u64>, slot: u32, ids: &mut Vec<u64>, map: &mut IdMap<(u32, Option<u64>, u32)>) {
+            ids.push(n.id);
+            map.insert(n.id, (top, parent, slot));
+            for (i, c) in n.children.iter().enumerate() {
+                add(c, top, Some(n.id), i as u32, ids, map);
+            }
+        }
+        for i in stale {
+            ix.tops[i] = Arc::downgrade(&self.nodes[i]);
+            add(&self.nodes[i], i as u32, None, i as u32, &mut ix.ids[i], &mut ix.map);
+        }
+        ix.stamp
+    }
+
+    /// Was the top-level node `top` laid out with these `lifted` items by the last
+    /// `settle_around`, and is it still the same? With `note`, it is put down as such. (The
+    /// `Weak` kept for it sees to it that the same address is the same content, as in `Index`.)
+    pub(crate) fn settled(&self, top: &Arc<Node>, lifted: &[u64], note: bool) -> bool {
+        let mut ix = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
+        let known = ix.settled.iter().any(|(w, l)| w.as_ptr() == Arc::as_ptr(top) && l == lifted);
+        if note && !known {
+            if ix.settled.len() >= 8 {
+                ix.settled.remove(0);
+            }
+            ix.settled.push((Arc::downgrade(top), lifted.to_vec()));
+        }
+        known
+    }
+
+    /// The path of `locate`, from the index: (path, its length). `None`: the index does not
+    /// know (it has not seen the node, or its top-level node changed since).
+    fn indexed(&self, id: u64) -> Option<([usize; INDEX_DEPTH], usize)> {
+        let ix = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
+        let &(top, mut parent, slot) = ix.map.get(&id)?;
+        if ix.tops.get(top as usize)?.as_ptr() != Arc::as_ptr(self.nodes.get(top as usize)?) {
+            return None;
+        }
+        // From the node up to its top-level node, then turned around.
+        let (mut path, mut len) = ([0usize; INDEX_DEPTH], 1);
+        path[0] = slot as usize;
+        while let Some(p) = parent {
+            let &(_, above, slot) = ix.map.get(&p)?;
+            if len == INDEX_DEPTH {
+                return None;
+            }
+            path[len] = slot as usize;
+            len += 1;
+            parent = above;
+        }
+        path[..len].reverse();
+        Some((path, len))
+    }
+
+    /// Is one of the frames around `id` among `ids`? (`ancestors` without making the list.)
+    fn inside_one_of(&self, id: u64, ids: &std::collections::HashSet<u64>) -> bool {
+        {
+            let ix = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
+            let known = ix.map.get(&id).filter(|e| ix.tops.get(e.0 as usize).zip(self.nodes.get(e.0 as usize)).is_some_and(|(w, top)| w.as_ptr() == Arc::as_ptr(top)));
+            if let Some(&(_, mut parent, _)) = known {
+                while let Some(p) = parent {
+                    if ids.contains(&p) {
+                        return true;
+                    }
+                    parent = ix.map.get(&p).and_then(|e| e.1);
+                }
+                return false;
+            }
+        }
+        self.ancestors(id).iter().any(|a| ids.contains(a))
+    }
+
+    /// The node `id` and the index of its top-level node, from the index (see `indexed`).
+    fn indexed_node(&self, id: u64) -> Option<(usize, &Node)> {
+        let (path, len) = self.indexed(id)?;
+        let n = self.at(&path[..len]).filter(|n| n.id == id)?;
+        Some((path[0], n))
+    }
+
+    /// The node `id` and the index of the top-level node that holds it.
+    pub fn find_top(&self, id: u64) -> Option<(usize, &Node)> {
+        if let Some(found) = self.indexed_node(id) {
+            return Some(found);
+        }
+        self.nodes.iter().enumerate().find_map(|(i, n)| Some((i, n.find(id)?)))
+    }
+
     /// Where a node is: the index among the top-level nodes, then the child index at each level
     /// below (so a top-level node has a path of length 1).
     pub fn locate(&self, id: u64) -> Option<Vec<usize>> {
+        if let Some((path, len)) = self.indexed(id).filter(|(path, len)| self.at(&path[..*len]).is_some_and(|n| n.id == id)) {
+            return Some(path[..len].to_vec());
+        }
         let mut path = Vec::new();
         for (ti, n) in self.nodes.iter().enumerate() {
             path.push(ti);
@@ -1852,12 +2058,15 @@ impl Doc {
     }
 
     pub fn find(&self, id: u64) -> Option<&Node> {
+        if let Some((_, n)) = self.indexed_node(id) {
+            return Some(n);
+        }
         self.nodes.iter().find_map(|n| n.find(id))
     }
 
     /// Only the top-level node that holds `id` is copied (when an undo snapshot shares it).
     pub fn find_mut(&mut self, id: u64) -> Option<&mut Node> {
-        let ti = self.nodes.iter().position(|n| n.find(id).is_some())?;
+        let ti = self.find_top(id)?.0;
         Arc::make_mut(&mut self.nodes[ti]).find_mut(id)
     }
 
@@ -1889,7 +2098,7 @@ impl Doc {
 
     /// The top-level node that holds `id` (the node itself when it is top-level).
     pub fn top_of(&self, id: u64) -> Option<u64> {
-        self.nodes.iter().find(|n| n.find(id).is_some()).map(|n| n.id)
+        self.find_top(id).map(|(i, _)| self.nodes[i].id)
     }
 
     /// Is `id` somewhere inside `of` (at any depth)? A node is not its own descendant.
@@ -1908,6 +2117,12 @@ impl Doc {
     /// Drop the ids that sit inside another node of the list, so a frame and its content are
     /// handled once. The order of the rest is kept.
     pub fn roots_of(&self, ids: &[u64]) -> Vec<u64> {
+        // (A long list is looked up in a set: with thousands of layers selected this is asked
+        // for several times per frame.)
+        if ids.len() > 32 {
+            let set: std::collections::HashSet<u64> = ids.iter().copied().collect();
+            return ids.iter().copied().filter(|id| !self.inside_one_of(*id, &set)).collect();
+        }
         ids.iter().copied().filter(|id| !self.ancestors(*id).iter().any(|a| ids.contains(a))).collect()
     }
 
@@ -2245,6 +2460,103 @@ impl Doc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three top-level nodes: a frame (1) that holds a rectangle (2) and a frame (3) with a
+    /// rectangle (4) in it, a loose rectangle (5) and an empty frame (6).
+    fn indexed_doc() -> Doc {
+        let mut doc = Doc::default();
+        for (id, kind, parent) in [(1, Kind::Frame, None), (2, Kind::Rect, Some(1)), (3, Kind::Frame, Some(1)), (4, Kind::Rect, Some(3)), (5, Kind::Rect, None), (6, Kind::Frame, None)] {
+            let mut n = Node::new(id, kind, id as f32 * 10.0, 0.0);
+            (n.w, n.h) = (if kind == Kind::Frame { 400.0 } else { 5.0 }, 5.0);
+            doc.insert(n, parent);
+        }
+        doc.next_id = 6;
+        doc
+    }
+
+    /// What the lookups say, to compare a document with and without an index.
+    fn lookups(doc: &Doc) -> Vec<(Option<u64>, Option<Vec<usize>>, Option<u64>, Option<u64>, Vec<u64>)> {
+        (0..9u64).map(|id| (doc.find(id).map(|n| n.id), doc.locate(id), doc.parent_of(id), doc.top_of(id), doc.ancestors(id))).collect()
+    }
+
+    #[test]
+    fn index_answers_as_the_slow_lookups_do_and_follows_every_change() {
+        let mut doc = indexed_doc();
+        let plain = lookups(&doc);
+        assert_eq!(plain[4], (Some(4), Some(vec![0, 1, 0]), Some(3), Some(1), vec![3, 1]));
+        let stamp = doc.reindex();
+        assert_eq!(lookups(&doc), plain);
+        // Nothing changed: the same number, and a copy (an undo snapshot) starts without an index.
+        assert_eq!(doc.reindex(), stamp);
+        let before = doc.clone();
+        assert_eq!(lookups(&before), plain);
+        // An edit of a node that the index knows goes to another allocation, so what the index
+        // says about that top-level node is no longer used; the answers stay right.
+        let was = Arc::as_ptr(&doc.nodes[0]);
+        doc.find_mut(4).unwrap().x = 77.0;
+        assert_ne!(Arc::as_ptr(&doc.nodes[0]), was);
+        assert_eq!(doc.find(4).map(|n| n.x), Some(77.0));
+        assert_eq!(lookups(&doc), plain);
+        // The untouched top-level nodes are still shared with the copy.
+        assert!(Arc::ptr_eq(&doc.nodes[1], &before.nodes[1]) && Arc::ptr_eq(&doc.nodes[2], &before.nodes[2]));
+        // Moving a node to another frame, removing one, reordering the top level: each is seen.
+        let moved = doc.remove(4).unwrap();
+        doc.insert(moved, Some(6));
+        doc.remove(2);
+        doc.nodes.swap(0, 1);
+        let slow = lookups(&doc.clone());
+        assert_eq!(lookups(&doc), slow);
+        let next = doc.reindex();
+        assert_ne!(next, stamp);
+        assert_eq!(lookups(&doc), slow);
+        assert_eq!((doc.parent_of(4), doc.top_of(4), doc.find(2).map(|n| n.id), doc.locate(5)), (Some(6), Some(6), None, Some(vec![0])));
+        // Undo puts the old document back: its own index is made anew, with a number of its own.
+        doc = before;
+        assert_eq!(lookups(&doc), plain);
+        let undone = doc.reindex();
+        assert!(undone != stamp && undone != next);
+        assert_eq!(lookups(&doc), plain);
+        // A long list goes through a set; a short one does not. Both drop what is inside another.
+        let many: Vec<u64> = (1..=6).chain(100..140).collect();
+        assert_eq!(doc.roots_of(&many)[..3], [1, 5, 6]);
+        assert_eq!(doc.roots_of(&[4, 3, 5]), [3, 5]);
+    }
+
+    #[test]
+    fn print_settings_are_saved_with_the_document_once_they_are_set() {
+        let mut doc = indexed_doc();
+        let plain = serde_json::to_string(&doc).unwrap();
+        // Untouched settings leave no trace: the file of such a document is what it always was.
+        assert!(!plain.contains("print") && !plain.contains("index"));
+        assert!(serde_json::from_str::<Doc>(&plain).unwrap().print.is_default());
+        doc.print = crate::print::Print { bleed_mm: 3.0, marks: true, cmyk: true, flatten: false, icc: Some("press.icc".into()), ppi: 300.0 };
+        let saved = serde_json::to_string(&doc).unwrap();
+        assert_eq!(serde_json::from_str::<Doc>(&saved).unwrap().print, doc.print);
+        // Settings written by a version that knew fewer of them: the rest are as by default.
+        let older = saved.replace(r#""ppi":300.0"#, r#""later":1"#);
+        assert_ne!(older, saved);
+        let read = serde_json::from_str::<Doc>(&older).unwrap().print;
+        assert_eq!((read.bleed_mm, read.cmyk, read.ppi), (3.0, true, 72.0));
+    }
+
+    #[test]
+    fn hit_test_of_a_path_with_many_contours_looks_only_at_those_near_the_point() {
+        // Two squares far apart in one path (the second is a hole of the first, as the letters
+        // of outlined text are), filled.
+        let square = |x: f32, y: f32| -> Vec<PathPoint> { [(x, y), (x + 0.1, y), (x + 0.1, y + 0.1), (x, y + 0.1)].into_iter().map(|(x, y)| PathPoint { x, y, hin: [0.0; 2], hout: [0.0; 2], r: None }).collect() };
+        let mut n = Node::new(1, Kind::Path, 100.0, 100.0);
+        (n.w, n.h, n.closed, n.fill, n.stroke_w) = (1000.0, 1000.0, true, Some([0, 0, 0, 255]), 0.0);
+        (n.points, n.holes) = (square(0.0, 0.0), vec![square(0.8, 0.8), square(0.0, 0.8)]);
+        // Inside each square, between them, just outside an edge (within and beyond reach).
+        assert!(n.contains(150.0, 150.0, 1.0) && n.contains(950.0, 950.0, 1.0) && n.contains(150.0, 950.0, 1.0));
+        assert!(!n.contains(500.0, 500.0, 1.0) && !n.contains(500.0, 150.0, 1.0) && !n.contains(50.0, 950.0, 1.0));
+        assert!(n.contains(202.0, 150.0, 3.0) && !n.contains(206.0, 150.0, 3.0));
+        // Left of both squares of the lower row, on their height: the ray crosses each twice.
+        assert!(!n.contains(99.0, 950.0, 0.5));
+        // An open path is hit on its line only.
+        (n.closed, n.holes, n.stroke_w) = (false, Vec::new(), 4.0);
+        assert!(n.contains(150.0, 101.0, 1.0) && !n.contains(150.0, 150.0, 1.0));
+    }
 
     fn text_node(s: &str) -> Node {
         let mut n = Node::new(1, Kind::Text, 0.0, 0.0);

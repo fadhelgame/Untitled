@@ -141,6 +141,8 @@ impl App {
         }
         let (tl, br) = (self.view.to_world(o, rect.min), self.view.to_world(o, rect.max));
         self.fonts.layouts.begin(&ctx);
+        // (What the pointer did above may have changed the document.)
+        self.doc.reindex();
         let origin = self.view.to_screen(o, 0.0, 0.0);
         let still = origin == self.ext.last_origin;
         self.ext.last_origin = origin;
@@ -157,7 +159,7 @@ impl App {
             moving,
             measures: Vec::new(),
             boxes: Vec::new(),
-            index: None,
+            doc: &self.doc,
             rec_top: None,
             drawn: 0,
             capture: None,
@@ -167,6 +169,7 @@ impl App {
             depth: 0,
             recording: false,
             no_keep: false,
+            keep_later: false,
             specials: Vec::new(),
         };
         self.labels.clear();
@@ -242,18 +245,37 @@ impl App {
 
         // --- overlay: hover, seleksi, pegangan, marquee ---
         let idle = matches!(self.drag, Drag::None);
+        let mut under = None;
         if idle && hovered && self.pointer_tool() && self.editing.is_none() && self.crop.is_none() {
             if let Some(p) = inp.pos {
                 let wp = self.view.to_world(o, p);
-                if let Some(n) = self.hit(p, wp, 4.0 / z).filter(|id| !self.sel.contains(id)).and_then(|id| self.doc.find(id)) {
-                    self.outline(&painter, n, 1.0);
-                }
+                under = self.hit(p, wp, 4.0 / z).filter(|id| !self.sel.contains(id));
             }
         }
-        for id in &self.sel {
-            if let Some(n) = self.doc.find(*id) {
-                self.outline(&painter, n, 1.5);
-            }
+        if under.is_some() || !self.sel.is_empty() {
+            // The outlines are kept as one mesh for as long as the document, the selection and
+            // the zoom stay as they are: with thousands of layers selected, or a few outlined
+            // texts, making them anew on every frame was most of the frame.
+            // (Painting may have changed the document too: texts are measured there.)
+            let stamp = self.doc.reindex();
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (stamp, self.doc.page, under, &self.sel, z.to_bits(), ctx.pixels_per_point().to_bits()).hash(&mut h);
+            let (doc, sel, view) = (&self.doc, &self.sel, self.view);
+            let mesh = render::overlay_mesh(&mut self.ext, &ctx, h.finish(), view.to_screen(o, 0.0, 0.0), || {
+                let mut shapes = Vec::new();
+                let mut budget = OUTLINE_CONTOURS;
+                if let Some(n) = under.and_then(|id| doc.find(id)) {
+                    outline(&mut shapes, view, o, n, 1.0, &mut budget);
+                }
+                // (The selection has a budget of its own: what is under the pointer takes none of it.)
+                budget = OUTLINE_CONTOURS;
+                for n in sel.iter().filter_map(|id| doc.find(*id)) {
+                    outline(&mut shapes, view, o, n, 1.5, &mut budget);
+                }
+                shapes
+            });
+            painter.add(egui::Shape::mesh(mesh));
         }
         if self.sel.len() == 1 && self.editing.is_none() && self.ext.path_edit.is_none() {
             if let Some(n) = self.doc.find(self.sel[0]) {
@@ -367,37 +389,6 @@ impl App {
 
         self.text_editor(&ctx, &painter, hovered);
         self.paint_rulers(&ctx, &painter, inp.pos, hovered);
-    }
-
-    fn outline(&self, painter: &egui::Painter, n: &Node, width: f32) {
-        let accent = if n.is_linked() || n.source.is_some() { components::PURPLE } else { ACCENT };
-        let o = self.canvas_rect.min;
-        let (cx, cy) = n.center();
-        // Titik dunia → layar, mengikuti rotasi node.
-        let s = |x: f32, y: f32| {
-            let (x, y) = if n.rotation != 0.0 { crate::doc::rotate(x, y, cx, cy, n.rotation) } else { (x, y) };
-            self.view.to_screen(o, x, y)
-        };
-        match n.kind {
-            Kind::Line => {
-                painter.line_segment([s(n.x, n.y), s(n.x + n.w, n.y + n.h)], Stroke::new(width + 0.5, accent));
-            }
-            // (A path of very many contours, such as a paragraph of outlined text, gets its box
-            // like other nodes: thousands of little outlines are slow to draw and say nothing.)
-            Kind::Path if n.holes.len() <= 60 => {
-                let stroke = Stroke::new(width, accent);
-                // (Each curve by its own size: outlined text is hundreds of small ones.)
-                for (c, ring) in n.contours_within(0.25 / self.view.zoom.max(1e-6), 16).into_iter().enumerate() {
-                    let pts: Vec<Pos2> = ring.into_iter().map(|(x, y)| s(x, y)).collect();
-                    painter.add(if n.closed || c > 0 { egui::Shape::closed_line(pts, stroke) } else { egui::Shape::line(pts, stroke) });
-                }
-            }
-            _ => {
-                let (x0, y0, x1, y1) = n.bounds();
-                let corners = vec![s(x0, y0), s(x1, y0), s(x1, y1), s(x0, y1)];
-                painter.add(egui::Shape::closed_line(corners, Stroke::new(width, accent)));
-            }
-        }
     }
 
     /// Kotak di layar tempat klik masih dianggap "di dalam teks yang sedang diedit".
@@ -1839,6 +1830,46 @@ fn word_at(text: &str, at: usize) -> (usize, usize) {
         b += 1;
     }
     (a, b)
+}
+
+/// How many contours of paths are outlined for one selection, all its paths together; the
+/// paths after that get their box.
+const OUTLINE_CONTOURS: usize = 240;
+
+/// The outline of `n` as it is selected or under the pointer: its shape for a line or a path,
+/// its box for anything else. `budget`: how many contours of paths may still be outlined
+/// (see `OUTLINE_CONTOURS`); what `n` uses of it is taken off.
+fn outline(shapes: &mut Vec<egui::Shape>, view: View, o: Pos2, n: &Node, width: f32, budget: &mut usize) {
+    let accent = if n.is_linked() || n.source.is_some() { components::PURPLE } else { ACCENT };
+    let (cx, cy) = n.center();
+    // Titik dunia → layar, mengikuti rotasi node.
+    let s = |x: f32, y: f32| {
+        let (x, y) = if n.rotation != 0.0 { crate::doc::rotate(x, y, cx, cy, n.rotation) } else { (x, y) };
+        view.to_screen(o, x, y)
+    };
+    let contours = 1 + n.holes.len();
+    match n.kind {
+        Kind::Line => {
+            shapes.push(egui::Shape::line_segment([s(n.x, n.y), s(n.x + n.w, n.y + n.h)], Stroke::new(width + 0.5, accent)));
+        }
+        // (A path of very many contours, such as a paragraph of outlined text, gets its box
+        // like other nodes: thousands of little outlines are slow to draw and say nothing.
+        // The same goes for many such paths selected together.)
+        Kind::Path if contours <= 61 && contours <= *budget => {
+            *budget -= contours;
+            let stroke = Stroke::new(width, accent);
+            // (Each curve by its own size: outlined text is hundreds of small ones.)
+            for (c, ring) in n.contours_within(0.25 / view.zoom.max(1e-6), 16).into_iter().enumerate() {
+                let pts: Vec<Pos2> = ring.into_iter().map(|(x, y)| s(x, y)).collect();
+                shapes.push(if n.closed || c > 0 { egui::Shape::closed_line(pts, stroke) } else { egui::Shape::line(pts, stroke) });
+            }
+        }
+        _ => {
+            let (x0, y0, x1, y1) = n.bounds();
+            let corners = vec![s(x0, y0), s(x1, y0), s(x1, y1), s(x0, y1)];
+            shapes.push(egui::Shape::closed_line(corners, Stroke::new(width, accent)));
+        }
+    }
 }
 
 #[cfg(test)]

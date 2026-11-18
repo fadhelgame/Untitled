@@ -118,7 +118,11 @@ impl App {
             return;
         }
         let id = self.sel[0];
-        let Some(orig) = self.doc.find(id).cloned() else { return };
+        let Some(mut orig) = self.doc.find(id).cloned() else { return };
+        // What the node holds is not edited here: it stays out of the two copies below (a
+        // frame of thousands of layers was copied three times per frame) and is put back
+        // into the one that is written to the document, further down.
+        let held = std::mem::take(&mut orig.children);
 
         // Sedang mengedit teks dengan huruf terseleksi: panel menampilkan dan mengubah
         // gaya rentang itu saja, bukan seluruh teks.
@@ -131,6 +135,7 @@ impl App {
             n.apply_style(style);
         }
         let before = n.clone();
+        orig.children = held;
         let mut align: Option<u8> = None;
         let mut flip: Option<bool> = None;
         let mut remove_bg = false;
@@ -467,6 +472,7 @@ impl App {
         if n == before {
             return;
         }
+        n.children.clone_from(&orig.children);
         // Perubahan beruntun pada objek yang sama digabung jadi satu langkah undo.
         if self.last_prop.0 != id || now - self.last_prop.1 > 0.8 {
             let pre = self.doc.clone();
@@ -543,6 +549,33 @@ impl App {
         }
     }
 
+    /// What the Design panel shows about a selection of several layers as a whole (see
+    /// `SelFacts`). Each of these asks about every selected layer and the frame it is in, so
+    /// they are worked out once and kept until the document or the selection changes.
+    fn sel_facts(&mut self, ids: &[u64]) -> SelFacts {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.doc.reindex(), self.doc.page, ids).hash(&mut h);
+        let key = h.finish();
+        if let Some((_, facts)) = self.sel_memo.as_ref().filter(|m| m.0 == key) {
+            return facts.clone();
+        }
+        let facts = SelFacts {
+            group: self.selected_whole_group(),
+            pinned: self.sel_pinned(),
+            units: self.doc.unit_count(ids),
+            constrained: self.constraints_shown(),
+            in_auto: ids.iter().all(|id| self.doc.parent_of(*id).and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto())),
+            // The sizes that every selected layer can have.
+            choices: [true, false].map(|horizontal| {
+                let lists: Vec<Vec<Sizing>> = ids.iter().map(|id| self.sizing_choices(*id, horizontal)).collect();
+                Sizing::ALL.into_iter().filter(|s| lists.iter().all(|l| l.contains(s))).collect::<Vec<_>>()
+            }),
+        };
+        self.sel_memo = Some((key, facts.clone()));
+        facts
+    }
+
     /// Properti bersama untuk beberapa objek terpilih. Nilai yang tampil diambil dari objek pertama;
     /// hanya properti yang diubah di panel yang disalin ke semua objek terpilih.
     fn multi_props(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -591,23 +624,17 @@ impl App {
         }
         let before = n.clone();
         let key = ids[0];
-        let group = self.selected_whole_group();
-        let pinned = self.sel_pinned();
+        let facts = self.sel_facts(&ids);
+        let (group, pinned) = (facts.group, facts.pinned);
         let mut comp_act: Option<super::components::Act> = None;
         let mut align: Option<u8> = None;
         let mut flip: Option<bool> = None;
-        let units = self.doc.unit_count(&ids);
-        let constrained = self.constraints_shown();
+        let (units, constrained) = (facts.units, facts.constrained);
         let mut constrain: super::constraints::Pair = (None, None);
         let mut auto_act: Option<super::autolayout::Act> = None;
         let mut sized: (Option<Sizing>, Option<Sizing>) = (None, None);
         let mut adjusting = false;
-        let in_auto = ids.iter().all(|id| self.doc.parent_of(*id).and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto()));
-        // The sizes that every selected layer can have.
-        let choices = [true, false].map(|horizontal| {
-            let lists: Vec<Vec<Sizing>> = ids.iter().map(|id| self.sizing_choices(*id, horizontal)).collect();
-            Sizing::ALL.into_iter().filter(|s| lists.iter().all(|l| l.contains(s))).collect::<Vec<_>>()
-        });
+        let (in_auto, choices) = (facts.in_auto, facts.choices);
         const MIXED: &str = "Mixed — showing the first layer; a change applies to all.";
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -1220,7 +1247,7 @@ impl App {
         if self.exporting.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.weak("Exporting…");
+                ui.weak(self.export_progress().unwrap_or_else(|| "Exporting…".into()));
             });
             return;
         }
@@ -1236,7 +1263,8 @@ impl App {
         let pdf = self.ext.export_fmt == 3;
         let size = self.print_size();
         let mut note = None;
-        let p = &mut self.ext.print;
+        let was = self.doc.print.clone();
+        let p = &mut self.doc.print;
         // (Open from the start when something in it is set.)
         let open = *p != crate::print::Print::default();
         egui::CollapsingHeader::new("Print").id_salt(ui.id().with("export_print")).default_open(open).show(ui, |ui| {
@@ -1297,6 +1325,11 @@ converted by a plain formula that knows nothing about the press.";
         if let Some(note) = note {
             self.status = note;
         }
+        // The settings are saved with the document: a change of them is a change of it (but
+        // not a step of its history: undo leaves them alone).
+        if self.doc.print != was {
+            self.touch();
+        }
     }
 
     /// The size, in document px, of the first thing the Export button would write.
@@ -1313,13 +1346,12 @@ converted by a plain formula that knows nothing about the press.";
         Some((x1 - x0, y1 - y0))
     }
 
-    /// The export of `only` with the print settings: the bleed around it (see
-    /// `export::to_svg_bleed`) and, for the formats that are one picture, the crop marks.
-    fn print_svg(&mut self, only: Option<u64>, marks: bool, ctx: &egui::Context) -> Option<(String, f32, f32)> {
-        let print = self.ext.print.clone();
-        let (svg, w, h) = export::to_svg_bleed(&self.doc, only, print.bleed_px(), &mut self.fonts, ctx)?;
-        let scale = self.ext.export_scale.clamp(0.1, 16.0);
-        Some(if marks { crate::print::sheet_svg(svg, w, h, &print, scale) } else { (svg, w, h) })
+    /// Is there anything `export::to_svg` would write for `only`?
+    fn exportable(&self, only: Option<u64>) -> bool {
+        match only {
+            Some(id) => self.doc.find(id).is_some(),
+            None => self.doc.bounds().is_some(),
+        }
     }
 
     fn export_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1341,13 +1373,12 @@ converted by a plain formula that knows nothing about the press.";
     }
 
     fn export_pdf(&mut self, ctx: &egui::Context) {
-        let targets = self.pdf_targets();
-        let pages: Vec<(String, f32, f32)> = targets.iter().filter_map(|t| self.print_svg(*t, false, ctx)).collect();
-        if pages.is_empty() {
+        let targets: Vec<Option<u64>> = self.pdf_targets().into_iter().filter(|t| self.exportable(*t)).collect();
+        if targets.is_empty() {
             self.status = "Nothing to export.".into();
             return;
         }
-        let print = self.ext.print.clone();
+        let print = self.doc.print.clone();
         let name = match (targets.as_slice(), &self.path) {
             ([Some(id)], _) => self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default(),
             (_, Some(path)) => path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -1357,34 +1388,59 @@ converted by a plain formula that knows nothing about the press.";
         let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{safe}.pdf")).save_file() else {
             return;
         };
-        self.export_spawn(ctx, move || match crate::print::save_pdf(&pages, &print, &path) {
-            Ok(colour) => format!("Exported {} page(s), {colour}: {}", pages.len(), path.display()),
-            Err(e) => format!("Export failed: {e}"),
-        });
+        self.exporting = Some(self.export_job(ctx, move |cx| {
+            let pages = cx.pages(&targets, &print, false, 1.0);
+            if pages.is_empty() {
+                return "Nothing to export.".into();
+            }
+            match cx.save_pdf(&pages, &print, &path) {
+                Ok(colour) => format!("Exported {} page(s), {colour}: {}", pages.len(), path.display()),
+                Err(e) => format!("Export failed: {e}"),
+            }
+        }));
     }
 
-    /// Jalankan export di thread lain supaya jendela tidak macet ("Not Responding") selama
-    /// gambar besar dirender; hasil `work` menjadi teks status bar.
-    fn export_spawn(&mut self, ctx: &egui::Context, work: impl FnOnce() -> String + Send + 'static) {
+    /// Run an export on another thread, so the window does not freeze ("Not Responding") while
+    /// a large document is turned into SVG and rendered. The work gets a copy of the document
+    /// and of the fonts as they are now (see `ExportJob`); what it says while it runs is shown
+    /// in the status bar, and its result arrives through the channel.
+    pub(super) fn export_job<T: Send + 'static>(&mut self, ctx: &egui::Context, work: impl FnOnce(&mut ExportJob) -> T + Send + 'static) -> std::sync::mpsc::Receiver<T> {
+        // Paragraphs that were not painted since their width changed get their height first.
+        self.measure_paragraphs(ctx);
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = ctx.clone();
+        let (doc, fonts, ppp, wake) = (self.doc.clone(), self.fonts.snapshot(), ctx.pixels_per_point(), ctx.clone());
+        let note = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        self.export_note = note.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(work());
-            ctx.request_repaint();
+            let ctx = fonts.worker_context(ppp);
+            let mut job = ExportJob { doc, fonts, ctx, ppp, note, wake };
+            let _ = tx.send(work(&mut job));
+            job.wake.request_repaint();
         });
-        self.exporting = Some(rx);
         self.status = "Exporting…".into();
+        rx
     }
 
-    /// Tiap frame: ambil hasil export yang sudah selesai.
+    /// Every frame: show how far the export is, and take its result when it is done.
     fn export_poll(&mut self) {
         let Some(rx) = &self.exporting else { return };
         self.status = match rx.try_recv() {
             Ok(status) => status,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if let Some(note) = self.export_progress() {
+                    self.status = note;
+                }
+                return;
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => "Export failed: the export stopped unexpectedly (out of memory?)".into(),
         };
         self.exporting = None;
+    }
+
+    /// What the running export last said about its progress.
+    pub(super) fn export_progress(&self) -> Option<String> {
+        let note = self.export_note.lock().unwrap_or_else(|e| e.into_inner());
+        (!note.is_empty()).then(|| note.clone())
     }
 
     fn export_now(&mut self, ctx: &egui::Context) {
@@ -1395,12 +1451,13 @@ converted by a plain formula that knows nothing about the press.";
             return self.export_batch(ctx);
         }
         let only = if self.sel.len() == 1 { Some(self.sel[0]) } else { None };
-        let Some((svg, w, h)) = self.print_svg(only, true, ctx) else {
+        if !self.exportable(only) {
             self.status = "Nothing to export.".into();
             return;
-        };
+        }
         let fmt = self.ext.export_fmt.min(3);
         let scale = self.ext.export_scale.clamp(0.1, 16.0);
+        let print = self.doc.print.clone();
         let ext = FORMATS[fmt].to_lowercase();
         let name = only.and_then(|id| self.doc.find(id)).map(|n| n.name.clone()).unwrap_or_else(|| "kanvas".into());
         let safe: String = name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
@@ -1412,7 +1469,8 @@ converted by a plain formula that knows nothing about the press.";
         else {
             return;
         };
-        self.export_spawn(ctx, move || {
+        self.exporting = Some(self.export_job(ctx, move |cx| {
+            let Some((svg, w, h)) = cx.svg(only, &print, true, scale) else { return "Nothing to export.".into() };
             let result = match fmt {
                 2 => std::fs::write(&path, svg).map_err(|e| e.to_string()),
                 _ => export::save_raster(&svg, w, h, scale, fmt == 1, &path),
@@ -1421,41 +1479,44 @@ converted by a plain formula that knows nothing about the press.";
                 Ok(()) => format!("Exported: {}", path.display()),
                 Err(e) => format!("Export failed: {e}"),
             }
-        });
+        }));
     }
 
     /// Batch export: beberapa objek terpilih menjadi satu file per objek di folder pilihan,
     /// dengan skala dan format yang sedang aktif.
     fn export_batch(&mut self, ctx: &egui::Context) {
-        let sel = self.sel.clone();
-        let items: Vec<(String, String, f32, f32)> = sel
-            .iter()
-            .filter_map(|id| {
-                let name = self.doc.find(*id).map(|n| n.name.clone()).unwrap_or_default();
-                let (svg, w, h) = self.print_svg(Some(*id), true, ctx)?;
-                Some((name, svg, w, h))
-            })
-            .collect();
-        if items.is_empty() {
+        let named: Vec<(u64, String)> = self.sel.iter().filter_map(|id| self.doc.find(*id).map(|n| (*id, n.name.clone()))).collect();
+        if named.is_empty() {
             self.status = "Nothing to export.".into();
             return;
         }
         let fmt = self.ext.export_fmt.min(2);
         let scale = self.ext.export_scale.clamp(0.1, 16.0);
+        let print = self.doc.print.clone();
         let Some(dir) = rfd::FileDialog::new().set_title("Choose a folder for the exported files").pick_folder() else {
             return;
         };
-        self.export_spawn(ctx, move || match export::save_batch(&items, &dir, fmt, scale) {
-            (n, None) => format!("Exported {n} files: {}", dir.display()),
-            (n, Some(e)) => format!("Exported {n} of {} files, failed on {e}", items.len()),
-        });
+        self.exporting = Some(self.export_job(ctx, move |cx| {
+            let targets: Vec<Option<u64>> = named.iter().map(|(id, _)| Some(*id)).collect();
+            let pages = cx.pages(&targets, &print, true, scale);
+            let items: Vec<(String, String, f32, f32)> = named.into_iter().zip(pages).map(|((_, name), (svg, w, h))| (name, svg, w, h)).collect();
+            cx.note(format!("Exporting: writing {} files…", items.len()));
+            match export::save_batch(&items, &dir, fmt, scale) {
+                (n, None) => format!("Exported {n} files: {}", dir.display()),
+                (n, Some(e)) => format!("Exported {n} of {} files, failed on {e}", items.len()),
+            }
+        }));
     }
 
     // ------------------------------------------------------------ toolbar
 
-    /// Toolbar mengambang di bawah canvas.
+    /// The toolbar floating at the bottom of the canvas. It always fits inside the canvas: when
+    /// the canvas is narrow its buttons get smaller, and after that the less used ones move into
+    /// a "More" popup (see `bar_fit`), so it never covers the side panels.
     pub(super) fn toolbar(&mut self, ctx: &egui::Context) {
         let c = self.canvas_rect;
+        let margin = if c.width() < 160.0 { 4.0 } else { 12.0 };
+        let fit = bar_fit(c.width() - margin * 2.0);
         egui::Area::new(egui::Id::new("kanvas_toolbar"))
             .order(egui::Order::Middle)
             .pivot(Align2::CENTER_BOTTOM)
@@ -1463,101 +1524,320 @@ converted by a plain formula that knows nothing about the press.";
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(theme::CARD)
-                    .corner_radius(CornerRadius::same(18))
+                    .corner_radius(CornerRadius::same(if fit.size < 38.0 { 15 } else { 18 }))
                     .stroke(Stroke::new(1.0_f32, Color32::from_gray(66)))
-                    .inner_margin(egui::Margin::same(6))
+                    .inner_margin(egui::Margin::same(BAR_MARGIN as i8))
                     .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(110) })
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let separator = |ui: &mut egui::Ui| {
-                                let (sep, _) = ui.allocate_exact_size(vec2(9.0, 38.0), Sense::hover());
-                                ui.painter().vline(sep.center().x, sep.y_range().shrink(8.0), Stroke::new(1.0_f32, Color32::from_gray(74)));
-                            };
-                            let button = |ui: &mut egui::Ui, active: bool| {
-                                let (rect, resp) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::click());
-                                if active {
-                                    ui.painter().rect_filled(rect, CornerRadius::same(12), ACCENT);
-                                } else if resp.hovered() {
-                                    ui.painter().rect_filled(rect, CornerRadius::same(12), Color32::from_gray(64));
+                            ui.spacing_mut().item_spacing.x = fit.gap;
+                            let export_id = ui.make_persistent_id("export_popup");
+                            let more_id = ui.make_persistent_id("toolbar_more");
+                            let mut anchor = None;
+                            let mut last: Option<BarItem> = None;
+                            for item in &fit.shown {
+                                if last.is_some_and(|l| l.group() != item.group()) {
+                                    bar_separator(ui, &fit);
                                 }
-                                (rect, resp)
-                            };
-                            for (i, (tool, name, key)) in TOOLS.iter().enumerate() {
-                                if matches!(i, 4 | 5 | 11) {
-                                    separator(ui);
-                                }
-                                let active = self.tool == *tool;
-                                let (rect, resp) = button(ui, active);
-                                let color = if active { Color32::WHITE } else { Color32::from_gray(225) };
-                                draw_icon(ui.painter(), *tool, rect.center(), color);
-                                if resp.on_hover_text(format!("{name}   {key}")).clicked() {
-                                    self.tool = *tool;
+                                last = Some(*item);
+                                let resp = self.bar_button(ui, *item, fit.size, export_id);
+                                if *item == BarItem::Export {
+                                    anchor = Some(resp);
                                 }
                             }
-                            // Eyedropper: bukan tool canvas, melainkan mode sekali pakai.
-                            let active = self.ext.picker.eyedrop.is_some();
-                            let (rect, resp) = button(ui, active);
-                            let color = if active { Color32::WHITE } else { Color32::from_gray(225) };
-                            super::picker::eyedropper_icon(ui.painter(), rect.center(), Stroke::new(1.6_f32, color));
-                            if resp.on_hover_text("Eyedropper   I").clicked() {
-                                self.toggle_eyedropper();
+                            if !fit.more.is_empty() {
+                                // The tools that did not fit: a popup with a grid of them.
+                                let open = ui.memory(|m| m.is_popup_open(more_id));
+                                let inside = fit.more.iter().any(|i| *i != BarItem::Export && self.bar_active(*i, export_id, ui));
+                                let (rect, resp) = bar_slot(ui, open || inside, fit.size);
+                                let color = if open || inside { Color32::WHITE } else { Color32::from_gray(225) };
+                                for dx in [-6.0, 0.0, 6.0] {
+                                    ui.painter().circle_filled(rect.center() + vec2(dx, 0.0), 1.7, color);
+                                }
+                                let resp = resp.on_hover_text("More tools");
+                                if resp.clicked() {
+                                    ui.memory_mut(|m| m.toggle_popup(more_id));
+                                }
+                                egui::popup::popup_above_or_below_widget(ui, more_id, &resp, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                                    let columns = fit.more.len().clamp(1, 5);
+                                    ui.set_max_width(columns as f32 * 34.0 + (columns - 1) as f32 * 4.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        for item in &fit.more {
+                                            // (Export opens its own popup in place of this one.)
+                                            if self.bar_button(ui, *item, 34.0, export_id).clicked() && *item != BarItem::Export {
+                                                ui.memory_mut(|m| m.close_popup());
+                                            }
+                                        }
+                                    });
+                                });
+                                anchor = anchor.or(Some(resp));
                             }
-                            // Icons: buka/tutup jendela pencarian icon.
-                            separator(ui);
-                            let active = self.icons.open;
-                            let (rect, resp) = button(ui, active);
-                            super::icons::toolbar_icon(ui.painter(), rect.center(), if active { Color32::WHITE } else { Color32::from_gray(225) });
-                            if resp.on_hover_text("Icons").clicked() {
-                                self.toggle_icons();
-                            }
-                            // Photos: buka/tutup jendela pencarian foto stok.
-                            let active = self.photos.open;
-                            let (rect, resp) = button(ui, active);
-                            super::photos::toolbar_icon(ui.painter(), rect.center(), if active { Color32::WHITE } else { Color32::from_gray(225) });
-                            if resp.on_hover_text("Photos").clicked() {
-                                self.toggle_photos();
-                            }
-                            // Library: buka/tutup jendela gambar milik pengguna.
-                            let active = self.library.open;
-                            let (rect, resp) = button(ui, active);
-                            super::library::toolbar_icon(ui.painter(), rect.center(), if active { Color32::WHITE } else { Color32::from_gray(225) });
-                            if resp.on_hover_text("Library: your own logos and images").clicked() {
-                                self.toggle_library();
-                            }
-                            // Components: every main component of the document; a click places an instance.
-                            let active = self.components.open;
-                            let (rect, resp) = button(ui, active);
-                            super::components::toolbar_icon(ui.painter(), rect.center(), if active { Color32::WHITE } else { Color32::from_gray(225) });
-                            if resp.on_hover_text("Components").clicked() {
-                                self.toggle_components();
-                            }
-                            // Export: popup di atas toolbar dengan skala dan format.
-                            separator(ui);
-                            let popup_id = ui.make_persistent_id("export_popup");
-                            let open = ui.memory(|m| m.is_popup_open(popup_id));
-                            let (rect, resp) = button(ui, open);
-                            export_icon(ui.painter(), rect.center(), if open { Color32::WHITE } else { Color32::from_gray(225) });
-                            let resp = resp.on_hover_text("Export");
-                            if resp.clicked() {
-                                ui.memory_mut(|m| m.toggle_popup(popup_id));
-                            }
-                            egui::popup::popup_above_or_below_widget(
-                                ui,
-                                popup_id,
-                                &resp,
-                                egui::AboveOrBelow::Above,
-                                egui::PopupCloseBehavior::CloseOnClickOutside,
-                                |ui| {
+                            // Export: a popup above the toolbar with the scale and the format.
+                            if let Some(resp) = anchor {
+                                egui::popup::popup_above_or_below_widget(ui, export_id, &resp, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                                     ui.set_min_width(190.0);
                                     ui.label(egui::RichText::new("Export").strong());
                                     self.export_controls(ui, ctx);
-                                },
-                            );
+                                });
+                            }
                         });
                     });
             });
     }
+
+    /// `--bench`: where the "More" button of the toolbar is, if the toolbar has one now.
+    pub(super) fn bench_more_button(&self) -> Option<Pos2> {
+        let c = self.canvas_rect;
+        let fit = bar_fit(c.width() - if c.width() < 160.0 { 4.0 } else { 12.0 } * 2.0);
+        (!fit.more.is_empty()).then(|| pos2(c.center().x + fit.width() * 0.5 - BAR_MARGIN - 1.0 - fit.size * 0.5, c.bottom() - 18.0 - BAR_MARGIN - 1.0 - fit.size * 0.5))
+    }
+
+    /// Is the thing behind this toolbar button on (the tool chosen, the window open)?
+    fn bar_active(&self, item: BarItem, export_id: egui::Id, ui: &egui::Ui) -> bool {
+        match item {
+            BarItem::Tool(i) => self.tool == TOOLS[i].0,
+            BarItem::Eyedrop => self.ext.picker.eyedrop.is_some(),
+            BarItem::Icons => self.icons.open,
+            BarItem::Photos => self.photos.open,
+            BarItem::Library => self.library.open,
+            BarItem::Components => self.components.open,
+            BarItem::Export => ui.memory(|m| m.is_popup_open(export_id)),
+        }
+    }
+
+    /// One button of the toolbar (or of its "More" popup): drawn, and acted on when clicked.
+    fn bar_button(&mut self, ui: &mut egui::Ui, item: BarItem, size: f32, export_id: egui::Id) -> egui::Response {
+        let active = self.bar_active(item, export_id, ui);
+        let (rect, resp) = bar_slot(ui, active, size);
+        let color = if active { Color32::WHITE } else { Color32::from_gray(225) };
+        let (p, c) = (ui.painter(), rect.center());
+        let tip = match item {
+            BarItem::Tool(i) => {
+                draw_icon(p, TOOLS[i].0, c, color);
+                format!("{}   {}", TOOLS[i].1, TOOLS[i].2)
+            }
+            // The eyedropper is not a canvas tool: it is a mode for one pick.
+            BarItem::Eyedrop => {
+                super::picker::eyedropper_icon(p, c, Stroke::new(1.6_f32, color));
+                "Eyedropper   I".into()
+            }
+            BarItem::Icons => {
+                super::icons::toolbar_icon(p, c, color);
+                "Icons".into()
+            }
+            BarItem::Photos => {
+                super::photos::toolbar_icon(p, c, color);
+                "Photos".into()
+            }
+            BarItem::Library => {
+                super::library::toolbar_icon(p, c, color);
+                "Library: your own logos and images".into()
+            }
+            BarItem::Components => {
+                super::components::toolbar_icon(p, c, color);
+                "Components".into()
+            }
+            BarItem::Export => {
+                export_icon(p, c, color);
+                "Export".into()
+            }
+        };
+        let resp = resp.on_hover_text(tip);
+        if resp.clicked() {
+            match item {
+                BarItem::Tool(i) => self.tool = TOOLS[i].0,
+                BarItem::Eyedrop => self.toggle_eyedropper(),
+                BarItem::Icons => self.toggle_icons(),
+                BarItem::Photos => self.toggle_photos(),
+                BarItem::Library => self.toggle_library(),
+                BarItem::Components => self.toggle_components(),
+                BarItem::Export => ui.memory_mut(|m| m.toggle_popup(export_id)),
+            }
+        }
+        resp
+    }
+}
+
+/// What `App::multi_props` shows about the selection as a whole.
+#[derive(Clone)]
+pub(super) struct SelFacts {
+    /// The group, when the selection is exactly one whole group.
+    group: Option<u64>,
+    /// A part of an instance is selected.
+    pinned: bool,
+    /// How many units distribute and tidy up would see.
+    units: usize,
+    constrained: Option<super::constraints::Pair>,
+    /// Every selected layer is an item of an auto layout.
+    in_auto: bool,
+    /// The sizes every selected layer can have: horizontal, vertical.
+    choices: [Vec<Sizing>; 2],
+}
+
+/// What an export has to work with on its own thread: the document and the fonts as they were
+/// when it started, and a context of its own to lay text out with (same fonts, same pixels
+/// per point, so the result is what the window's thread would have written).
+pub(super) struct ExportJob {
+    pub doc: Doc,
+    pub fonts: FontManager,
+    pub ctx: egui::Context,
+    ppp: f32,
+    note: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The context of the window, to have it show the progress.
+    wake: egui::Context,
+}
+
+impl ExportJob {
+    /// Progress, for the status bar.
+    pub fn note(&self, text: String) {
+        *self.note.lock().unwrap_or_else(|e| e.into_inner()) = text;
+        self.wake.request_repaint();
+    }
+
+    /// The export of `only` with the print settings: the bleed around it (see
+    /// `export::to_svg_bleed`) and, with `marks`, for the formats that are one picture, the
+    /// crop marks (for a picture exported at `scale`).
+    pub fn svg(&mut self, only: Option<u64>, print: &crate::print::Print, marks: bool, scale: f32) -> Option<(String, f32, f32)> {
+        let (svg, w, h) = export::to_svg_bleed(&self.doc, only, print.bleed_px(), &mut self.fonts, &self.ctx)?;
+        // (Lets go of the glyphs and layouts of this page.)
+        self.fonts.worker_pass(&self.ctx, self.ppp);
+        Some(if marks { crate::print::sheet_svg(svg, w, h, print, scale) } else { (svg, w, h) })
+    }
+
+    /// `print::save_pdf`, reporting which page it is at.
+    pub fn save_pdf(&self, pages: &[(String, f32, f32)], print: &crate::print::Print, path: &std::path::Path) -> Result<String, String> {
+        let n = pages.len();
+        crate::print::save_pdf_with(pages, print, path, &mut |i| self.note(format!("Exporting page {}/{n}…", i + 1)))
+    }
+
+    /// `svg` for each of `targets`, reporting which one it is at.
+    pub fn pages(&mut self, targets: &[Option<u64>], print: &crate::print::Print, marks: bool, scale: f32) -> Vec<(String, f32, f32)> {
+        let mut pages = Vec::new();
+        for (i, target) in targets.iter().enumerate() {
+            self.note(format!("Exporting: preparing page {}/{}…", i + 1, targets.len()));
+            pages.extend(self.svg(*target, print, marks, scale));
+        }
+        pages
+    }
+}
+
+/// A button of the bottom toolbar, in the order they are shown.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BarItem {
+    /// An index into `TOOLS`.
+    Tool(usize),
+    Eyedrop,
+    Icons,
+    Photos,
+    Library,
+    Components,
+    Export,
+}
+
+impl BarItem {
+    fn all() -> Vec<BarItem> {
+        let tools = (0..TOOLS.len()).map(BarItem::Tool);
+        tools.chain([BarItem::Eyedrop, BarItem::Icons, BarItem::Photos, BarItem::Library, BarItem::Components, BarItem::Export]).collect()
+    }
+
+    /// Buttons of one group stand together; a thin line separates the groups.
+    fn group(self) -> u8 {
+        match self {
+            BarItem::Tool(0..=3) => 0,
+            BarItem::Tool(4) => 1,
+            BarItem::Tool(5..=10) => 2,
+            BarItem::Tool(_) | BarItem::Eyedrop => 3,
+            BarItem::Export => 5,
+            _ => 4,
+        }
+    }
+
+    /// The order in which buttons leave a toolbar that is too narrow: the highest goes first.
+    fn rank(self) -> u8 {
+        match self {
+            BarItem::Tool(i) => match TOOLS[i].0 {
+                Tool::Select => 0,
+                Tool::Hand => 2,
+                Tool::Frame => 3,
+                Tool::Rect => 4,
+                Tool::Text => 5,
+                Tool::Pen => 6,
+                Tool::Ellipse => 7,
+                Tool::Line => 8,
+                Tool::Scale => 9,
+                Tool::Polygon => 10,
+                Tool::Wand => 12,
+                _ => 13,
+            },
+            BarItem::Export => 1,
+            BarItem::Eyedrop => 11,
+            BarItem::Components => 14,
+            BarItem::Icons => 15,
+            BarItem::Photos => 16,
+            BarItem::Library => 17,
+        }
+    }
+}
+
+/// Space between the toolbar's edge and its buttons.
+const BAR_MARGIN: f32 = 6.0;
+
+/// How the bottom toolbar is laid out for the width it has (see `bar_fit`).
+struct BarFit {
+    /// Side of a button, space between two widgets, width of a separator.
+    size: f32,
+    gap: f32,
+    sep: f32,
+    shown: Vec<BarItem>,
+    /// The buttons that moved into the "More" popup.
+    more: Vec<BarItem>,
+}
+
+impl BarFit {
+    /// The width of the whole toolbar, its edge included.
+    fn width(&self) -> f32 {
+        let seps = self.shown.windows(2).filter(|w| w[0].group() != w[1].group()).count();
+        let buttons = self.shown.len() + !self.more.is_empty() as usize;
+        let widgets = buttons + seps;
+        buttons as f32 * self.size + seps as f32 * self.sep + widgets.saturating_sub(1) as f32 * self.gap + BAR_MARGIN * 2.0 + 2.0
+    }
+}
+
+/// The toolbar for a canvas with `avail` px of room: at full size when that fits, else with
+/// smaller buttons, else with the least used buttons (by `BarItem::rank`) in the "More" popup.
+/// At least the "More" button is always there.
+fn bar_fit(avail: f32) -> BarFit {
+    let mut fit = BarFit { size: 38.0, gap: 4.0, sep: 9.0, shown: BarItem::all(), more: Vec::new() };
+    if fit.width() <= avail {
+        return fit;
+    }
+    (fit.size, fit.gap, fit.sep) = (32.0, 2.0, 7.0);
+    while fit.width() > avail && !fit.shown.is_empty() {
+        let Some(at) = (0..fit.shown.len()).max_by_key(|i| fit.shown[*i].rank()) else { break };
+        fit.more.push(fit.shown.remove(at));
+    }
+    // In the popup they are in toolbar order again.
+    let all = BarItem::all();
+    fit.more.sort_by_key(|item| all.iter().position(|a| a == item));
+    fit
+}
+
+fn bar_separator(ui: &mut egui::Ui, fit: &BarFit) {
+    let (sep, _) = ui.allocate_exact_size(vec2(fit.sep, fit.size), Sense::hover());
+    ui.painter().vline(sep.center().x, sep.y_range().shrink(8.0), Stroke::new(1.0_f32, Color32::from_gray(74)));
+}
+
+/// The square of a toolbar button, with its background when it is on or under the pointer.
+fn bar_slot(ui: &mut egui::Ui, active: bool, size: f32) -> (Rect, egui::Response) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    let radius = CornerRadius::same(if size < 38.0 { 10 } else { 12 });
+    if active {
+        ui.painter().rect_filled(rect, radius, ACCENT);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, radius, Color32::from_gray(64));
+    }
+    (rect, resp)
 }
 
 /// Bagian "Effects": tombol + membuka daftar efek yang bisa ditambahkan; tiap efek yang terpasang
@@ -1767,6 +2047,9 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let _update = perf::span(0);
+        perf::idle_frame();
+        // (Lookups by id are quick for as long as the document stays as it is now.)
+        self.doc.reindex();
         {
             let _poll = perf::span(1);
             self.fonts.poll(ctx);
@@ -1856,5 +2139,31 @@ impl eframe::App for App {
         self.settle_doc();
         self.autosave(ctx);
         self.run_bench(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbar_fits_the_canvas_at_every_width() {
+        let all = BarItem::all();
+        for avail in (40..2000).step_by(7) {
+            let fit = bar_fit(avail as f32);
+            // Nothing is lost: every button is on the bar or in the popup, once.
+            let mut both: Vec<BarItem> = fit.shown.iter().chain(&fit.more).copied().collect();
+            both.sort_by_key(|item| all.iter().position(|a| a == item));
+            assert_eq!(both, all, "at {avail}");
+            // It fits, down to the width of the More button alone.
+            if avail >= 46 {
+                assert!(fit.width() <= avail as f32, "{} wide in {avail}", fit.width());
+            }
+        }
+        // The default window: no popup. A narrow canvas: Move stays, then Export.
+        assert!(bar_fit(900.0).more.is_empty() && bar_fit(900.0).size == 38.0);
+        assert!(bar_fit(736.0).more.is_empty() && bar_fit(736.0).size == 32.0);
+        assert_eq!(bar_fit(90.0).shown, [BarItem::Tool(0)]);
+        assert_eq!(bar_fit(130.0).shown, [BarItem::Tool(0), BarItem::Export]);
     }
 }

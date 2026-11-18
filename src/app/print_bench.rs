@@ -55,6 +55,15 @@ impl super::App {
         let frames = crate::export::pdf_pages(&doc);
         let start = std::time::Instant::now();
         let art: Vec<(String, f32, f32)> = frames.iter().filter_map(|id| crate::export::to_svg_bleed(&doc, Some(*id), print.bleed_px(), &mut self.fonts, ctx)).collect();
+        // The same on the export thread (see `App::export_job`): it has to write the same bytes.
+        let (copy, targets, settings) = (doc.clone(), frames.iter().map(|id| Some(*id)).collect::<Vec<_>>(), print.clone());
+        let start_worker = std::time::Instant::now();
+        let worker = self.export_job(ctx, move |cx| {
+            cx.doc = copy;
+            cx.pages(&targets, &settings, false, 1.0)
+        });
+        let worker = worker.recv().unwrap_or_default();
+        eprintln!("PRINT doc: svg made on the export thread in {:.0} ms, identical: {}", start_worker.elapsed().as_secs_f32() * 1000.0, worker == art);
         let Some(first) = art.first() else { return };
         eprintln!("PRINT doc: {} pages, {}, svg made in {:.0} ms ({} MB)", art.len(), print.hint(first.1 - print.bleed_px() * 2.0, first.2 - print.bleed_px() * 2.0), start.elapsed().as_secs_f32() * 1000.0, art.iter().map(|a| a.0.len()).sum::<usize>() / (1 << 20));
         for (name, print) in [("doc-rgb.pdf", print.clone()), ("doc-cmyk.pdf", Print { cmyk: true, ..print.clone() }), ("doc-cmyk-flattened.pdf", Print { cmyk: true, flatten: true, ..print.clone() })] {
@@ -135,7 +144,7 @@ impl super::App {
                 Err(e) => eprintln!("PRINT doc: {e}"),
             }
         }
-        self.ext.print = Print { bleed_mm: 3.0, marks: true, cmyk: true, ..Default::default() };
+        self.doc.print = Print { bleed_mm: 3.0, marks: true, cmyk: true, ..Default::default() };
         self.ext.export_fmt = 3;
         let part: Vec<f32> = mode.strip_prefix("view:").map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect()).unwrap_or_default();
         let view = if part.len() == 4 { (x + part[0], y + part[1], x + part[2], y + part[3]) } else { (x - 40.0, y - 60.0, x + 2000.0, y + h + 60.0) };
@@ -160,6 +169,9 @@ impl super::App {
         let start = std::time::Instant::now();
         let art: Vec<(String, f32, f32)> = pages.iter().filter_map(|id| crate::export::to_svg_bleed(&self.doc, Some(*id), print.bleed_px(), &mut self.fonts, ctx)).collect();
         eprintln!("PRINT {} svg made in {:.1} ms ({} kB)", art.len(), start.elapsed().as_secs_f32() * 1000.0, art.iter().map(|a| a.0.len()).sum::<usize>() / 1024);
+        let (targets, settings) = (pages.iter().map(|id| Some(*id)).collect::<Vec<_>>(), print.clone());
+        let worker = self.export_job(ctx, move |cx| cx.pages(&targets, &settings, false, 1.0)).recv().unwrap_or_default();
+        eprintln!("PRINT svg made on the export thread identical: {}", worker == art);
         let Some(first) = art.first().cloned() else { return };
         let save = |name: &str, pages: &[(String, f32, f32)], print: &Print| {
             let path = out.with_file_name(name);
@@ -211,6 +223,20 @@ impl super::App {
             serde_json::json!({ "path": file("remote-wrong.pdf"), "id": pages[2], "color": "cmyk", "icc": file("print-sheet.png") }),
         ] {
             eprintln!("PRINT remote {args} -> {}", self.remote_bench_export(ctx, &args));
+        }
+        // `KANVAS_BENCH_PRINT=huge`: a page of 12000 × 12000 px at 300 px per inch, flattened
+        // in CMYK: 144 megapixels as asked for, which is more than a flattened page may have.
+        // (The memory it takes is read from outside, as the peak of the process.)
+        if std::env::var("KANVAS_BENCH_PRINT").is_ok_and(|m| m == "huge") {
+            let mut page = Node::new(self.doc.alloc_id(), Kind::Frame, x, y + 40000.0);
+            (page.name, page.w, page.h, page.fill) = ("Huge page".into(), 12000.0, 12000.0, Some([250, 204, 21, 255]));
+            page.gradient = Some(Gradient { radial: false, angle: 45.0, stops: vec![Stop { pos: 0.0, color: [250, 204, 21, 255] }, Stop { pos: 1.0, color: [14, 116, 144, 255] }], line: None, radial_line: None });
+            let id = page.id;
+            self.doc.insert(page, None);
+            let start = std::time::Instant::now();
+            let args = serde_json::json!({ "path": file("huge-cmyk-flattened.pdf"), "id": id, "flatten": true, "color": "cmyk", "resolution": 300 });
+            let answer = self.remote_bench_export(ctx, &args);
+            eprintln!("PRINT huge page flattened in {:.1} s -> {}", start.elapsed().as_secs_f32(), answer);
         }
         self.bench_print_doc(ctx, out);
     }

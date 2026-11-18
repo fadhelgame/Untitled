@@ -29,8 +29,10 @@ pub const FLATTEN_DPI: f32 = 300.0;
 /// Width of a crop mark, in points.
 pub const MARK_WIDTH: f32 = 0.25;
 
-/// The print settings of an export.
-#[derive(Clone, Debug, PartialEq)]
+/// The print settings of an export. They describe the job the document is made for, so they
+/// are saved with it (`Doc::print`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Print {
     /// Bleed on every side, in millimetres.
     pub bleed_mm: f32,
@@ -53,6 +55,11 @@ impl Default for Print {
 }
 
 impl Print {
+    /// Nothing is set: such settings are left out of the file.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     fn resolution(&self) -> f32 {
         if self.ppi.is_finite() && self.ppi > 0.0 {
             self.ppi.clamp(1.0, 4800.0)
@@ -309,26 +316,54 @@ impl Colour {
 
 // ---------------------------------------------------------------- PDF
 
+/// The most pixels a flattened page may have. (Its bitmap takes four bytes per pixel while it
+/// is rendered and converted: half a gigabyte at this size.)
+const FLATTEN_PIXELS: f32 = 120e6;
+
+/// Pixels per document px of a flattened page of `w` × `h` px: `FLATTEN_DPI`, or less for a
+/// page so large that its bitmap would not fit in memory (or in the renderer: 16000 px a side).
+fn flatten_scale(w: f32, h: f32, print: &Print) -> f32 {
+    let area = (w * h).max(1.0);
+    (FLATTEN_DPI / print.resolution()).min(16000.0 / w.max(h)).min((FLATTEN_PIXELS / area).sqrt())
+}
+
 /// One page as a single image of `FLATTEN_DPI`, on white: the samples (RGB, or CMYK when
-/// `colour` is given) and the size in pixels.
-fn flatten(svg: &str, w: f32, h: f32, print: &Print, colour: Option<&Colour>) -> Result<(Vec<u8>, u32, u32), String> {
-    // (Kept inside the largest bitmap the renderer makes.)
-    let scale = (FLATTEN_DPI / print.resolution()).min(16000.0 / w.max(h));
+/// `colour` is given), the size in pixels, and the resolution it has if that had to be less.
+fn flatten(svg: &str, w: f32, h: f32, print: &Print, colour: Option<&Colour>) -> Result<(Vec<u8>, u32, u32, Option<f32>), String> {
+    let scale = flatten_scale(w, h, print);
+    let lower = (scale < FLATTEN_DPI / print.resolution() * 0.999).then(|| scale * print.resolution());
     let pixmap = crate::export::rasterize(svg, w, h, scale)?;
-    let rgb: Vec<u8> = pixmap
-        .data()
-        .chunks_exact(4)
-        .flat_map(|p| {
+    let (pw, ph) = (pixmap.width(), pixmap.height());
+    // The bitmap is turned into the samples in place, a band of rows at a time: a second and a
+    // third copy of a large page would not fit in memory.
+    let mut data = pixmap.take();
+    let band = (pw as usize * 64).max(1);
+    let mut rgb = Vec::with_capacity(band * 3);
+    let mut out = 0;
+    for start in (0..data.len() / 4).step_by(band) {
+        let end = (start + band).min(data.len() / 4);
+        rgb.clear();
+        for p in data[start * 4..end * 4].chunks_exact(4) {
             // (Premultiplied: what is missing to full cover is the white of the paper.)
             let rest = 255 - p[3] as u16;
-            [(p[0] as u16 + rest).min(255) as u8, (p[1] as u16 + rest).min(255) as u8, (p[2] as u16 + rest).min(255) as u8]
-        })
-        .collect();
-    let samples = match colour {
-        Some(colour) => colour.pixels(&rgb),
-        None => rgb,
-    };
-    Ok((samples, pixmap.width(), pixmap.height()))
+            rgb.extend([(p[0] as u16 + rest).min(255) as u8, (p[1] as u16 + rest).min(255) as u8, (p[2] as u16 + rest).min(255) as u8]);
+        }
+        // (What is written never passes what is still to be read: at most four bytes a pixel.)
+        match colour {
+            Some(colour) => {
+                let cmyk = colour.pixels(&rgb);
+                data[out..out + cmyk.len()].copy_from_slice(&cmyk);
+                out += cmyk.len();
+            }
+            None => {
+                data[out..out + rgb.len()].copy_from_slice(&rgb);
+                out += rgb.len();
+            }
+        }
+    }
+    data.truncate(out);
+    data.shrink_to_fit();
+    Ok((data, pw, ph, lower))
 }
 
 /// Pixels per document px for the parts of a vector PDF that have to be bitmaps.
@@ -356,11 +391,12 @@ fn colour_note(colour: Option<&Colour>) -> String {
 /// marks as well.
 #[cfg(test)]
 pub fn pdf_bytes(pages: &[(String, f32, f32)], print: &Print) -> Result<Vec<u8>, String> {
-    build(pages, print).map(|(bytes, _)| bytes)
+    build(pages, print, &mut |_| {}).map(|(bytes, _)| bytes)
 }
 
 /// `pdf_bytes`, and how the colours were made (see `colour_note`).
-fn build(pages: &[(String, f32, f32)], print: &Print) -> Result<(Vec<u8>, String), String> {
+/// `progress` is told the index of each page as its turn comes.
+fn build(pages: &[(String, f32, f32)], print: &Print, progress: &mut dyn FnMut(usize)) -> Result<(Vec<u8>, String), String> {
     use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, TextStr};
     use resvg::usvg;
     let colour = match (&print.icc, print.cmyk) {
@@ -375,13 +411,18 @@ fn build(pages: &[(String, f32, f32)], print: &Print) -> Result<(Vec<u8>, String
     let mut pdf = Pdf::new();
     let mut kids = Vec::new();
     let name = Name(b"S");
-    for (svg, w, h) in pages {
+    // The resolution of the flattened pages, where a page was too large for `FLATTEN_DPI`.
+    let mut lower: Option<f32> = None;
+    for (at, (svg, w, h)) in pages.iter().enumerate() {
+        progress(at);
         let bleed_px = print.page_bleed(*w, *h);
         let s = sheet((w - bleed_px * 2.0) * scale, (h - bleed_px * 2.0) * scale, bleed_px * scale, print.marks, MM);
         let art = if print.flatten {
-            let (samples, pw, ph) = flatten(svg, *w, *h, print, colour.as_ref())?;
+            let (samples, pw, ph, less) = flatten(svg, *w, *h, print, colour.as_ref())?;
+            lower = lower.or(less);
             let id = alloc.bump();
             let packed = pdf::deflate(&samples);
+            drop(samples);
             let mut image = pdf.image_xobject(id, &packed);
             image.filter(Filter::FlateDecode);
             image.width(pw as i32).height(ph as i32).bits_per_component(8);
@@ -458,13 +499,22 @@ fn build(pages: &[(String, f32, f32)], print: &Print) -> Result<(Vec<u8>, String
         Some(colour) => pdf::to_cmyk(&bytes, colour)?,
         None => bytes,
     };
-    Ok((bytes, colour_note(colour.as_ref())))
+    let mut note = colour_note(colour.as_ref());
+    if let Some(dpi) = lower {
+        note += &format!(", flattened at {dpi:.0} dpi (the page is too large for {FLATTEN_DPI:.0})");
+    }
+    Ok((bytes, note))
 }
 
 /// Write the PDF of `pdf_bytes` to `path`. Returns how the colours were made ("RGB",
 /// "CMYK (plain conversion, no ICC profile)", …), for the status line.
 pub fn save_pdf(pages: &[(String, f32, f32)], print: &Print, path: &Path) -> Result<String, String> {
-    let (bytes, colour) = build(pages, print)?;
+    save_pdf_with(pages, print, path, &mut |_| {})
+}
+
+/// `save_pdf` that tells `progress` the index of each page as its turn comes.
+pub fn save_pdf_with(pages: &[(String, f32, f32)], print: &Print, path: &Path, progress: &mut dyn FnMut(usize)) -> Result<String, String> {
+    let (bytes, colour) = build(pages, print, progress)?;
     std::fs::write(path, bytes).map_err(|e| e.to_string())?;
     Ok(colour)
 }

@@ -358,6 +358,59 @@ impl FontManager {
         m
     }
 
+    /// A copy for a worker thread (an export): the fonts that are usable now, laid out exactly
+    /// as here, with nothing shared with this one but the font files. It downloads nothing:
+    /// a font that is not there yet is the fallback font, as it would be here at this moment.
+    /// The copy lays text out with a context of its own (see `worker_context`).
+    pub fn snapshot(&self) -> FontManager {
+        let (tx, rx) = mpsc::channel();
+        let state = self
+            .state
+            .iter()
+            .map(|(k, s)| {
+                let s = match s {
+                    State::Loading => State::Loading,
+                    State::Ready { frame } => State::Ready { frame: *frame },
+                    State::Failed(e) => State::Failed(e.clone()),
+                };
+                (k.clone(), s)
+            })
+            .collect();
+        FontManager {
+            paths: HashMap::new(),
+            catalog: Vec::new(),
+            catalog_state: CatalogState::Ready,
+            defs: self.defs.clone(),
+            state,
+            // (No worker reads this queue.)
+            queue: Arc::new(Queue { jobs: Mutex::new(VecDeque::new()), ready: Condvar::new() }),
+            tx,
+            rx,
+            dir: self.dir.clone(),
+            frame: self.frame,
+            reference: HashMap::new(),
+            layouts: Default::default(),
+            usable: self.usable,
+            ref_fonts: None,
+        }
+    }
+
+    /// A context that lays text out like the one of the window does at `ppp` pixels per point,
+    /// for the thread that works with a `snapshot`: it has the same fonts, and its own atlas.
+    pub fn worker_context(&self, ppp: f32) -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(self.defs.clone());
+        self.worker_pass(&ctx, ppp);
+        ctx
+    }
+
+    /// An empty pass of a `worker_context`: its font atlas is emptied if it has filled up.
+    pub fn worker_pass(&self, ctx: &egui::Context, ppp: f32) {
+        let mut input = egui::RawInput { max_texture_side: Some(2048), ..Default::default() };
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        let _ = ctx.run(input, |_| {});
+    }
+
     pub fn load_catalog(&mut self, ctx: &egui::Context) {
         self.catalog_state = CatalogState::Loading;
         let (tx, dir, ctx) = (self.tx.clone(), self.dir.clone(), ctx.clone());

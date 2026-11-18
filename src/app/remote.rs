@@ -67,6 +67,9 @@ struct Waiting {
 pub(super) struct Remote {
     rx: mpsc::Receiver<Request>,
     waiting: Vec<Waiting>,
+    /// Exports that are being written on another thread: where the answer goes, and where it
+    /// comes from (see `remote_export`).
+    exports: Vec<(mpsc::Sender<Value>, mpsc::Receiver<Result<Value, String>>)>,
     info: PathBuf,
     token: String,
 }
@@ -95,7 +98,7 @@ impl Remote {
                 std::thread::spawn(move || serve(stream, &secret, tx, ctx));
             }
         });
-        Some(Remote { rx, waiting: Vec::new(), info, token })
+        Some(Remote { rx, waiting: Vec::new(), exports: Vec::new(), info, token })
     }
 }
 
@@ -629,6 +632,10 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
             while let Ok(req) = remote.rx.try_recv() {
+                // What is read or rendered has its paragraphs at the height of their text.
+                if matches!(req.cmd.as_str(), "get_document" | "screenshot" | "export") {
+                    self.measure_paragraphs(ctx);
+                }
                 let outcome = self.remote_run(&req.cmd, &req.args);
                 // Instances follow at once, so the next command reads a document that is in line.
                 self.settle_doc();
@@ -649,6 +656,11 @@ impl App {
         for w in std::mem::take(&mut remote.waiting) {
             let ready = w.fonts.iter().all(|(f, wt, it)| self.fonts.settled(f, *wt, *it));
             if ready || now >= w.deadline {
+                // An export takes a while: it is written on another thread and answered when done.
+                if let After::Export { id, path, scale, print } = w.after {
+                    remote.exports.push((w.reply, self.remote_export(ctx, id, path, scale, print)));
+                    continue;
+                }
                 let answer = self.remote_finish(ctx, w.after, &w.fonts).unwrap_or_else(|e| fail(&e));
                 let _ = w.reply.send(answer);
             } else {
@@ -657,6 +669,24 @@ impl App {
         }
         if !remote.waiting.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(30));
+        }
+        for (reply, done) in std::mem::take(&mut remote.exports) {
+            let answer = match done.try_recv() {
+                Ok(answer) => answer,
+                Err(mpsc::TryRecvError::Empty) => {
+                    if let Some(note) = self.export_progress() {
+                        self.status = format!("Remote: {note}");
+                    }
+                    remote.exports.push((reply, done));
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => Err("the export stopped unexpectedly (out of memory?)".into()),
+            };
+            self.status = match &answer {
+                Ok(v) => format!("Remote: exported {}", v["path"].as_str().unwrap_or_default()),
+                Err(e) => format!("Remote: export failed: {e}"),
+            };
+            let _ = reply.send(answer.map_or_else(|e| fail(&e), ok));
         }
         self.remote = Some(remote);
     }
@@ -818,6 +848,48 @@ impl App {
         }
     }
 
+    /// Give the paragraphs of this page the height their text has at the width they have now.
+    ///
+    /// A text that wraps gets its height from the canvas when it is painted, a frame later than
+    /// its width was set (see `layout::resize`), and never while it is out of view, too small
+    /// to read or under a layer blur that is not shown. An export or a remote read in between
+    /// would see a paragraph of the old height in an auto layout made for it. So before those,
+    /// every such text is measured here and the layouts around them are settled again, until
+    /// nothing changes. (A text whose font is still on its way is left as it is.)
+    pub(super) fn measure_paragraphs(&mut self, ctx: &egui::Context) {
+        for _ in 0..3 {
+            let mut texts: Vec<&Node> = Vec::new();
+            for top in &self.doc.nodes {
+                top.walk(&mut |n| {
+                    if n.kind == Kind::Text && n.wrap && !n.fixed_h && n.on_path.is_none() && !n.text.is_empty() && n.visible {
+                        texts.push(n);
+                    }
+                });
+            }
+            let mut stale: std::collections::HashMap<u64, f32> = Default::default();
+            for n in texts {
+                if !self.fonts.settled(&n.font, n.weight, n.italic) {
+                    // (Asked for, so it is there the next time.)
+                    self.fonts.resolve(&n.font, n.weight, n.italic);
+                    continue;
+                }
+                let f = (200.0 / n.max_size()).min(1.0);
+                let h = (render::layout_text(ctx, n, &n.text, &mut self.fonts, f, 1.0, true).height / f).max(1.0);
+                // (The canvas measures at the size on screen, which comes out a little
+                // different: only a height that is really another one counts.)
+                if (h - n.h).abs() > 0.5 + n.h.abs() * 0.01 {
+                    stale.insert(n.id, h);
+                }
+            }
+            if stale.is_empty() {
+                return;
+            }
+            self.doc.update_nodes(|n| stale.contains_key(&n.id), |n| n.h = stale[&n.id]);
+            self.components.recheck();
+            self.settle_doc();
+        }
+    }
+
     /// `--bench`: an `export` command run to its end at once (the fonts have to be there
     /// already). Result: the answer as text.
     pub(super) fn remote_bench_export(&mut self, ctx: &egui::Context, args: &Value) -> String {
@@ -871,6 +943,8 @@ impl App {
             }
             After::Outline { ids } => self.outline_nodes(Some(ctx), &ids).map(ok),
             After::Shot { id, max } => {
+                // (Fonts may have arrived since the command came in.)
+                self.measure_paragraphs(ctx);
                 let (svg, w, h) = export::to_svg(&self.doc, id, &mut self.fonts, ctx).ok_or("nothing to render: the document is empty")?;
                 let scale = (max / w.max(h)).min(2.0);
                 let (png, pw, ph) = export::render_png(&svg, w, h, scale)?;
@@ -878,32 +952,40 @@ impl App {
                 answer["image"] = json!(b64::encode(&png));
                 Ok(answer)
             }
+            // (Only `--bench` gets here: it waits for the export. See `remote_poll`.)
             After::Export { id, path, scale, print } => {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-                if ext == "pdf" {
-                    // One page for the node; without one, every frame is a page, as in the app.
-                    let frames = export::pdf_pages(&self.doc);
-                    let targets: Vec<Option<u64>> = if id.is_some() || frames.is_empty() { vec![id] } else { frames.into_iter().map(Some).collect() };
-                    let pages: Vec<(String, f32, f32)> = targets.iter().filter_map(|t| export::to_svg_bleed(&self.doc, *t, print.bleed_px(), &mut self.fonts, ctx)).collect();
-                    if pages.is_empty() {
-                        return Err("nothing to export: the document is empty".into());
-                    }
-                    let colour = crate::print::save_pdf(&pages, &print, &path)?;
-                    self.status = format!("Remote: exported {}", path.display());
-                    let scale = print.pt_per_px();
-                    let sizes: Vec<Value> = pages.iter().map(|(_, w, h)| json!([r2((w - print.page_bleed(*w, *h) * 2.0) * scale), r2((h - print.page_bleed(*w, *h) * 2.0) * scale)])).collect();
-                    return Ok(ok(json!({ "path": path, "pages": pages.len(), "trim_size_pt": sizes, "bleed_mm": print.bleed(), "crop_marks": print.marks, "color": colour, "flatten": print.flatten })));
-                }
-                let (svg, w, h) = export::to_svg_bleed(&self.doc, id, print.bleed_px(), &mut self.fonts, ctx).ok_or("nothing to export: the document is empty")?;
-                let (svg, w, h) = crate::print::sheet_svg(svg, w, h, &print, if ext == "svg" { 1.0 } else { scale });
-                match ext.as_str() {
-                    "svg" => std::fs::write(&path, svg).map_err(|e| e.to_string())?,
-                    other => export::save_raster(&svg, w, h, scale, other != "png", &path)?,
-                }
-                self.status = format!("Remote: exported {}", path.display());
-                Ok(ok(json!({ "path": path, "width": r2(w * scale), "height": r2(h * scale) })))
+                let shown = path.display().to_string();
+                let answer = self.remote_export(ctx, id, path, scale, print).recv().map_err(|_| "the export stopped unexpectedly".to_string());
+                self.status = format!("Remote: exported {shown}");
+                answer?.map(ok)
             }
         }
+    }
+
+    /// Write an export on another thread (see `export_job`). Result: where its answer arrives.
+    fn remote_export(&mut self, ctx: &egui::Context, id: Option<u64>, path: PathBuf, scale: f32, print: crate::print::Print) -> mpsc::Receiver<Result<Value, String>> {
+        self.export_job(ctx, move |cx| {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+            if ext == "pdf" {
+                // One page for the node; without one, every frame is a page, as in the app.
+                let frames = export::pdf_pages(&cx.doc);
+                let targets: Vec<Option<u64>> = if id.is_some() || frames.is_empty() { vec![id] } else { frames.into_iter().map(Some).collect() };
+                let pages = cx.pages(&targets, &print, false, 1.0);
+                if pages.is_empty() {
+                    return Err("nothing to export: the document is empty".into());
+                }
+                let colour = cx.save_pdf(&pages, &print, &path)?;
+                let scale = print.pt_per_px();
+                let sizes: Vec<Value> = pages.iter().map(|(_, w, h)| json!([r2((w - print.page_bleed(*w, *h) * 2.0) * scale), r2((h - print.page_bleed(*w, *h) * 2.0) * scale)])).collect();
+                return Ok(json!({ "path": path, "pages": pages.len(), "trim_size_pt": sizes, "bleed_mm": print.bleed(), "crop_marks": print.marks, "color": colour, "flatten": print.flatten }));
+            }
+            let (svg, w, h) = cx.svg(id, &print, true, if ext == "svg" { 1.0 } else { scale }).ok_or("nothing to export: the document is empty")?;
+            match ext.as_str() {
+                "svg" => std::fs::write(&path, svg).map_err(|e| e.to_string())?,
+                other => export::save_raster(&svg, w, h, scale, other != "png", &path)?,
+            }
+            Ok(json!({ "path": path, "width": r2(w * scale), "height": r2(h * scale) }))
+        })
     }
 
     // ------------------------------------------------------------ baca

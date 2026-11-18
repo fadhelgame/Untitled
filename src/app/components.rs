@@ -74,6 +74,9 @@ impl App {
 
     /// Something in the selection is a part of an instance (see `Doc::pinned`).
     pub(super) fn sel_pinned(&self) -> bool {
+        if self.sel.len() > super::SEL_KEPT {
+            return self.sel_whole().pinned;
+        }
         self.sel.iter().any(|id| self.doc.pinned(*id))
     }
 

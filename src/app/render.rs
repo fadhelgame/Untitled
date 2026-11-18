@@ -354,12 +354,15 @@ pub struct Ext {
     in_rx: mpsc::Receiver<InnerDone>,
     pub export_scale: f32,
     pub export_fmt: usize,
-    /// Print settings of the export: bleed, crop marks, CMYK (see `crate::print`).
-    pub print: crate::print::Print,
     pub v_plain: bool,
     pub paste_seen: bool,
     /// Top-level frames as finished meshes (see `frame_cached`), per frame id.
     frames: HashMap<u64, FrameMesh>,
+    /// The meshes of styled strokes, per node id, and how many vertices they have together.
+    strokes: HashMap<u64, StrokeMesh>,
+    stroke_vertices: usize,
+    /// The outlines of the selection as a mesh (see `overlay_mesh`).
+    overlay: Option<StrokeMesh>,
     /// Goes up whenever a texture prepared on another thread arrives: what was drawn before may
     /// have used a placeholder.
     epoch: u64,
@@ -447,10 +450,12 @@ impl Default for Ext {
             glyphs: vtext::Cache::default(),
             export_scale: 1.0,
             export_fmt: 0,
-            print: Default::default(),
             v_plain: false,
             paste_seen: false,
             frames: HashMap::new(),
+            strokes: HashMap::new(),
+            stroke_vertices: 0,
+            overlay: None,
             epoch: 0,
             last_origin: Pos2::ZERO,
             retired: Vec::new(),
@@ -600,6 +605,8 @@ impl Ext {
                     if let Some(old) = self.shadows.insert(key, ShadowTex { nodes, scale, region, fonts, tex, frame: self.frame }) {
                         self.retired.push((old.tex, self.frame));
                     }
+                    // (What failed before is of no interest once it works; the same below.)
+                    self.shadow_failed.remove(&key);
                 }
                 Err(_) => {
                     self.shadow_failed.insert(key, nodes);
@@ -615,6 +622,7 @@ impl Ext {
                     if let Some(old) = self.blurs.insert(key, BlurTex { nodes, scale, region, fonts, tex, frame: self.frame }) {
                         self.retired.push((old.tex, self.frame));
                     }
+                    self.blur_failed.remove(&key);
                 }
                 Err(_) => {
                     self.blur_failed.insert(key, nodes);
@@ -631,6 +639,7 @@ impl Ext {
                     if let Some(old) = self.inners.insert(key, InnerTex { probe, extra, scale, region, clipped, fonts, tex, frame: self.frame }) {
                         self.retired.push((old.tex, self.frame));
                     }
+                    self.inner_failed.remove(&key);
                 }
                 Err(_) => {
                     self.inner_failed.insert(key, done.probe);
@@ -645,6 +654,13 @@ impl Ext {
         }
         let frame = self.frame;
         self.frames.retain(|_, f| f.used + 300 > frame);
+        if self.overlay.as_ref().is_some_and(|o| o.used + 300 <= frame) {
+            self.overlay = None;
+        }
+        if self.strokes.values().any(|s| s.used + 300 <= frame) {
+            self.strokes.retain(|_, s| s.used + 300 > frame);
+            self.stroke_vertices = self.strokes.values().map(|s| s.mesh.vertices.len()).sum();
+        }
         self.retired.retain(|r| r.1 + 300 > frame);
         self.blurs.retain(|_, b| b.frame + 300 > frame);
         self.details.retain(|_, d| d.frame + 300 > frame);
@@ -661,6 +677,15 @@ impl Ext {
         self.adj_live.retain(|_, e| e.frame + 300 > frame);
         self.adj_last.retain(|_, e| e.1 + 300 > frame);
         self.adj_src.retain(|_, e| e.used + 600 > frame);
+    }
+
+    /// `--bench`: do the kept meshes of the top-level frame `id` draw with a texture that only
+    /// stands in for an adjusted image (the preview of a slider, or the one shown before)?
+    /// `None`: no meshes are kept for it.
+    pub fn kept_preview(&self, id: u64) -> Option<bool> {
+        let e = self.frames.get(&id).filter(|e| e.state == 1)?;
+        let spare: Vec<TextureId> = self.adj_live.values().map(|l| l.tex.id()).chain(self.adj_last.values().map(|l| l.0.id())).collect();
+        Some(e.prims.iter().any(|(_, kept)| matches!(kept, Kept::Mesh(m) if spare.contains(&m.texture_id))))
     }
 
     /// Adjusted image textures: (finished ones, ones that follow a slider or stand in for one
@@ -861,9 +886,8 @@ pub struct PaintCx<'a> {
     pub measures: Vec<(u64, f32, f32)>,
     /// The boxes of the texts on a path that were laid out (see `path_laid`).
     pub boxes: Vec<PathBox>,
-    /// Every node of the page by its id, with the index of the top-level node it is in. Made
-    /// when the first text on a path asks for its path.
-    pub index: Option<HashMap<u64, (&'a Node, u32)>>,
+    /// The document that is painted: a text on a path finds its path in it.
+    pub doc: &'a Doc,
     /// While recording: the frame that is being recorded.
     pub rec_top: Option<u64>,
     pub drawn: usize,
@@ -881,24 +905,19 @@ pub struct PaintCx<'a> {
     /// be kept (it depends on the part of the screen that is visible).
     pub recording: bool,
     pub no_keep: bool,
+    /// While recording: what was painted shows a stand-in that is replaced soon (the preview of
+    /// an image adjustment). The meshes are not kept this time, and made again on the next frame.
+    pub keep_later: bool,
     /// While recording: what the GPU draws directly (see `add_special`), with its clip rectangle.
     pub specials: Vec<(Rect, Special)>,
 }
 
 impl<'a> PaintCx<'a> {
     /// A node of the page by its id, and which top-level node holds it.
+    /// (Through the index of the document, see `Doc::reindex`: a map of the whole page used
+    /// to be made here on every frame that painted a text on a path.)
     fn node(&mut self, id: u64) -> Option<(&'a Node, u32)> {
-        let tops = self.tops;
-        let index = self.index.get_or_insert_with(|| {
-            let mut map = HashMap::new();
-            for (i, top) in tops.iter().enumerate() {
-                top.walk(&mut |c| {
-                    map.insert(c.id, (c, i as u32));
-                });
-            }
-            map
-        });
-        index.get(&id).copied()
+        self.doc.find_top(id).map(|(top, n)| (n, top as u32))
     }
 }
 
@@ -1068,6 +1087,11 @@ fn adjusted_texture(pc: &mut PaintCx, node: u64, id: u64, adjust: Adjust, need: 
             adjust_start(pc, key, adjust, true);
         }
         return Some(tex);
+    }
+    // What is shown from here on is a stand-in. Meshes kept with it would never ask for the
+    // proper texture (it is started below, once the value has rested for some frames).
+    if pc.recording {
+        pc.keep_later = true;
     }
     let preview = pc.ext.adj_src.get_mut(&id).map(|s| {
         s.used = frame;
@@ -1644,8 +1668,10 @@ pub struct TextCache {
 }
 
 impl TextCache {
-    /// Entries unused for this many frames are dropped.
-    const KEEP: u64 = 240;
+    /// Entries unused for this many frames are dropped. (Longer than a kept frame goes without
+    /// being made again, which is up to 264 frames, see `frame_cached`: the layouts of its
+    /// texts are still here then.)
+    const KEEP: u64 = 300;
 
     pub fn generation(&self) -> u64 {
         self.generation
@@ -2104,7 +2130,7 @@ fn add_dashed(sink: &mut Sink, mut pts: Vec<Pos2>, closed: bool, s: Stroke, n: &
 /// Draws the stroke of `n` from its own shape (see `stroke.rs`) where egui's plain lines would
 /// not show it as the export does: dashes, round or square ends, corners of a path, round or
 /// bevelled corners of a rectangle. Result false: nothing was drawn, the plain way is as good.
-fn styled_stroke(pc: &PaintCx, sink: &mut Sink, n: &Node, s: Stroke) -> bool {
+fn styled_stroke(pc: &mut PaintCx, sink: &mut Sink, n: &Node, s: Stroke) -> bool {
     let z = pc.view.zoom;
     // Dashes too close together to be told apart are drawn as a solid line.
     let dashed = n.dash > 0.0 && (n.dash + if n.gap > 0.0 { n.gap } else { n.dash }) * z >= 2.0;
@@ -2123,19 +2149,135 @@ fn styled_stroke(pc: &PaintCx, sink: &mut Sink, n: &Node, s: Stroke) -> bool {
     if !wanted || *OFF.get_or_init(|| std::env::var_os("KANVAS_PLAIN_STROKES").is_some()) {
         return false;
     }
+    let feather = 1.0 / pc.ctx.pixels_per_point().max(0.1);
+    // The mesh is kept (see `StrokeMesh`): found again by what it was made from, moved along
+    // when the view is panned, and scaled for as long as the zoom is changing.
+    let key = stroke_key(n, s.color, dashed, feather);
+    let anchor = pc.view.to_screen(pc.o, n.x, n.y);
+    let (frame, moving) = (pc.ext.frame, pc.moving);
+    static NO_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // `KANVAS_NO_STROKE_CACHE`: make every stroke again on every frame (to compare the two).
+    let keep = !*NO_CACHE.get_or_init(|| std::env::var_os("KANVAS_NO_STROKE_CACHE").is_some());
+    if let Some(e) = pc.ext.strokes.get_mut(&n.id).filter(|e| keep && e.key == key) {
+        if e.made == z || (moving && (0.5..=2.0).contains(&(z / e.made))) {
+            if e.at != anchor || e.zoom != z {
+                let (from, k) = (e.at, z / e.zoom);
+                for v in &mut Arc::make_mut(&mut e.mesh).vertices {
+                    v.pos = anchor + (v.pos - from) * k;
+                }
+                (e.at, e.zoom) = (anchor, z);
+            }
+            e.used = frame;
+            sink.add(Shape::mesh(e.mesh.clone()));
+            return true;
+        }
+    }
     let Some(lines) = crate::outline::stroke_lines(n) else { return false };
     let mut style = crate::outline::stroke_style(n);
     if !dashed {
         style.dash = None;
     }
-    let (view, o) = (pc.view, pc.o);
-    let feather = 1.0 / pc.ctx.pixels_per_point().max(0.1);
-    match super::stroke::mesh(&lines, &style, |x, y| view.to_screen(o, x, y), z, s.color, feather) {
-        Some(mesh) => {
-            sink.add(Shape::mesh(mesh));
-            true
+    // (Laid out from the corner of the node, where the numbers are small, then put in place.)
+    let (x0, y0) = (n.x, n.y);
+    let Some(mut mesh) = super::stroke::mesh(&lines, &style, |x, y| pos2((x - x0) * z, (y - y0) * z), z, s.color, feather) else { return false };
+    mesh.translate(anchor.to_vec2());
+    let mesh = Arc::new(mesh);
+    sink.add(Shape::mesh(mesh.clone()));
+    if keep {
+        pc.ext.keep_stroke(n.id, StrokeMesh { key, made: z, at: anchor, zoom: z, mesh, used: frame });
+    }
+    true
+}
+
+/// The mesh of a styled stroke (see `styled_stroke`), kept from frame to frame: making it
+/// means running the stroker, flattening its outline and filling that, which used to be done
+/// again on every painted frame for every path.
+struct StrokeMesh {
+    /// What it was made from (`stroke_key`).
+    key: u64,
+    /// The zoom it was made at.
+    made: f32,
+    /// Where the corner of its node is on screen, and the zoom, as the mesh is now.
+    at: Pos2,
+    zoom: f32,
+    mesh: Arc<egui::Mesh>,
+    used: u64,
+}
+
+/// Shapes drawn over the document that stay the same from frame to frame (the outlines of
+/// what is selected), as one mesh: made by `shapes` when `key` (everything they depend on but
+/// where the view is panned to) changes, and moved along with `origin`, the place of the
+/// world's origin on screen.
+pub fn overlay_mesh(ext: &mut Ext, ctx: &egui::Context, key: u64, origin: Pos2, shapes: impl FnOnce() -> Vec<Shape>) -> Arc<egui::Mesh> {
+    let frame = ext.frame;
+    if let Some(e) = ext.overlay.as_mut().filter(|e| e.key == key) {
+        if e.at != origin {
+            Arc::make_mut(&mut e.mesh).translate(origin - e.at);
+            e.at = origin;
         }
-        None => false,
+        e.used = frame;
+        return e.mesh.clone();
+    }
+    let mut all = egui::Mesh::default();
+    for mesh in tessellate(ctx, shapes()) {
+        all.append(mesh);
+    }
+    let mesh = Arc::new(all);
+    ext.overlay = Some(StrokeMesh { key, made: 1.0, at: origin, zoom: 1.0, mesh: mesh.clone(), used: frame });
+    mesh
+}
+
+/// Vertices of kept stroke meshes, all together (20 bytes each, and about as much again for
+/// the triangles). Over this, those that were not drawn for longest go.
+const STROKE_VERTICES: usize = 1_500_000;
+
+/// Everything the mesh of the stroke of `n` depends on but the view: its shape, the style of
+/// the stroke and its colour.
+fn stroke_key(n: &Node, color: Color32, dashed: bool, feather: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (n.kind as u8, [n.x, n.y, n.w, n.h, n.radius, n.stroke_w, n.dash, n.gap, feather].map(f32::to_bits)).hash(&mut h);
+    (n.stroke_align, n.cap, n.join, n.closed, dashed, color).hash(&mut h);
+    if n.kind == Kind::Path {
+        for c in std::iter::once(&n.points).chain(&n.holes) {
+            c.len().hash(&mut h);
+            for p in c {
+                ([p.x, p.y, p.hin[0], p.hin[1], p.hout[0], p.hout[1]].map(f32::to_bits), p.r.map(f32::to_bits)).hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+impl Ext {
+    fn keep_stroke(&mut self, id: u64, made: StrokeMesh) {
+        let size = made.mesh.vertices.len();
+        if let Some(old) = self.strokes.remove(&id) {
+            self.stroke_vertices -= old.mesh.vertices.len().min(self.stroke_vertices);
+        }
+        // (One that would take most of the room by itself is made anew every frame, as before.)
+        if size > STROKE_VERTICES / 2 {
+            return;
+        }
+        if self.stroke_vertices + size > STROKE_VERTICES {
+            // Make room: half of it, oldest first, so this is not done for every stroke.
+            let mut by_age: Vec<(u64, u64, usize)> = self.strokes.iter().map(|(id, e)| (e.used, *id, e.mesh.vertices.len())).collect();
+            by_age.sort_unstable();
+            for (_, id, n) in by_age {
+                if self.stroke_vertices + size <= STROKE_VERTICES / 2 {
+                    break;
+                }
+                self.strokes.remove(&id);
+                self.stroke_vertices -= n.min(self.stroke_vertices);
+            }
+        }
+        self.stroke_vertices += size;
+        self.strokes.insert(id, made);
+    }
+
+    /// `--bench`: kept stroke meshes and their vertices.
+    pub fn kept_strokes(&self) -> (usize, usize) {
+        (self.strokes.len(), self.stroke_vertices)
     }
 }
 
@@ -2145,6 +2287,29 @@ fn styled_stroke(pc: &PaintCx, sink: &mut Sink, n: &Node, s: Stroke) -> bool {
 /// dan bayangan yang buram cukup dengan resolusi rendah.
 fn shadow_scale(blur: f32, screen: f32, side: f32) -> f32 {
     screen.min(8.0 / blur.max(0.5)).min(2048.0 / side.max(1.0)).max(1e-3)
+}
+
+/// `n` as a drop shadow sees it: without the adjustments of its images, which change their
+/// colours only. (A shadow that is kept for `n` stays good while a slider of Adjust moves.)
+fn shadow_source(n: &Node) -> std::borrow::Cow<'_, Node> {
+    fn adjusted(n: &Node) -> bool {
+        n.adjust.is_some() || n.children.iter().any(adjusted)
+    }
+    fn strip(n: &mut Node) {
+        n.adjust = None;
+        n.children.iter_mut().for_each(strip);
+    }
+    if !adjusted(n) {
+        return std::borrow::Cow::Borrowed(n);
+    }
+    let mut plain = n.clone();
+    strip(&mut plain);
+    std::borrow::Cow::Owned(plain)
+}
+
+/// Are `kept` (see `shadow_source`) what the shadow of `run` is made from?
+fn shadow_same<T: AsRef<Node>>(kept: &[Node], run: &[T]) -> bool {
+    kept.len() == run.len() && kept.iter().zip(run).all(|(a, b)| a == b.as_ref() || matches!(shadow_source(b.as_ref()), std::borrow::Cow::Owned(ref plain) if a == plain))
 }
 
 fn render_shadow(svg: &str, region: (f32, f32, f32, f32), scale: f32) -> Result<ColorImage, String> {
@@ -2172,19 +2337,18 @@ fn shadow_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: 
     let fresh = pc.ext.shadows.get_mut(&n.id).is_some_and(|c| {
         c.frame = frame;
         let want = shadow_scale(shadow.blur, screen, (c.region.2 - c.region.0).max(c.region.3 - c.region.1));
-        let same = c.nodes.len() == run.len() && c.nodes.iter().zip(run).all(|(a, b)| a == b.as_ref());
-        same && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
+        shadow_same(&c.nodes, run) && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
     });
-    let failed = pc.ext.shadow_failed.get(&n.id).is_some_and(|f| f.len() == run.len() && f.iter().zip(run).all(|(a, b)| a == b.as_ref()));
+    let failed = pc.ext.shadow_failed.get(&n.id).is_some_and(|f| shadow_same(f, run));
     if !fresh && !pc.ext.shadow_busy.contains(&n.id) && !failed {
         register_paths(pc, run);
-        if let Some((svg, region)) = crate::export::shadow_svg(run, pc.assets, pc.fonts, pc.ctx) {
+        if let Some((svg, region, images)) = crate::export::shadow_svg(run, pc.assets, pc.fonts, pc.ctx) {
             let scale = shadow_scale(shadow.blur, screen, (region.2 - region.0).max(region.3 - region.1));
             pc.ext.shadow_busy.insert(n.id);
-            let nodes: Vec<Node> = run.iter().map(|n| n.as_ref().clone()).collect();
+            let nodes: Vec<Node> = run.iter().map(|n| shadow_source(n.as_ref()).into_owned()).collect();
             let (tx, ctx) = (pc.ext.sh_tx.clone(), pc.ctx.clone());
             std::thread::spawn(move || {
-                let image = render_shadow(&svg, region, scale);
+                let image = render_shadow(&images.fill(svg), region, scale);
                 let _ = tx.send((nodes, fonts, scale, region, image));
                 ctx.request_repaint();
             });
@@ -2277,13 +2441,14 @@ fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[
     let failed = pc.ext.blur_failed.get(&key).is_some_and(|f| same(f));
     if !fresh && !pc.ext.blur_busy.contains(&key) && !failed {
         register_paths(pc, run);
-        if let Some((svg, region)) = crate::export::blur_svg(run, pc.assets, pc.fonts, pc.ctx) {
+        if let Some((svg, region, images)) = crate::export::blur_svg(run, pc.assets, pc.fonts, pc.ctx) {
             let scale = blur_scale(first.blur, screen, (region.2 - region.0).max(region.3 - region.1));
             pc.ext.blur_busy.insert(key);
             let nodes: Vec<Node> = run.iter().map(|n| n.as_ref().clone()).collect();
             let (tx, ctx) = (pc.ext.bl_tx.clone(), pc.ctx.clone());
             std::thread::spawn(move || {
-                let image = render_shadow(&svg, region, scale);
+                // (The images are encoded here, off the thread of the window.)
+                let image = render_shadow(&images.fill(svg), region, scale);
                 let _ = tx.send((nodes, fonts, scale, region, image));
                 ctx.request_repaint();
             });
@@ -2319,8 +2484,13 @@ fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[
 /// Resolution of an inner shadow texture. One that the mesh of the shape cuts out only has to
 /// carry the blurred edge of the shadow; one that is cut off at the glyphs of a text in the
 /// texture itself has to be as fine as the screen.
+///
+/// (A drop shadow or a layer blur gets no more than 16 pixels per unit however sharp it is,
+/// see `shadow_scale`. Here that made a shadow without blur, a hard line inside the shape,
+/// turn soft above 16× zoom, so the less blur there is the finer the texture may be: up to the
+/// resolution of the screen, within the same largest size.)
 fn inner_scale(blur: f32, screen: f32, side: f32, clipped: bool) -> f32 {
-    let fine = if clipped { screen.min(4096.0 / side.max(1.0)) } else { screen.min(8.0 / blur.max(0.5)).min(2048.0 / side.max(1.0)) };
+    let fine = if clipped { screen.min(4096.0 / side.max(1.0)) } else { screen.min(8.0 / blur.max(0.02)).min(2048.0 / side.max(1.0)) };
     fine.max(1e-3)
 }
 
@@ -2443,8 +2613,10 @@ fn backdrop_layer(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, shape: Sh
 /// (slightly soft for a moment, like a photo being resized) and made afresh at the new size once
 /// it rests, or when the zoom has moved past half or double the size they were made for.
 struct FrameMesh {
-    /// Keeps the node alive, so the same address means the same content.
-    node: Arc<Node>,
+    /// Keeps the allocation of the node, so the same address means the same content (a node
+    /// with a `Weak` to it is never changed in place). Not an `Arc`: that would have every
+    /// edit of the frame copy all of it first, on every frame of a drag.
+    node: std::sync::Weak<Node>,
     /// 0 = seen once, 1 = meshes ready, 2 = cannot be kept.
     state: u8,
     key: FrameKey,
@@ -2545,12 +2717,12 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
         return false;
     }
     let frame = pc.ext.frame;
-    let known = pc.ext.frames.get(&n.id).is_some_and(|e| std::ptr::eq(Arc::as_ptr(&e.node), n));
+    let known = pc.ext.frames.get(&n.id).is_some_and(|e| std::ptr::eq(e.node.as_ptr(), n));
     if !known {
         // New or just changed. A frame that changes every frame (something in it is being
         // dragged) would only add work here, so its meshes are made the second time it is seen.
         if let Some(node) = pc.tops.iter().find(|a| std::ptr::eq(Arc::as_ptr(a), n)) {
-            let entry = FrameMesh { node: node.clone(), state: 0, key: Default::default(), origin: Pos2::ZERO, zoom: 1.0, prims: Vec::new(), drawn: 0, made: frame, used: frame };
+            let entry = FrameMesh { node: Arc::downgrade(node), state: 0, key: Default::default(), origin: Pos2::ZERO, zoom: 1.0, prims: Vec::new(), drawn: 0, made: frame, used: frame };
             pc.ext.frames.insert(n.id, entry);
         }
         return false;
@@ -2588,9 +2760,13 @@ fn frame_cached(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f32)
                 (e.state, e.key, e.origin, e.zoom, e.prims, e.drawn, e.made) = (1, key, origin, zoom, prims, drawn, frame);
             }
             None => {
+                let later = pc.keep_later && !pc.no_keep;
                 if let Some(e) = pc.ext.frames.get_mut(&n.id) {
-                    e.state = 2;
+                    e.state = if later { 0 } else { 2 };
                     e.prims = Vec::new();
+                }
+                if later {
+                    pc.ctx.request_repaint();
                 }
                 return false;
             }
@@ -2658,7 +2834,7 @@ fn record_frame(pc: &mut PaintCx, n: &Node, alpha: f32) -> Option<(Vec<(Rect, Ke
     let side = egui::Painter::new(pc.ctx.clone(), layer, Rect::EVERYTHING);
     let (vis, drawn) = (pc.vis, pc.drawn);
     pc.vis = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
-    (pc.recording, pc.no_keep, pc.skip_shadow) = (true, false, true);
+    (pc.recording, pc.no_keep, pc.keep_later, pc.skip_shadow) = (true, false, false, true);
     pc.rec_top = Some(n.id);
     pc.specials.clear();
     paint_node(pc, &side, n, alpha);
@@ -2668,7 +2844,7 @@ fn record_frame(pc: &mut PaintCx, n: &Node, alpha: f32) -> Option<(Vec<(Rect, Ke
     pc.drawn = drawn;
     let list = pc.ctx.graphics_mut(|g| g.get_mut(layer).map(std::mem::take)).unwrap_or_default();
     let mut specials: Vec<Option<(Rect, Special)>> = std::mem::take(&mut pc.specials).into_iter().map(Some).collect();
-    if pc.no_keep {
+    if pc.no_keep || pc.keep_later {
         return None;
     }
     let shapes: Vec<egui::epaint::ClippedShape> = list.all_entries().cloned().collect();
@@ -3120,6 +3296,36 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharp_inner_shadow_gets_a_texture_as_fine_as_the_screen() {
+        // No blur, 40 pixels per unit on screen (32× zoom): as fine as that, not 16.
+        assert!(inner_scale(0.0, 40.0, 20.0, false) > 39.0);
+        // A blurred one stays coarse, and a large shape stays within the largest texture.
+        assert_eq!(inner_scale(8.0, 40.0, 20.0, false), 1.0);
+        assert!(inner_scale(0.0, 40.0, 1000.0, false) <= 2.05);
+    }
+
+    #[test]
+    fn shadow_is_kept_while_only_the_adjustment_of_its_image_changes() {
+        let mut image = Node::new(1, Kind::Image, 0.0, 0.0);
+        (image.w, image.h, image.adjust) = (10.0, 10.0, Some(Adjust { exposure: 10.0, ..Default::default() }));
+        let kept = vec![shadow_source(&image).into_owned()];
+        assert!(kept[0].adjust.is_none());
+        let mut moved = image.clone();
+        moved.adjust = Some(Adjust { exposure: 60.0, ..Default::default() });
+        assert!(shadow_same(&kept, std::slice::from_ref(&moved)));
+        // Anything else about the node makes the shadow anew; so does an image inside a frame.
+        moved.w = 12.0;
+        assert!(!shadow_same(&kept, std::slice::from_ref(&moved)));
+        let mut frame = Node::new(2, Kind::Frame, 0.0, 0.0);
+        frame.children.push(image.clone());
+        let kept = vec![shadow_source(&frame).into_owned()];
+        frame.children[0].adjust = None;
+        assert!(shadow_same(&kept, std::slice::from_ref(&frame)));
+        frame.children[0].x = 3.0;
+        assert!(!shadow_same(&kept, std::slice::from_ref(&frame)));
+    }
 
     #[test]
     fn svg_files_open_as_images() {

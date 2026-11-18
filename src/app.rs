@@ -22,6 +22,7 @@ mod find;
 mod glass;
 mod home;
 mod icons;
+mod layers_bench;
 mod library;
 mod pacer;
 mod pages;
@@ -343,6 +344,21 @@ struct Bench {
     perf: perf::State,
 }
 
+/// A selection of more layers than this has what is asked about it as a whole kept from
+/// frame to frame (see `App::sel_whole`).
+const SEL_KEPT: usize = 24;
+
+/// See `App::sel_whole`.
+#[derive(Clone, Copy)]
+struct SelWhole {
+    /// A locked layer, or one in a locked frame, is selected.
+    locked: bool,
+    /// A part of an instance is selected.
+    pinned: bool,
+    /// The box around the selection, when it is more than one unit (see `App::sel_box`).
+    bounds: Option<(f32, f32, f32, f32)>,
+}
+
 pub struct App {
     doc: Doc,
     view: View,
@@ -386,6 +402,13 @@ pub struct App {
     rembg: Option<rembg::Job>,
     /// Export yang sedang berjalan di thread lain; hasilnya teks untuk status bar.
     exporting: Option<std::sync::mpsc::Receiver<String>>,
+    /// What the running export says about its progress (see `export_job`).
+    export_note: std::sync::Arc<std::sync::Mutex<String>>,
+    /// What the Design panel last worked out about a selection of several layers, and for what
+    /// (see `sel_facts`).
+    sel_memo: Option<(u64, panel::SelFacts)>,
+    /// What was last worked out about a large selection as a whole, and for what (see `sel_whole`).
+    sel_kept: std::cell::Cell<Option<(u64, SelWhole)>>,
     /// Remote control lewat soket lokal (untuk server MCP `kanvas-mcp`).
     remote: Option<remote::Remote>,
     /// Pengaturan magic wand.
@@ -494,6 +517,9 @@ impl App {
             files: home::Files::new(&cc.egui_ctx),
             rembg: None,
             exporting: None,
+            export_note: Default::default(),
+            sel_memo: None,
+            sel_kept: Default::default(),
             remote: None,
             icons: Default::default(),
             photos: Default::default(),
@@ -559,8 +585,10 @@ impl App {
     }
 
     fn do_undo(&mut self) {
-        if let Some(d) = self.undo.pop() {
+        if let Some(mut d) = self.undo.pop() {
             let page = self.doc.page_id();
+            // (The print settings are not part of what is undone.)
+            d.print.clone_from(&self.doc.print);
             self.redo.push(std::mem::replace(&mut self.doc, d));
             self.page_changed(page);
             self.after_history();
@@ -568,8 +596,9 @@ impl App {
     }
 
     fn do_redo(&mut self) {
-        if let Some(d) = self.redo.pop() {
+        if let Some(mut d) = self.redo.pop() {
             let page = self.doc.page_id();
+            d.print.clone_from(&self.doc.print);
             self.undo.push(std::mem::replace(&mut self.doc, d));
             self.page_changed(page);
             self.after_history();
@@ -802,7 +831,33 @@ impl App {
 
     /// Ada layer terkunci di dalam seleksi (seleksinya dibuat dari panel layer).
     fn sel_locked(&self) -> bool {
+        if self.sel.len() > SEL_KEPT {
+            return self.sel_whole().locked;
+        }
         self.sel.iter().any(|id| self.locked(*id))
+    }
+
+    /// What is asked about a large selection as a whole, several times per frame (by the
+    /// pointer over the canvas, the handles, the panels): each answer looks at every selected
+    /// layer and the frames around it, so they are worked out once and kept until the document
+    /// or the selection changes.
+    fn sel_whole(&self) -> SelWhole {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.doc.reindex(), self.doc.page, &self.sel).hash(&mut h);
+        let key = h.finish();
+        if let Some((_, kept)) = self.sel_kept.get().filter(|k| k.0 == key) {
+            return kept;
+        }
+        let roots = self.doc.roots_of(&self.sel);
+        let bounds = roots.iter().filter_map(|id| self.doc.find(*id).map(|n| n.aabb())).reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
+        let whole = SelWhole {
+            locked: self.sel.iter().any(|id| self.locked(*id)),
+            pinned: self.sel.iter().any(|id| self.doc.pinned(*id)),
+            bounds: bounds.filter(|_| roots.len() >= 2),
+        };
+        self.sel_kept.set(Some((key, whole)));
+        whole
     }
 
     /// Ctrl+Shift+L: kunci seleksi; kalau semuanya sudah terkunci, buka kuncinya.
@@ -864,6 +919,9 @@ impl App {
     fn sel_box(&self) -> Option<(f32, f32, f32, f32)> {
         if self.sel.len() < 2 || !self.pointer_tool() || self.editing.is_some() || self.ext.path_edit.is_some() {
             return None;
+        }
+        if self.sel.len() > SEL_KEPT {
+            return self.sel_whole().bounds;
         }
         let ids = self.roots();
         if ids.len() < 2 {
@@ -2651,6 +2709,13 @@ impl App {
                 // caret and the selection are in the screenshot. `=keys`: Ctrl+U on the selected list;
                 // `=edit-keys`: on the characters selected in the editor (more modes further down).
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_TYPO") {
+                    if mode == "rest" {
+                        // (A frame is made again after 200 to 263 frames, by its id: this one
+                        // gets the longest wait.)
+                        while self.doc.next_id % 64 != 62 {
+                            self.doc.alloc_id();
+                        }
+                    }
                     let ids = self.bench_typo();
                     b.ids.clone_from(&ids);
                     let id = if mode == "edit-list" { ids[3] } else { ids[1] };
@@ -2735,6 +2800,19 @@ impl App {
                 // `=drag`: the sliders of a 12 megapixel photo are moved, and timed.
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_ADJUST") {
                     b.ids = self.bench_adjust(ctx, &mode, &mut b.inject);
+                }
+                // `KANVAS_BENCH_TOOLBAR=1` (with a narrow `KANVAS_WINDOW`): the "More" button of
+                // the bottom toolbar is clicked, so its popup is in the screenshot.
+                if std::env::var_os("KANVAS_BENCH_TOOLBAR").is_some() {
+                    if let Some(at) = self.bench_more_button() {
+                        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                        b.inject.extend([(200, egui::Event::PointerMoved(at)), (204, button(true)), (206, button(false)), (212, egui::Event::PointerMoved(at + vec2(-40.0, -60.0)))]);
+                    }
+                }
+                // `KANVAS_BENCH_LAYERS=<n>`: one artboard with n layers, timed at rest, with
+                // all of them selected, during a drag and while typing (see `layers_bench`).
+                if let Ok(n) = std::env::var("KANVAS_BENCH_LAYERS") {
+                    b.ids = self.bench_layers(n.parse().unwrap_or(5000));
                 }
                 // `KANVAS_BENCH_SHADOW=1`: beri drop shadow ke isi frame demo.
                 if std::env::var("KANVAS_BENCH_SHADOW").is_ok() {
@@ -3257,6 +3335,46 @@ impl App {
                                 self.sel = if std::env::var("KANVAS_BENCH_AUTOLAYOUT").is_ok_and(|m| m == "multi") { vec![primary, cancel] } else { vec![card] };
                             }
                         }
+                        // A card that hugs its height, with a paragraph that fills its width, far
+                        // out of view: nothing paints it, so nothing measures the paragraph.
+                        // An export has to come out with the card laid out around its text all
+                        // the same, also after the card was made narrower.
+                        354 | 358 | 362 if !hold => {
+                            use crate::layout::{AutoLayout, Dir, Sizing};
+                            let far = self.doc.nodes.iter().find(|n| n.name == "Far card").map(|n| n.id);
+                            let sizes = |app: &Self| app.doc.nodes.iter().find(|n| n.name == "Far card").map(|c| (c.w, c.h, c.children[0].w, c.children[0].h));
+                            match (b.frame, far) {
+                                (354, _) => {
+                                    let (x, y) = self.doc.find(card).map_or((0.0, 0.0), |c| (c.x + 60000.0, c.y));
+                                    let mut far = Node::new(self.doc.alloc_id(), Kind::Frame, x, y);
+                                    (far.name, far.w, far.h, far.fill, far.size_v) = ("Far card".into(), 400.0, 60.0, Some([255, 255, 255, 255]), Sizing::Hug);
+                                    far.layout = Some(AutoLayout { dir: Dir::Vertical, pad: [16.0; 4], ..Default::default() });
+                                    let mut text = Node::new(self.doc.alloc_id(), Kind::Text, x + 16.0, y + 16.0);
+                                    (text.text, text.font_size, text.wrap, text.w, text.h, text.size_h, text.fill) = ("A paragraph that is long enough to need several lines in a card of this width, and more of them in a narrower one.".into(), 16.0, true, 368.0, 20.0, Sizing::Fill, Some([30, 30, 40, 255]));
+                                    far.children.push(text);
+                                    let pre = self.doc.clone();
+                                    self.doc.insert(far, None);
+                                    self.push_undo(pre);
+                                }
+                                (_, Some(far)) => {
+                                    let before = sizes(self);
+                                    let file = b.out.with_file_name(format!("bench-far-card-{}.png", b.frame)).to_string_lossy().into_owned();
+                                    let answer = self.remote_bench_export(ctx, &serde_json::json!({ "path": file, "id": far }));
+                                    let after = sizes(self);
+                                    let ok = after.is_some_and(|(w, h, tw, th)| near(tw, w - 32.0) && near(h, th + 32.0) && th > 30.0);
+                                    eprintln!("AUTOLAYOUT far card (w, h, text w, text h) before the export {before:?}, exported as {after:?} -> {}: the card is laid out around its text: {ok}", answer.chars().take(60).collect::<String>());
+                                    if b.frame == 358 {
+                                        // Narrower, as from the panel; the layout follows at the end of the frame.
+                                        let pre = self.doc.clone();
+                                        if let Some(n) = self.doc.find_mut(far) {
+                                            n.w = 220.0;
+                                        }
+                                        self.push_undo(pre);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -3354,6 +3472,11 @@ impl App {
                         eprintln!("SVG selection {sel:?}; status: {}", self.status);
                     }
                 }
+                let layers = std::env::var_os("KANVAS_BENCH_LAYERS").is_some() && b.ids.len() == 3;
+                if layers {
+                    let ids = b.ids.clone();
+                    self.bench_layers_frame(b.frame, &ids, &mut b.inject);
+                }
                 let textpath = std::env::var("KANVAS_BENCH_TEXTPATH").ok();
                 if let (Some(mode), true) = (&textpath, b.ids.len() >= 8) {
                     if b.aux == 0 && b.frame >= 230 && (!self.fonts.any_loading() || b.frame > 900) {
@@ -3427,8 +3550,14 @@ impl App {
                         self.bench_adjust_ui(ctx, b.frame, &mut b.inject);
                     }
                 }
-                if std::env::var_os("KANVAS_BENCH_CAPS").is_some() && (250..=255).contains(&b.frame) {
-                    eprintln!("CAPS frame {}: {:.2} ms", b.frame, self.frame_ms);
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_CAPS") {
+                    // `=dash`: the view is panned for some frames first (kept stroke meshes move along).
+                    if mode == "dash" && (232..=243).contains(&b.frame) {
+                        self.view.pan += vec2(-7.3, 2.6);
+                    }
+                    if (250..=255).contains(&b.frame) {
+                        eprintln!("CAPS frame {}: {:.2} ms; kept strokes {:?}", b.frame, self.frame_ms, self.ext.kept_strokes());
+                    }
                 }
                 if let Ok(mode) = std::env::var("KANVAS_BENCH_TYPO") {
                     if (250..=255).contains(&b.frame) {
@@ -3436,6 +3565,15 @@ impl App {
                     }
                     let paragraph = b.ids.get(1).and_then(|id| self.doc.find(*id)).map(|n| (n.x, n.y, n.w, n.h, n.fixed_h));
                     match (mode.as_str(), b.frame, paragraph) {
+                        // `=rest`: the canvas stands still for 600 frames; text layouts built in
+                        // that time are counted (kept frames are made again now and then, and
+                        // should find the layouts of their texts still there).
+                        ("rest", 300 | 900, _) => {
+                            let built = perf::COUNT[0].swap(0, std::sync::atomic::Ordering::Relaxed);
+                            if b.frame == 900 {
+                                eprintln!("TYPO text layouts built in 600 frames at rest: {built}");
+                            }
+                        }
                         // `=edit-keys`: after Ctrl+U the selected characters are struck through too.
                         ("edit-keys", 245, _) => self.toggle_decoration(true),
                         // `=outline`: every text of the frame becomes vector paths (Outline text).
@@ -3444,6 +3582,22 @@ impl App {
                             let start = std::time::Instant::now();
                             self.outline_stroke(ctx);
                             eprintln!("TYPO outlined in {:.1} ms: {} layers selected; status: {}", start.elapsed().as_secs_f32() * 1000.0, self.sel.len(), self.status);
+                        }
+                        // What a hit test of the outlined texts costs: a point in the box of
+                        // each (between its letters, mostly), a thousand times.
+                        ("outline", 252, _) => {
+                            let paths: Vec<&Node> = self.sel.iter().filter_map(|id| self.doc.find(*id)).collect();
+                            let start = std::time::Instant::now();
+                            let mut hits = 0;
+                            for i in 0..1000 {
+                                for n in &paths {
+                                    let (x0, y0, x1, y1) = n.bounds();
+                                    let t = (i % 97) as f32 / 97.0;
+                                    hits += n.contains(x0 + (x1 - x0) * t, y0 + (y1 - y0) * (1.0 - t), 1.0) as usize;
+                                }
+                            }
+                            let calls = 1000 * paths.len().max(1);
+                            eprintln!("TYPO hit test of {} outlined texts ({} contours): {:.2} us per call, {hits} of {calls} hit", paths.len(), paths.iter().map(|n| 1 + n.holes.len()).sum::<usize>(), start.elapsed().as_secs_f64() * 1e6 / calls as f64);
                         }
                         // `=resize`: the bottom handle of the justified paragraph is dragged down by
                         // 60, which gives it a fixed height; then its lines go to the bottom.
@@ -3462,7 +3616,9 @@ impl App {
                         _ => {}
                     }
                 }
-                let settled = b.frame > if nested { 760 } else if component { 640 } else if auto { 356 } else { 260 };
+                let settled = b.frame > if nested { 760 } else if component { 640 } else if auto { 368 } else { 260 };
+                let settled = settled && (!layers || b.frame > 430);
+                let settled = settled && (std::env::var("KANVAS_BENCH_TYPO").as_deref() != Ok("rest") || b.frame > 905);
                 let settled = settled && (textpath.is_none() || (b.aux != 0 && b.frame > b.aux + 80));
                 let settled = settled && (!print || (b.aux != 0 && b.frame > b.aux + 80));
                 let settled = settled && (!effects || (b.aux != 0 && b.frame > b.aux + 80 && self.ext.busy() == 0));

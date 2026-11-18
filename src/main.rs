@@ -45,9 +45,14 @@ fn main() -> eframe::Result {
     // Window icon (title bar, taskbar, Alt+Tab). The .exe file icon itself comes from `build.rs`.
     let icon = image::load_from_memory(include_bytes!("../assets/icon-256.png")).map(|i| i.to_rgba8()).ok();
 
+    // `KANVAS_WINDOW=<width>x<height>`: the size of the window at the start (for `--bench`).
+    let size = std::env::var("KANVAS_WINDOW").ok().and_then(|v| {
+        let (w, h) = v.split_once('x')?;
+        Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?])
+    });
     let viewport = egui::ViewportBuilder::default()
             .with_title("Kanvas")
-            .with_inner_size([1360.0, 840.0])
+            .with_inner_size(size.unwrap_or([1360.0, 840.0]))
             .with_min_inner_size([720.0, 480.0]);
     let viewport = match icon {
         Some(i) => viewport.with_icon(egui::IconData { width: i.width(), height: i.height(), rgba: i.into_raw() }),

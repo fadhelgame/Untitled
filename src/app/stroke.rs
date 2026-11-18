@@ -283,7 +283,21 @@ impl super::App {
         }
         eprintln!("CAPS exported in {:.1} ms", start.elapsed().as_secs_f32() * 1000.0);
         let part: Vec<f32> = mode.strip_prefix("view:").map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect()).unwrap_or_default();
-        let view = if part.len() == 4 { (x + part[0], y + part[1], x + part[2], y + part[3]) } else { (x - 20.0, y - 20.0, x + w * 2.0 + 60.0, y + h + 20.0) };
+        let mut view = if part.len() == 4 { (x + part[0], y + part[1], x + part[2], y + part[3]) } else { (x - 20.0, y - 20.0, x + w * 2.0 + 60.0, y + h + 20.0) };
+        if mode == "dash" {
+            // `=dash`: long top-level paths (no frame around them, so nothing keeps their
+            // meshes but the strokes' own cache): a dashed wave of 1200 points, a see-through
+            // one and a solid one, seen close up; most of each is off screen.
+            let (wx, wy) = (x, y + h + 400.0);
+            for (row, (dash, color)) in [(14.0, blue), (9.0, red), (0.0, ink)].into_iter().enumerate() {
+                let pts: Vec<super::render::PenPt> = (0..1200).map(|i| pt(wx + i as f32 * 5.0, wy + row as f32 * 60.0 + if i % 2 == 0 { 0.0 } else { 34.0 } + (i as f32 * 0.05).sin() * 20.0)).collect();
+                let mut n = Node::new(self.doc.alloc_id(), Kind::Path, wx, wy);
+                set_contours(&mut n, vec![Contour { pts, closed: false }]);
+                (n.name, n.stroke, n.stroke_w, n.dash, n.gap, n.cap, n.join) = ("Wave".into(), Some(color), 6.0, dash, dash * 0.6, 1, 1);
+                self.doc.insert(n, None);
+            }
+            view = (wx + 2900.0, wy - 40.0, wx + 3100.0, wy + 200.0);
+        }
         self.zoom_to(view, 32.0);
         self.fit_pending = false;
         self.sel.clear();
