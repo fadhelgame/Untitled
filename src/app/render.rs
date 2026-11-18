@@ -257,6 +257,10 @@ pub struct Ext {
     /// fonts, its place on the path or the path itself changes.
     path_texts: HashMap<u64, PathText>,
     pub path_seen: HashMap<u64, PathSeen>,
+    /// Texts in a box of fixed height, by id: how far their lines ran out of the box when they
+    /// were last laid out (`Node::text_spill`), and what that was worked out for (`spill_key`).
+    /// Such a text is drawn, found and clicked beyond its box.
+    spills: HashMap<u64, (u64, f32)>,
     pub frame: u64,
     pub pen: Option<Vec<PenPt>>,
     pub pen_drag: bool,
@@ -312,9 +316,10 @@ pub struct Ext {
     /// Per asset, the adjusted texture that was dropped last: shown until the one for the
     /// new values is there, so the image does not blink back to its plain self.
     adj_last: HashMap<u64, (TextureHandle, u64)>,
-    /// Assets an adjusted texture is being made for, and those it could not be made for.
+    /// Assets an adjusted texture is being made for, and those it could not be made for, with
+    /// the adjustments that was tried with: other values are tried again.
     adj_busy: HashSet<u64>,
-    adj_failed: HashSet<u64>,
+    adj_failed: HashMap<u64, [u32; 7]>,
     adj_tx: mpsc::Sender<AdjDone>,
     adj_rx: mpsc::Receiver<AdjDone>,
     blend_gl: blend::Shared,
@@ -330,19 +335,21 @@ pub struct Ext {
     /// Tekstur drop shadow per node, yang sedang dirender, dan yang gagal dirender.
     shadows: HashMap<u64, ShadowTex>,
     shadow_busy: HashSet<u64>,
-    shadow_failed: HashSet<u64>,
+    /// (What failed is kept as it was then: once the node is edited it is tried again. The
+    /// same goes for the layer blurs and the inner shadows below.)
+    shadow_failed: HashMap<u64, Vec<Node>>,
     sh_tx: mpsc::Sender<ShadowDone>,
     sh_rx: mpsc::Receiver<ShadowDone>,
     /// Tekstur layer blur per rangkaian, yang sedang dirender, dan yang gagal dirender.
     blurs: HashMap<u64, BlurTex>,
     blur_busy: HashSet<u64>,
-    blur_failed: HashSet<u64>,
+    blur_failed: HashMap<u64, Vec<Node>>,
     bl_tx: mpsc::Sender<BlurDone>,
     bl_rx: mpsc::Receiver<BlurDone>,
     /// Inner shadow textures per node, those being rendered, and those that failed.
     inners: HashMap<u64, InnerTex>,
     inner_busy: HashSet<u64>,
-    inner_failed: HashSet<u64>,
+    inner_failed: HashMap<u64, Node>,
     in_tx: mpsc::Sender<InnerDone>,
     in_rx: mpsc::Receiver<InnerDone>,
     pub export_scale: f32,
@@ -378,17 +385,17 @@ impl Default for Ext {
             adj_live: HashMap::new(),
             adj_last: HashMap::new(),
             adj_busy: HashSet::new(),
-            adj_failed: HashSet::new(),
+            adj_failed: HashMap::new(),
             adj_tx,
             adj_rx,
             inners: HashMap::new(),
             inner_busy: HashSet::new(),
-            inner_failed: HashSet::new(),
+            inner_failed: HashMap::new(),
             in_tx,
             in_rx,
             blurs: HashMap::new(),
             blur_busy: HashSet::new(),
-            blur_failed: HashSet::new(),
+            blur_failed: HashMap::new(),
             bl_tx,
             bl_rx,
             svg: HashMap::new(),
@@ -399,12 +406,13 @@ impl Default for Ext {
             det_rx,
             shadows: HashMap::new(),
             shadow_busy: HashSet::new(),
-            shadow_failed: HashSet::new(),
+            shadow_failed: HashMap::new(),
             sh_tx,
             sh_rx,
             text_lines: HashMap::new(),
             path_texts: HashMap::new(),
             path_seen: HashMap::new(),
+            spills: HashMap::new(),
             frame: 0,
             pen: None,
             pen_drag: false,
@@ -450,7 +458,42 @@ impl Default for Ext {
     }
 }
 
+/// What the overflow of a text in a box of fixed height was measured for: when this changes
+/// (while the text is out of view, say), the overflow is not known until it is laid out again.
+fn spill_key(n: &Node) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (n.text.len(), n.w.to_bits(), n.h.to_bits(), n.font_size.to_bits(), n.line_height.to_bits(), n.valign, n.spans.len()).hash(&mut h);
+    h.finish()
+}
+
 impl Ext {
+    /// The text `id` as it was last laid out on its path (by the canvas, when it drew it).
+    pub fn path_text(&self, id: u64) -> Option<Arc<textpath::Laid>> {
+        self.path_texts.get(&id).map(|t| t.laid.clone())
+    }
+
+    /// A text was laid out, its lines `content` high in all: remember how far they run out of
+    /// its box, if that is one of fixed height.
+    pub fn note_spill(&mut self, n: &Node, content: f32) {
+        if n.kind != Kind::Text || !n.fixed_h {
+            return;
+        }
+        if self.spills.len() > 8192 {
+            self.spills.clear();
+        }
+        self.spills.insert(n.id, (spill_key(n), n.text_spill(content)));
+    }
+
+    /// How far the lines of `n` run out of its box, above or below: 0 for anything but a text
+    /// in a box of fixed height, `None` when such a text has not been laid out as it is now.
+    pub fn spill(&self, n: &Node) -> Option<f32> {
+        if n.kind != Kind::Text || !n.fixed_h || n.on_path.is_some() {
+            return Some(0.0);
+        }
+        self.spills.get(&n.id).filter(|s| s.0 == spill_key(n)).map(|s| s.1)
+    }
+
     /// Kept frames: how many, in how many pieces, with how many vertices, and how many cannot be kept.
     pub fn kept(&self) -> (usize, usize, usize, usize) {
         let ready = self.frames.values().filter(|f| f.state == 1);
@@ -530,7 +573,7 @@ impl Ext {
                     }
                 }
                 Err(e) => {
-                    self.adj_failed.insert(key.0);
+                    self.adj_failed.insert(key.0, key.1);
                     self.notice = Some(format!("Couldn't read an image: {e}"));
                 }
             }
@@ -559,7 +602,7 @@ impl Ext {
                     }
                 }
                 Err(_) => {
-                    self.shadow_failed.insert(key);
+                    self.shadow_failed.insert(key, nodes);
                 }
             }
         }
@@ -574,7 +617,7 @@ impl Ext {
                     }
                 }
                 Err(_) => {
-                    self.blur_failed.insert(key);
+                    self.blur_failed.insert(key, nodes);
                 }
             }
         }
@@ -590,7 +633,7 @@ impl Ext {
                     }
                 }
                 Err(_) => {
-                    self.inner_failed.insert(key);
+                    self.inner_failed.insert(key, done.probe);
                 }
             }
         }
@@ -992,7 +1035,7 @@ fn image_texture(pc: &mut PaintCx, id: u64, mask: bool, need: f32) -> Option<Tex
 /// change (they leave the alpha alone).
 fn node_texture(pc: &mut PaintCx, n: &Node, mask: bool, need: f32) -> Option<TextureId> {
     let id = n.image?;
-    match n.adjustment().filter(|_| !mask && !pc.ext.adj_failed.contains(&id)) {
+    match n.adjustment().filter(|a| !mask && pc.ext.adj_failed.get(&id) != Some(&a.key())) {
         Some(adjust) => adjusted_texture(pc, n.id, id, adjust, need),
         None => image_texture(pc, id, mask, need),
     }
@@ -1083,7 +1126,7 @@ fn adjusted_texture(pc: &mut PaintCx, node: u64, id: u64, adjust: Adjust, need: 
 /// `full`: at full size, otherwise the small version.
 fn adjust_start(pc: &mut PaintCx, key: AdjKey, adjust: Adjust, full: bool) {
     let id = key.0;
-    if pc.ext.adj_busy.contains(&id) || pc.ext.adj_failed.contains(&id) || pc.ext.adj_busy.len() >= decode_limit() {
+    if pc.ext.adj_busy.contains(&id) || pc.ext.adj_failed.get(&id) == Some(&key.1) || pc.ext.adj_busy.len() >= decode_limit() {
         return;
     }
     let Some(asset) = pc.assets.get(&id).cloned() else { return };
@@ -1201,7 +1244,7 @@ fn silhouette(image: &mut ColorImage) {
 fn svg_detail(pc: &mut PaintCx, n: &Node, r: Rect, clip: Rect, whole: bool) -> Option<(TextureId, Rect)> {
     let key: TexKey = (n.image?, n.fill.is_some());
     // (A colour overlay shows the silhouette only: adjustments change nothing there.)
-    let adjust = n.adjustment().filter(|_| !key.1 && !pc.ext.adj_failed.contains(&key.0));
+    let adjust = n.adjustment().filter(|a| !key.1 && pc.ext.adj_failed.get(&key.0) != Some(&a.key()));
     let adjust_key = adjust.map(|a| a.key());
     let base = match adjust_key {
         Some(a) => pc.ext.adj.get(&(key.0, a))?.tex.size(),
@@ -2132,7 +2175,8 @@ fn shadow_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: 
         let same = c.nodes.len() == run.len() && c.nodes.iter().zip(run).all(|(a, b)| a == b.as_ref());
         same && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
     });
-    if !fresh && !pc.ext.shadow_busy.contains(&n.id) && !pc.ext.shadow_failed.contains(&n.id) {
+    let failed = pc.ext.shadow_failed.get(&n.id).is_some_and(|f| f.len() == run.len() && f.iter().zip(run).all(|(a, b)| a == b.as_ref()));
+    if !fresh && !pc.ext.shadow_busy.contains(&n.id) && !failed {
         register_paths(pc, run);
         if let Some((svg, region)) = crate::export::shadow_svg(run, pc.assets, pc.fonts, pc.ctx) {
             let scale = shadow_scale(shadow.blur, screen, (region.2 - region.0).max(region.3 - region.1));
@@ -2188,6 +2232,7 @@ fn measure_texts(pc: &mut PaintCx, n: &Node) {
     let layout = layout_text(pc.ctx, n, &n.text, pc.fonts, lay / max, 1.0, true);
     let width = if n.wrap { n.w } else { layout.width * k / z };
     pc.measures.push((n.id, width, layout.height * k / z));
+    pc.ext.note_spill(n, layout.height * k / z);
 }
 
 /// Gambar satu rangkaian layer blur sebagai tekstur yang sudah buram. Seperti bayangan, teksturnya
@@ -2229,7 +2274,8 @@ fn blur_layer<T: AsRef<Node>>(pc: &mut PaintCx, painter: &egui::Painter, run: &[
         let want = blur_scale(first.blur, screen, (c.region.2 - c.region.0).max(c.region.3 - c.region.1));
         same(&c.nodes) && c.fonts == fonts && c.scale >= want * 0.66 && c.scale <= want * 4.0
     });
-    if !fresh && !pc.ext.blur_busy.contains(&key) && !pc.ext.blur_failed.contains(&key) {
+    let failed = pc.ext.blur_failed.get(&key).is_some_and(|f| same(f));
+    if !fresh && !pc.ext.blur_busy.contains(&key) && !failed {
         register_paths(pc, run);
         if let Some((svg, region)) = crate::export::blur_svg(run, pc.assets, pc.fonts, pc.ctx) {
             let scale = blur_scale(first.blur, screen, (region.2 - region.0).max(region.3 - region.1));
@@ -2335,7 +2381,8 @@ fn inner_layer(pc: &mut PaintCx, n: &Node) -> Option<(TextureId, Rect, bool)> {
         let fits = if c.clipped && !moving { c.scale >= want * 0.8 && c.scale <= want * 1.6 } else { c.scale >= want * 0.66 && c.scale <= want * 4.0 };
         inner_same(&c.probe, n) && c.extra == extra && c.fonts == fonts && (fits || (c.clipped && moving))
     });
-    if !fresh && !pc.ext.inner_busy.contains(&n.id) && !pc.ext.inner_failed.contains(&n.id) {
+    let failed = pc.ext.inner_failed.get(&n.id).is_some_and(|probe| inner_same(probe, n));
+    if !fresh && !pc.ext.inner_busy.contains(&n.id) && !failed {
         if let Some((svg, region, clipped)) = crate::export::inner_shadow_svg(n, pc.fonts, pc.ctx) {
             let scale = inner_scale(shadow.blur, screen, (region.2 - region.0).max(region.3 - region.1), clipped);
             pc.ext.inner_busy.insert(n.id);
@@ -2778,6 +2825,14 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
         _ => cull,
     };
     let pad = n.stroke_w.max(1.0) + if n.kind == Kind::Text { n.max_size() } else { 0.0 } + n.shadow.map_or(0.0, |s| s.pad());
+    // The lines of a text in a box of fixed height may run out of it: the box counts as larger
+    // by as much as they did when they were last laid out. Until that is known the text is
+    // drawn wherever it is, which lays it out (drawn as a bar, it is its box and no more).
+    let pad = match pc.ext.spill(n) {
+        Some(spill) => pad + spill,
+        None if n.max_size() * pc.view.zoom < 3.0 => pad,
+        None => f32::INFINITY,
+    };
     if cull.2 + pad < pc.vis.0 || cull.0 - pad > pc.vis.2 || cull.3 + pad < pc.vis.1 || cull.1 - pad > pc.vis.3 {
         return;
     }
@@ -3034,6 +3089,7 @@ pub fn paint_node(pc: &mut PaintCx, painter: &egui::Painter, n: &Node, alpha: f3
             let off = -text_offset(n, &layout, lay / max);
             let width = if n.wrap { n.w } else { layout.width * k / z };
             pc.measures.push((n.id, width, layout.height * k / z));
+            pc.ext.note_spill(n, layout.height * k / z);
             if px > GLYPH_ATLAS_MAX {
                 // Teks besar: gambar outline glyph sebagai mesh vector supaya tetap tajam.
                 let clip = (n.rotation == 0.0 && !flipped).then(|| painter.clip_rect());

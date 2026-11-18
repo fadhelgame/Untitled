@@ -58,7 +58,7 @@ impl App {
             None => {
                 let parent = self.doc.frame_for(&root, c.x, c.y, &[]);
                 self.sel = vec![root.id];
-                self.doc.insert(root, parent);
+                self.doc.insert_placed(root, parent);
             }
             Some(side) => {
                 let (cx, cy) = root.center();
@@ -75,7 +75,7 @@ impl App {
                 }
                 self.sel = nodes.iter().map(|n| n.id).collect();
                 for n in nodes {
-                    self.doc.insert(n, parent);
+                    self.doc.insert_placed(n, parent);
                 }
             }
         }

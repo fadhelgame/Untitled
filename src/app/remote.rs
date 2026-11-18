@@ -45,7 +45,7 @@ enum After {
     /// Ukur ulang teks lalu laporkan node (`key` = "created" / "updated").
     Nodes { key: &'static str, ids: Vec<u64>, warnings: Vec<String> },
     /// `replace_text`: measure the texts that changed, then report the counts.
-    Replaced { count: usize, ids: Vec<u64> },
+    Replaced { count: usize, ids: Vec<u64>, removed: usize },
     Shot { id: Option<u64>, max: f32 },
     /// `outline_stroke` with texts among the nodes: once their fonts are there.
     Outline { ids: Vec<u64> },
@@ -669,7 +669,7 @@ impl App {
         match outcome {
             Ok(Outcome::Now(v)) => v.to_string(),
             Ok(Outcome::Later(After::Nodes { ids, .. }, _)) => format!("ids {ids:?}"),
-            Ok(Outcome::Later(After::Replaced { count, ids }, _)) => format!("replaced {count} in {} layers", ids.len()),
+            Ok(Outcome::Later(After::Replaced { count, ids, removed }, _)) => format!("replaced {count} in {} layers, {removed} removed", ids.len() + removed),
             Ok(Outcome::Later(..)) => "(answers later)".into(),
             Err(e) => format!("ERROR: {e}"),
         }
@@ -860,14 +860,14 @@ impl App {
                 }
                 Ok(ok(result))
             }
-            After::Replaced { count, ids } => {
+            After::Replaced { count, ids, removed } => {
                 // The texts were replaced when the command came in; their boxes follow here,
                 // and with them the auto layouts and instances around them.
                 self.find_measure(ctx, &ids);
                 self.components.recheck();
                 self.settle_doc();
                 let list: Vec<Value> = ids.iter().filter_map(|id| self.doc.find(*id).map(|n| brief(n, self.origin_of(*id)))).collect();
-                Ok(ok(json!({ "replaced": count, "layers": ids.len(), "updated": list })))
+                Ok(ok(json!({ "replaced": count, "layers": ids.len() + removed, "removed": removed, "updated": list })))
             }
             After::Outline { ids } => self.outline_nodes(Some(ctx), &ids).map(ok),
             After::Shot { id, max } => {
@@ -895,7 +895,7 @@ impl App {
                     return Ok(ok(json!({ "path": path, "pages": pages.len(), "trim_size_pt": sizes, "bleed_mm": print.bleed(), "crop_marks": print.marks, "color": colour, "flatten": print.flatten })));
                 }
                 let (svg, w, h) = export::to_svg_bleed(&self.doc, id, print.bleed_px(), &mut self.fonts, ctx).ok_or("nothing to export: the document is empty")?;
-                let (svg, w, h) = crate::print::sheet_svg(svg, w, h, &print);
+                let (svg, w, h) = crate::print::sheet_svg(svg, w, h, &print, if ext == "svg" { 1.0 } else { scale });
                 match ext.as_str() {
                     "svg" => std::fs::write(&path, svg).map_err(|e| e.to_string())?,
                     other => export::save_raster(&svg, w, h, scale, other != "png", &path)?,
@@ -1192,6 +1192,16 @@ impl App {
                             if !self.doc.find(path).is_some_and(crate::textpath::can_carry) {
                                 return Err(format!("`on_path`: node {path} is not a path, line, ellipse or rect of this page (create the shape first, then put the text on it)"));
                             }
+                            // As `Doc::attach_text`: a text that goes on a path (or on another one)
+                            // starts at its beginning, on its outer side, unless told otherwise.
+                            if n.on_path != Some(path) {
+                                if !m.contains_key("path_offset") {
+                                    n.path_offset = 0.0;
+                                }
+                                if !m.contains_key("path_side") {
+                                    n.path_side = false;
+                                }
+                            }
                             n.on_path = Some(path);
                             (n.rotation, n.flip_h, n.flip_v) = (0.0, false, false);
                         }
@@ -1480,7 +1490,7 @@ impl App {
         }
         let was = n.clone();
         self.apply(&mut n, m, o, false, notes)?;
-        let item = !n.absolute && target.and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto());
+        let item = !n.floats() && target.and_then(|p| self.doc.find(p)).is_some_and(|p| p.is_auto());
         if item && (m.contains_key("x") || m.contains_key("y")) && !notes.warnings.iter().any(|w| w == POSITIONED) {
             notes.warnings.push(POSITIONED.into());
         }
@@ -1512,10 +1522,13 @@ impl App {
             "all" => true,
             other => return Err(format!("unknown scope \"{other}\"; use page or all")),
         };
-        let (count, ids) = self.replace_text(query, with, opt, all);
+        let (count, ids, removed) = self.replace_text(query, with, opt, all);
         self.home = false;
-        self.status = format!("Remote: replaced {count} match{} in {} layer{}.", if count == 1 { "" } else { "es" }, ids.len(), if ids.len() == 1 { "" } else { "s" });
-        Ok(Outcome::Later(After::Replaced { count, ids }, Vec::new()))
+        self.status = format!("Remote: replaced {count} match{} in {} layer{}.", if count == 1 { "" } else { "es" }, ids.len() + removed, if ids.len() + removed == 1 { "" } else { "s" });
+        if removed > 0 {
+            self.status.push_str(&format!(" {removed} left empty: removed."));
+        }
+        Ok(Outcome::Later(After::Replaced { count, ids, removed }, Vec::new()))
     }
 
     /// `import_svg`: SVG markup as editable layers in a frame of its own (see `svg_import`).

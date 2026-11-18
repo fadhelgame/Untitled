@@ -49,6 +49,9 @@ impl App {
         self.doc.drop_lost_paths();
         let base = self.components.base.take();
         if self.doc.settle(base.as_ref(), &self.lifted()) {
+            // Instances took what their mains have now, text included: what Find and replace
+            // found in them is of the old text.
+            self.find.gen += 1;
             // Parts whose layer was removed from the main are gone.
             let doc = &self.doc;
             self.sel.retain(|id| doc.find(*id).is_some());
@@ -108,18 +111,18 @@ impl App {
     }
 
     /// Arrow keys with items of an auto layout selected: each trades places with its neighbour
-    /// along the direction of its frame. Result: the keys were for this, not for nudging.
-    pub(super) fn swap_items(&mut self, dx: f32, dy: f32) -> bool {
+    /// along the direction of its frame. The caller commits (see `App::nudge`). Result: `None`
+    /// if no item is selected, else whether any of them moved.
+    pub(super) fn swap_items(&mut self, dx: f32, dy: f32) -> Option<bool> {
         let mut ids: Vec<u64> = self.roots().into_iter().filter(|id| self.doc.auto_item(*id)).collect();
         if ids.is_empty() {
-            return false;
+            return None;
         }
         self.doc.sort_by_stack(&mut ids);
         // The one in front goes first, so that neighbours that move together don't leapfrog.
         if dx + dy > 0.0 {
             ids.reverse();
         }
-        let pre = self.doc.clone();
         let mut any = false;
         for id in &ids {
             let horizontal = self.doc.parent_of(*id).and_then(|p| self.doc.find(p)).and_then(|f| f.layout.as_ref()).is_some_and(|l| l.dir == Dir::Horizontal);
@@ -135,12 +138,7 @@ impl App {
                 any |= self.doc.swap_item(*id, d > 0.0);
             }
         }
-        if any {
-            self.push_undo(pre);
-        } else {
-            self.status = "Arrow keys re-order an auto-layout item along the direction of its frame.".into();
-        }
-        true
+        Some(any)
     }
 
     /// The frame a dragged layer belongs in with the pointer at (x, y): as `Doc::frame_for`, but
@@ -168,6 +166,10 @@ impl App {
     pub(super) fn reorder_drag(&mut self, grab: Pos2) {
         self.drop_mark = None;
         let roots = self.roots();
+        // (Nothing is selected any more: a remote command removed what was being dragged.)
+        if roots.is_empty() {
+            return;
+        }
         let parents: Vec<Option<u64>> = roots.iter().map(|id| self.doc.parent_of(*id)).collect();
         let together = roots.len() == 1 || parents.windows(2).all(|w| w[0] == w[1]);
         let mut touched = roots.clone();
@@ -182,7 +184,7 @@ impl App {
         for (ids, (x, y)) in batches {
             let (target, parent) = (self.drop_frame(ids[0], x, y, &roots), self.doc.parent_of(ids[0]));
             // An absolute child moves about in its frame like in any other.
-            let stays = |n: &Node| n.absolute && parent == target;
+            let stays = |n: &Node| n.floats() && parent == target;
             let ids: Vec<u64> = ids.into_iter().filter(|id| self.doc.find(*id).is_some_and(|n| !stays(n) && (target == parent || !self.doc.would_cycle(n, target)))).collect();
             if ids.is_empty() {
                 continue;

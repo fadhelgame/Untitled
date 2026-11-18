@@ -190,7 +190,7 @@ impl super::App {
             save("print-plain-rgb.pdf", &[plain], &Print::default());
         }
         // The sheet as a picture: what the PDFs with marks should look like.
-        let (sheet, sw, sh) = crate::print::sheet_svg(first.0, first.1, first.2, &print);
+        let (sheet, sw, sh) = crate::print::sheet_svg(first.0, first.1, first.2, &print, 1.0);
         let _ = crate::export::save_raster(&sheet, sw, sh, 3.0, false, &out.with_file_name("print-sheet.png"));
         let _ = crate::export::save_raster(&sheet, sw, sh, 2.0, true, &out.with_file_name("print-sheet.jpg"));
         if let Ok((png, _, _)) = crate::export::render_png(&sheet, sw, sh, 3.0) {

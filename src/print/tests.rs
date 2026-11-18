@@ -251,6 +251,27 @@ fn a_frame_fills_its_bleed() {
     assert_eq!(pixel(&bled, w, h, 1, 60), (255, 0, 0, 255));
     // … and what is inside has not moved (the black square is at 40,10 of the frame).
     assert_eq!(pixel(&bled, w, h, 60, 30), (0, 0, 0, 255));
+    // The frame's own border and inner shadow stay at the edge of the page: 6 px of black
+    // inside the trim box (which starts at 10), and the bleed around it is still the fill.
+    let mut edged = doc.clone();
+    let f = edged.find_mut(frame).unwrap();
+    (f.stroke, f.stroke_w) = (Some([0, 0, 0, 255]), 6.0);
+    let (bled, w, h) = svg(&edged, frame, 10.0);
+    assert_eq!((pixel(&bled, w, h, 12, 85), pixel(&bled, w, h, 100, 12), pixel(&bled, w, h, 207, 85)), ((0, 0, 0, 255), (0, 0, 0, 255), (0, 0, 0, 255)));
+    let (r, g, b, _) = pixel(&bled, w, h, 3, 85);
+    assert!(r > 240 && g > 240 && b < 15, "{r} {g} {b}");
+    assert_eq!(pixel(&bled, w, h, 3, 60), (255, 0, 0, 255));
+    // (The border is over what the frame holds, as without bleed: the red bar is under it.)
+    assert_eq!(pixel(&bled, w, h, 12, 60), (0, 0, 0, 255));
+    let f = edged.find_mut(frame).unwrap();
+    (f.stroke, f.inner_shadow) = (None, Some(Shadow { x: 8.0, y: 0.0, blur: 0.0, color: [0, 0, 255, 255] }));
+    let (bled, w, h) = svg(&edged, frame, 10.0);
+    // The shadow falls in from the left edge of the page (8 px from x 10 on), not of the bleed.
+    assert_eq!(pixel(&bled, w, h, 14, 85), (0, 0, 255, 255));
+    let (r, g, b, _) = pixel(&bled, w, h, 3, 85);
+    assert!(r > 240 && g > 240 && b < 15, "{r} {g} {b}");
+    let (_, _, b, _) = pixel(&bled, w, h, 30, 85);
+    assert!(b < 60);
     // Another top-level layer beside the frame is not part of it.
     let mut doc = doc;
     let mut n = Node::new(doc.alloc_id(), Kind::Rect, -8.0, -8.0);
@@ -272,7 +293,7 @@ fn marks_around_an_image() {
     let (doc, frame) = page();
     let print = Print { bleed_mm: 3.0, marks: true, ..Default::default() };
     let (art, w, h) = svg(&doc, frame, print.bleed_px());
-    let (sheet_svg, sw, sh) = sheet_svg(art, w, h, &print);
+    let (sheet_svg, sw, sh) = sheet_svg(art, w, h, &print, 1.0);
     let margin = 8.0 * MM;
     assert!(close(sw, 200.0 + margin * 2.0) && close(sh, 100.0 + margin * 2.0));
     let map = crate::export::rasterize(&sheet_svg, sw, sh, 4.0).unwrap();
@@ -280,18 +301,21 @@ fn marks_around_an_image() {
         let px = map.pixel((x * 4.0) as u32, (y * 4.0) as u32).unwrap();
         (px.red(), px.green(), px.blue(), px.alpha())
     };
-    // The margin is empty, the bleed is filled, and the page starts at the margin.
-    assert_eq!(at(2.0, 2.0).3, 0);
+    // The margin is white paper, the bleed is filled, and the page starts at the margin.
+    assert_eq!(at(2.0, 2.0), (255, 255, 255, 255));
     assert_eq!(at(margin - 3.0 * MM + 1.0, margin + 50.0), (255, 0, 0, 255));
     assert_eq!(at(margin + 50.0, margin + 20.0), (0, 0, 0, 255));
     // A mark left of the top left corner, on the line of the top edge, and one above it;
-    // beside the marks the margin is empty.
+    // beside the marks the margin is white.
     assert_eq!(at(5.0, margin), (0, 0, 0, 255));
-    assert_eq!(at(5.0, margin + 3.0).3, 0);
+    assert_eq!(at(5.0, margin + 3.0), (255, 255, 255, 255));
     assert_eq!(at(margin, 5.0), (0, 0, 0, 255));
     // Without marks the picture is left alone.
     let plain = Print { bleed_mm: 3.0, ..Default::default() };
-    assert_eq!(super::sheet_svg("<svg/>".into(), 10.0, 20.0, &plain), ("<svg/>".to_owned(), 10.0, 20.0));
+    assert_eq!(super::sheet_svg("<svg/>".into(), 10.0, 20.0, &plain, 1.0), ("<svg/>".to_owned(), 10.0, 20.0));
+    // Made into a picture a quarter the size, a mark is still one pixel of it wide: 4 px here.
+    let small = super::sheet_svg("<svg/>".into(), 100.0, 50.0, &print, 0.25).0;
+    assert!(small.contains(r#"stroke-width="4""#) && sheet_svg.contains(r#"stroke-width="1""#), "{small}");
 }
 
 #[test]

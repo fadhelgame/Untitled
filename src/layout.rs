@@ -117,7 +117,7 @@ fn set_box_with(n: &mut Node, to: Rect, children: Children, lifted: &[u64]) {
         let to = (n.x, n.y, n.w, n.h);
         let auto = n.layout.is_some();
         for c in &mut n.children {
-            if auto && !c.absolute {
+            if auto && !c.floats() {
                 c.translate(to.0 - from.0, to.1 - from.1);
             } else {
                 reflow_with(c, from, to, lifted);
@@ -292,7 +292,14 @@ impl Node {
 
     /// In an auto-layout frame: is this child one of the items it places?
     pub fn in_flow(&self) -> bool {
-        self.visible && !self.absolute
+        self.visible && !self.floats()
+    }
+
+    /// Left out of the auto layout of its frame whether it is shown or not: set to "Absolute
+    /// position", or a text on a path (the path decides where it stands; a frame that placed
+    /// it as well would push it along the path on every frame).
+    pub fn floats(&self) -> bool {
+        self.absolute || (self.kind == Kind::Text && self.on_path.is_some())
     }
 
     pub fn sizing(&self, horizontal: bool) -> Sizing {
@@ -635,7 +642,15 @@ pub fn insert_index(f: &Node, skip: &[u64], x: f32, y: f32) -> usize {
 
 /// An auto-layout frame was mirrored left-right (`horizontal`) or top-bottom: the layout that
 /// keeps its items where the mirror put them. Along the direction they run the other way.
+///
+/// A layout that wraps is left as it is, and its items go back to reading order (what each
+/// shows stays mirrored): which items share a row depends on the order they come in, and
+/// rows always stack from the top, so the mirror image of wrapped rows is not something an
+/// order and an alignment can say.
 pub fn flip_layout(f: &mut Node, horizontal: bool) {
+    if Flow::of(f).is_some_and(|flow| flow.wrap) {
+        return;
+    }
     let Some(l) = f.layout.as_mut().filter(|_| f.kind == Kind::Frame) else { return };
     let turn = |a: Align| match a {
         Align::Start => Align::End,
@@ -652,6 +667,16 @@ pub fn flip_layout(f: &mut Node, horizontal: bool) {
         return;
     }
     l.align = turn(l.align);
+    reverse_items(f, horizontal);
+}
+
+/// The items of auto-layout frame `f` in the opposite order, if they run along that axis
+/// (`horizontal`: left-right) and the layout is one that `flip_layout` mirrors. On its own
+/// this is for a frame that was mirrored before it was given its children.
+pub fn reverse_items(f: &mut Node, horizontal: bool) {
+    if !Flow::of(f).is_some_and(|flow| !flow.wrap && flow.horizontal == horizontal) {
+        return;
+    }
     let items: Vec<usize> = (0..f.children.len()).filter(|i| f.children[*i].in_flow()).collect();
     for k in 0..items.len() / 2 {
         f.children.swap(items[k], items[items.len() - 1 - k]);
@@ -779,7 +804,7 @@ impl Doc {
     pub fn auto_item(&self, id: u64) -> bool {
         let line = self.lineage(id);
         match line[..] {
-            [.., parent, n] => parent.is_auto() && !n.absolute,
+            [.., parent, n] => parent.is_auto() && !n.floats(),
             _ => false,
         }
     }
@@ -789,6 +814,18 @@ impl Doc {
         match parent.and_then(|p| self.find_mut(p)).filter(|f| f.kind == Kind::Frame) {
             Some(f) => f.children.insert(at.min(f.children.len()), node),
             None => self.nodes.insert(at.min(self.nodes.len()), Arc::new(node)),
+        }
+    }
+
+    /// Put a new node into frame `parent` (or the top level): on top, or, where the frame has
+    /// auto layout and the node is an item of it, among the items at the place the node is
+    /// at, as a layer dropped there would land.
+    pub fn insert_placed(&mut self, node: Node, parent: Option<u64>) {
+        let (cx, cy) = node.center();
+        let at = parent.and_then(|p| self.find(p)).filter(|f| f.is_auto() && node.in_flow()).map(|f| insert_index(f, &[], cx, cy));
+        match at {
+            Some(at) => self.insert_at(node, parent, at),
+            None => self.insert(node, parent),
         }
     }
 
@@ -824,7 +861,8 @@ impl Doc {
             }
         };
         let f = self.find_mut(id).ok_or("Select a frame or some layers to add auto layout to.")?;
-        let shown: Vec<usize> = (0..f.children.len()).filter(|i| f.children[*i].visible).collect();
+        // (A text on a path is no item: it is not read, and stays where its path has it.)
+        let shown: Vec<usize> = (0..f.children.len()).filter(|i| f.children[*i].visible && !f.children[*i].floats()).collect();
         let boxes: Vec<Rect> = shown.iter().map(|i| f.children[*i].aabb()).collect();
         let read = infer(&boxes);
         let mut l = AutoLayout { dir: read.dir, gap: read.gap, cross: read.cross, ..Default::default() };
@@ -832,7 +870,7 @@ impl Doc {
             l.pad = [b.0 - f.x, b.1 - f.y, f.x + f.w - b.2, f.y + f.h - b.3].map(|p| p.max(0.0));
             (f.size_h, f.size_v) = (Sizing::Hug, Sizing::Hug);
         }
-        // The visible children in the order they are read; hidden ones stay where they are in the stack.
+        // The visible children in the order they are read; the others stay where they are in the stack.
         let mut slots: Vec<Option<Node>> = std::mem::take(&mut f.children).into_iter().map(Some).collect();
         let mut next = read.order.iter().map(|k| shown[*k]);
         for i in 0..slots.len() {
@@ -1294,6 +1332,52 @@ mod tests {
     }
 
     #[test]
+    fn a_text_on_a_path_is_left_out_and_does_not_drift() {
+        // A column that hugs: a box, a line to write on, and a text that is on that line.
+        let line = node(3, Kind::Line, (0.0, 0.0, 120.0, 0.0), (Min, Min));
+        let mut text = node(4, Kind::Text, (0.0, 0.0, 50.0, 12.0), (Min, Min));
+        (text.on_path, text.path_offset) = (Some(3), 7.0);
+        let mut doc = Doc::default();
+        doc.insert(flow(1, (10.0, 10.0), HUG, column(10.0, [5.0; 4]), vec![item(2, 60.0, 40.0), line, text]), None);
+        doc.next_id = 10;
+        assert!(!doc.find(4).unwrap().in_flow() && !doc.auto_item(4) && doc.auto_item(3));
+        // What the canvas does on every frame (`App::apply_path_box`): the box of the text is the
+        // box around its glyphs on the line, and a text that is not where it was last put was
+        // moved by hand, which slides it along.
+        let mut seen: Option<(f32, f32)> = None;
+        let mut rounds = Vec::new();
+        for _ in 0..6 {
+            let pre = doc.clone();
+            let on = doc.find(3).map(|l| (l.x + 7.0, l.y - 12.0)).unwrap();
+            let t = doc.find_mut(4).unwrap();
+            if let Some(at) = seen.filter(|at| *at != (t.x, t.y)) {
+                t.path_offset += t.x - at.0;
+            }
+            (t.x, t.y) = on;
+            seen = Some(on);
+            doc.settle(Some(&pre), &[]);
+            let (f, t) = (doc.find(1).unwrap(), doc.find(4).unwrap());
+            rounds.push(((f.w, f.h), laid(f)[2], t.path_offset));
+        }
+        // The frame hugs the box and the line only, and the text stays where the line has it.
+        assert_eq!(rounds[0], ((130.0, 60.0), (12.0, 43.0, 50.0, 12.0), 7.0));
+        assert!(rounds.iter().all(|r| *r == rounds[0]), "{rounds:?}");
+        assert_eq!(seen, doc.find(4).map(|t| (t.x, t.y)));
+        // Shift+A on a frame keeps a text on a path out of the row as well, and taking the
+        // layout off again leaves it on its path.
+        let mut plain = Doc::default();
+        let mut f = frame(vec![node(2, Kind::Line, (120.0, 150.0, 100.0, 0.0), (Min, Min)), node(3, Kind::Text, (130.0, 130.0, 40.0, 12.0), (Min, Min)), node(4, Kind::Rect, (240.0, 140.0, 20.0, 20.0), (Min, Min))]);
+        f.children[1].on_path = Some(2);
+        plain.insert(f, None);
+        plain.next_id = 10;
+        let id = plain.nodes[0].id;
+        assert_eq!(plain.add_auto_layout(&[id]), Ok(id));
+        let f = plain.find(id).unwrap();
+        assert_eq!((f.children.len(), plain.auto_item(3), plain.find(3).map(|t| (t.x, t.y, t.on_path))), (3, false, Some((130.0, 130.0, Some(2)))));
+        assert!(plain.remove_auto_layout(id) && plain.find(3).unwrap().on_path == Some(2));
+    }
+
+    #[test]
     fn a_turned_item_is_placed_by_the_box_around_it() {
         // 60 × 20 turned a quarter: it takes 20 × 60.
         let mut turned = item(2, 60.0, 20.0);
@@ -1377,6 +1461,26 @@ mod tests {
         let l = doc.find(1).unwrap().layout.clone().unwrap();
         assert_eq!((l.pad, l.align, l.cross, doc.child_ids(Some(1))), ([20.0, 50.0, 40.0, 30.0], Align::Start, Align::Start, vec![2, 9, 3, 4]));
         assert!(mirrored(&doc, false));
+    }
+
+    #[test]
+    fn a_wrapping_layout_is_not_mirrored() {
+        // 140 of room: the first box has a row of its own, the other two share the next.
+        let l = AutoLayout { wrap: true, row_gap: 5.0, cross: Align::End, ..row(10.0, PAD) };
+        let mut doc = Doc::default();
+        doc.insert(flow(1, (200.0, 200.0), FIXED, l.clone(), three()), None);
+        let before = doc.clone();
+        assert_eq!(laid(before.find(1).unwrap()).iter().map(|b| (b.0, b.1)).collect::<Vec<_>>(), [(20.0, 30.0), (20.0, 85.0), (110.0, 75.0)]);
+        for horizontal in [true, false] {
+            assert!(doc.flip(&[1], horizontal));
+            doc.settle_layout(None, &[]);
+            let f = doc.find(1).unwrap();
+            // The layout and the order are as they were, and so the items are where they were;
+            // what they show is mirrored.
+            assert_eq!((f.layout.as_ref(), doc.child_ids(Some(1))), (Some(&l), vec![2, 3, 4]));
+            assert_eq!(laid(f), laid(before.find(1).unwrap()));
+            assert!(f.children.iter().all(|c| c.flip_h && (c.flip_v != horizontal)));
+        }
     }
 
     /// Frame 1 at (100, 100), 200 × 100, with three 40 × 20 boxes in a row (ids 2, 3, 4 from the
@@ -1474,6 +1578,29 @@ mod tests {
         assert_eq!([at(100.0, 110.0), at(130.0, 110.0), at(190.0, 110.0), at(100.0, 140.0), at(130.0, 140.0), at(190.0, 145.0), at(100.0, 400.0)], [0, 1, 2, 2, 3, 4, 4]);
         // Not an auto layout: on top, as anywhere else.
         assert_eq!(insert_index(&frame(vec![item(2, 1.0, 1.0), item(3, 1.0, 1.0)]), &[3], 0.0, 0.0), 1);
+    }
+
+    #[test]
+    fn a_new_layer_goes_among_the_items_where_it_is_made() {
+        // A row of 60, 80 and 30 wide boxes from x 120 on, 10 apart.
+        let mut doc = Doc::default();
+        doc.insert(flow(1, (400.0, 200.0), FIXED, row(10.0, PAD), three()), None);
+        let new = |id: u64, x: f32| node(id, Kind::Rect, (x, 140.0, 0.0, 0.0), (Min, Min));
+        // Drawn between the first two, before the first, and behind the last.
+        doc.insert_placed(new(5, 185.0), Some(1));
+        doc.insert_placed(new(6, 105.0), Some(1));
+        doc.insert_placed(new(7, 390.0), Some(1));
+        assert_eq!(doc.child_ids(Some(1)), [6, 2, 5, 3, 4, 7]);
+        // What the layout does not place goes on top, as in a plain frame or at the top level.
+        let mut floating = new(8, 105.0);
+        floating.absolute = true;
+        doc.insert_placed(floating, Some(1));
+        doc.insert(frame(Vec::new()), None);
+        doc.nodes[1] = Arc::new(Node { id: 20, ..(*doc.nodes[1]).clone() });
+        doc.insert(node(21, Kind::Rect, (150.0, 150.0, 10.0, 10.0), (Min, Min)), Some(20));
+        doc.insert_placed(new(22, 105.0), Some(20));
+        doc.insert_placed(new(23, 0.0), None);
+        assert_eq!((doc.child_ids(Some(1)).last(), doc.child_ids(Some(20)), doc.nodes.last().map(|n| n.id)), (Some(&8), vec![21, 22], Some(23)));
     }
 
     #[test]

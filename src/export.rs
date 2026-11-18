@@ -1008,8 +1008,28 @@ pub fn to_svg(doc: &Doc, only: Option<u64>, fonts: &mut FontManager, ctx: &egui:
 /// on every side (its corners square, as the page is cut out of it), so its fill, gradient or
 /// image is drawn for the larger area and what it holds is clipped there instead of at the
 /// frame's edge. The layers inside keep their places.
+///
+/// The frame's own stroke and inner shadow are not part of what bleeds: they belong to the
+/// edge of the page. Each is taken off the grown frame and drawn by a rectangle of its own
+/// with the box the frame has, the inner shadow under what the frame holds and the stroke
+/// over it, as they are without bleed.
 fn bleed_frame(n: &Node, bleed: f32) -> Node {
     let mut f = n.clone();
+    let edge = |id: u64| {
+        let mut p = Node::new(id, Kind::Rect, n.x, n.y);
+        (p.w, p.h, p.fill, p.stroke) = (n.w, n.h, None, None);
+        p
+    };
+    if n.inner().is_some() {
+        let mut p = edge(u64::MAX - 1);
+        p.inner_shadow = f.inner_shadow.take();
+        f.children.insert(0, p);
+    }
+    if n.stroke.is_some() && n.stroke_w > 0.0 {
+        let mut p = edge(u64::MAX - 2);
+        (p.stroke, p.stroke_w, p.stroke_align, p.dash, p.gap, p.cap, p.join) = (f.stroke.take(), n.stroke_w, Some(n.stroke_pos()), n.dash, n.gap, n.cap, n.join);
+        f.children.push(p);
+    }
     let grow = |at: &mut f32, size: &mut f32| {
         let sign = if *size < 0.0 { -1.0 } else { 1.0 };
         *at -= bleed * sign;
@@ -1045,8 +1065,17 @@ pub fn to_svg_bleed(doc: &Doc, only: Option<u64>, bleed: f32, fonts: &mut FontMa
             let pad = pad + n.shadow.filter(|s| s.color[3] > 0 && n.kind != Kind::Frame).map_or(0.0, |s| s.pad());
             // Begitu juga luberan layer blur.
             let pad = pad + if n.kind == Kind::Frame { 0.0 } else { n.blur_pad() };
+            // The lines of a text in a box of fixed height that run out of it are exported too.
+            let spill = if n.kind == Kind::Text && n.fixed_h && n.on_path.is_none() && !n.text.is_empty() {
+                let f = (200.0 / n.max_size()).min(1.0);
+                n.text_spill(layout_text(ctx, n, &n.text, fonts, f, 1.0, true).height / f)
+            } else {
+                0.0
+            };
+            // (Turned, they run out sideways.)
+            let pad = (pad + if n.rotation != 0.0 { spill } else { 0.0 }, pad + spill);
             let b = n.aabb();
-            (b.0 - pad, b.1 - pad, b.2 + pad, b.3 + pad)
+            (b.0 - pad.0, b.1 - pad.1, b.2 + pad.0, b.3 + pad.1)
         }
         None => doc.bounds()?,
     };

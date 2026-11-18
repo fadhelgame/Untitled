@@ -80,13 +80,15 @@ pub fn import(svg: &[u8], name: &str) -> Result<Imported, String> {
     let mut cx = Cx { next: 1, nodes: Vec::new(), groups: Vec::new(), images: Vec::new(), dropped: Vec::new(), size, unnamed: 0 };
     let top = Inherit { ts: Transform::identity(), opacity: 1.0, blend: 0, group: 0 };
     cx.group(tree.root(), top, true);
-    // A group of one is no group.
-    for (g, _) in cx.groups.clone() {
-        if cx.nodes.iter().filter(|n| n.group == g).count() < 2 {
-            cx.nodes.iter_mut().filter(|n| n.group == g).for_each(|n| n.group = 0);
-            cx.groups.retain(|x| x.0 != g);
-        }
+    // A group of one is no group. (The members are counted once for all groups: a file can
+    // have thousands of groups, and looking through every node for each of them is quadratic.)
+    let mut members: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for n in cx.nodes.iter().filter(|n| n.group != 0) {
+        *members.entry(n.group).or_default() += 1;
     }
+    let grouped = |g: u64| members.get(&g).is_some_and(|count| *count >= 2);
+    cx.nodes.iter_mut().filter(|n| n.group != 0 && !grouped(n.group)).for_each(|n| n.group = 0);
+    cx.groups.retain(|x| grouped(x.0));
     let mut root = Node::new(cx.id(), Kind::Frame, 0.0, 0.0);
     (root.name, root.w, root.h) = (name.to_owned(), size.0.max(1.0), size.1.max(1.0));
     let shapes = cx.nodes.len();
@@ -305,6 +307,11 @@ impl Cx {
         if let Some(d) = stroke.dasharray().filter(|d| !d.is_empty()) {
             n.dash = d[0] * k;
             n.gap = d.get(1).copied().unwrap_or(d[0]) * k;
+            // "0 6" with round caps is a row of dots. No dash at all means a solid line here,
+            // so such a dash is kept as one too short to see: its caps make the dot.
+            if n.dash <= 0.0 && n.gap > 0.0 {
+                n.dash = 0.01;
+            }
         }
     }
 
@@ -522,6 +529,11 @@ mod tests {
         let n = &got.root.children[0];
         assert_eq!((got.shapes, n.closed, n.fill, n.points.len()), (1, false, None, 3));
         assert_eq!((n.stroke, n.stroke_w, n.dash, n.gap), (Some([0x12, 0x34, 0x56, 128]), 6.0, 8.0, 4.0));
+        // Dots: a dash of no length with round caps is still a dash.
+        let dots = svg(r##"<path d="M10 10 H90" fill="none" stroke="#000" stroke-width="4" stroke-linecap="round" stroke-dasharray="0 6"/>"##);
+        let d = &dots.root.children[0];
+        assert_eq!((d.dash > 0.0 && d.dash < 0.1, d.gap, d.cap), (true, 6.0, 1));
+        assert!(crate::outline::stroke_style(d).dash.is_some());
         // Ends and corners: butt and miter unless the file says otherwise.
         assert_eq!((n.cap, n.join), (0, 0));
         let got = svg(r##"<path d="M0 0L10 0L10 10" fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="bevel"/><line x2="5" fill="none" stroke="#000" stroke-linecap="square" stroke-linejoin="round"/>"##);

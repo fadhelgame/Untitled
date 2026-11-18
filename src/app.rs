@@ -451,6 +451,9 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, bench: Option<PathBuf>, open: Option<PathBuf>) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         theme::apply(&cc.egui_ctx);
+        // Ctrl+0, Ctrl+= and Ctrl+- are for the canvas (100%, in, out). egui would take them to
+        // scale the whole interface, and swallow Ctrl+0 before the canvas sees it.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         // Mode `--bench` memakai folder library sendiri supaya library pengguna tidak tersentuh.
         let library_dir = bench.as_ref().map_or_else(|| home::data_dir().join("library"), |out| out.with_file_name("bench-library"));
         let mut app = App {
@@ -535,7 +538,10 @@ impl App {
 
     /// Undo dari pengguna (Ctrl+Z / menu): saat menggambar dengan pen, mundur satu titik dulu.
     fn undo_cmd(&mut self) {
-        if self.pen_can_undo() {
+        if self.crop.is_some() {
+            // Crop mode: undo calls off the crop that is being made.
+            self.finish_crop(false);
+        } else if self.pen_can_undo() {
             self.pen_undo();
         } else {
             self.do_undo();
@@ -543,7 +549,9 @@ impl App {
     }
 
     fn redo_cmd(&mut self) {
-        if self.pen_can_redo() {
+        if self.crop.is_some() {
+            self.finish_crop(false);
+        } else if self.pen_can_redo() {
             self.pen_redo();
         } else {
             self.do_redo();
@@ -571,6 +579,9 @@ impl App {
     fn after_history(&mut self) {
         let doc = &self.doc;
         self.sel.retain(|id| doc.find(*id).is_some());
+        // Nor is a text on a path that is somewhere else now one that was moved by hand (see
+        // `apply_path_box`): where the canvas last put each is forgotten.
+        self.ext.path_seen.clear();
         // The restored document is already consistent; an undone change is not one to follow.
         self.components.rebase();
         self.touch();
@@ -614,6 +625,36 @@ impl App {
         self.doc.roots_of(&self.sel)
     }
 
+    /// The mouse is dragging something of the document (panning the view is not that).
+    fn dragging(&self) -> bool {
+        !matches!(self.drag, Drag::None | Drag::Pan)
+    }
+
+    /// Esc in the middle of a drag: the drag is called off, and the document and the selection
+    /// are as they were when it began. Result: there was a drag to call off.
+    fn cancel_drag(&mut self) -> bool {
+        if !self.dragging() {
+            return false;
+        }
+        match std::mem::replace(&mut self.drag, Drag::None) {
+            Drag::Marquee { base, .. } => self.sel = base,
+            // Alt was held: what is selected are the copies.
+            Drag::Move { dup: Some(originals), .. } => self.sel = originals,
+            _ => {}
+        }
+        if let Some(pre) = self.pre_drag.take() {
+            self.doc = pre;
+        }
+        let doc = &self.doc;
+        self.sel.retain(|id| doc.find(*id).is_some());
+        self.end_snap();
+        self.drop_mark = None;
+        // Where the drag had a text on a path is not where it was moved to (see `apply_path_box`).
+        self.ext.path_seen.clear();
+        self.status = "Drag cancelled.".into();
+        true
+    }
+
     /// Move dan Scale sama-sama bisa memilih dan menggeser objek.
     fn pointer_tool(&self) -> bool {
         matches!(self.tool, Tool::Select | Tool::Scale)
@@ -626,35 +667,14 @@ impl App {
             8 => return self.tidy_up(),
             _ => {}
         }
-        if self.refuse_pinned() || self.refuse_auto_items() {
+        if self.sel.is_empty() || self.sel_locked() || self.refuse_pinned() || self.refuse_auto_items() {
             return;
         }
-        let ids = self.roots();
-        // Satu objek: rata terhadap frame induknya. Banyak objek: terhadap kotak seleksi.
-        let target = if ids.len() == 1 {
-            self.doc.parent_of(ids[0]).and_then(|p| self.doc.find(p)).map(|n| n.bounds())
-        } else {
-            ids.iter()
-                .filter_map(|id| self.doc.find(*id).map(|n| n.bounds()))
-                .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
-        };
-        let Some(t) = target else { return };
+        // One object (or one group): to the frame it is in. Several: to the box around them.
         let pre = self.doc.clone();
-        for id in ids {
-            if let Some(n) = self.doc.find_mut(id) {
-                let b = n.bounds();
-                let (dx, dy) = match mode {
-                    0 => (t.0 - b.0, 0.0),
-                    1 => (t.2 - b.2, 0.0),
-                    2 => ((t.0 + t.2 - b.0 - b.2) * 0.5, 0.0),
-                    3 => (0.0, t.1 - b.1),
-                    4 => (0.0, t.3 - b.3),
-                    _ => (0.0, (t.1 + t.3 - b.1 - b.3) * 0.5),
-                };
-                n.translate(dx.round(), dy.round());
-            }
+        if self.doc.align(&self.sel, mode) {
+            self.push_undo(pre);
         }
-        self.push_undo(pre);
     }
 
     /// Alt+Shift+H / Alt+Shift+V: equal gaps between the selected objects (a group is one).
@@ -994,6 +1014,32 @@ impl App {
 
     // ------------------------------------------------------------ editing ops
 
+    /// Delete from the user (the key or the Edit menu): what it removes depends on what is
+    /// being worked on. The pen takes back its last point, the point editor removes the
+    /// selected points, crop mode has nothing to delete; otherwise the selected layers go.
+    fn delete_cmd(&mut self) {
+        if self.ext.pen.is_some() {
+            self.pen_backspace();
+        } else if self.ext.path_edit.is_some() {
+            self.path_edit_delete();
+        } else if self.crop.is_none() {
+            self.delete_selection();
+        }
+    }
+
+    /// Before a command of the Layers panel, which is about whole layers: whatever is being
+    /// worked on inside one (its text, its points, its crop, a path being drawn) is finished.
+    fn leave_modes(&mut self) {
+        self.finish_text_edit();
+        if self.ext.pen.is_some() {
+            self.finish_pen(false);
+        }
+        self.ext.path_edit = None;
+        if self.crop.is_some() {
+            self.finish_crop(true);
+        }
+    }
+
     fn delete_selection(&mut self) {
         if self.sel.is_empty() || self.refuse_pinned() {
             return;
@@ -1161,16 +1207,24 @@ impl App {
 
     fn nudge(&mut self, dx: f32, dy: f32) {
         let ids = self.roots();
-        if ids.is_empty() || self.sel_locked() || self.refuse_pinned() || self.swap_items(dx, dy) {
+        if ids.is_empty() || self.sel_locked() || self.refuse_pinned() {
             return;
         }
+        // Items of an auto layout trade places with their neighbour; the other layers of the
+        // selection move by the step, as one undo step with that.
+        let free: Vec<u64> = ids.into_iter().filter(|id| !self.doc.auto_item(*id)).collect();
         let pre = self.doc.clone();
-        for id in ids {
-            if let Some(n) = self.doc.find_mut(id) {
+        let swapped = self.swap_items(dx, dy);
+        for id in &free {
+            if let Some(n) = self.doc.find_mut(*id) {
                 n.translate(dx, dy);
             }
         }
-        self.push_undo(pre);
+        if swapped == Some(true) || !free.is_empty() {
+            self.push_undo(pre);
+        } else if swapped.is_some() {
+            self.status = "Arrow keys re-order an auto-layout item along the direction of its frame.".into();
+        }
     }
 
     fn reorder(&mut self, to_front: bool) {
@@ -1209,6 +1263,9 @@ impl App {
         } else if empty {
             self.doc.remove(id);
             self.sel.retain(|s| *s != id);
+            // An auto layout made room for it while it was edited; a new text that was given up
+            // is no commit, so ask for the frames to be laid out again without it.
+            self.components.recheck();
         }
         if let Some(pre) = pre {
             let changed = pre.find(id).map(|n| &n.text) != self.doc.find(id).map(|n| &n.text);
@@ -1246,6 +1303,7 @@ impl App {
         self.drag = Drag::None;
         self.dirty = false;
         self.fit_pending = true;
+        self.ext.path_seen.clear();
         self.components.rebase();
         self.pages.reset();
         self.find.reset();
@@ -1390,14 +1448,14 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let cmd = Modifiers::COMMAND;
-        // Ctrl+Shift+O (outline stroke) before Ctrl+O, whose pattern would match it as well.
+        // (`take_key`: with exactly these modifiers. Ctrl+Alt+S is not Save.)
         let (outline, save_as, save, open, new) = ctx.input_mut(|i| {
             (
-                i.consume_key(cmd | Modifiers::SHIFT, Key::O),
-                i.consume_key(cmd | Modifiers::SHIFT, Key::S),
-                i.consume_key(cmd, Key::S),
-                i.consume_key(cmd, Key::O),
-                i.consume_key(cmd, Key::N),
+                take_key(i, cmd | Modifiers::SHIFT, Key::O),
+                take_key(i, cmd | Modifiers::SHIFT, Key::S),
+                take_key(i, cmd, Key::S),
+                take_key(i, cmd, Key::O),
+                take_key(i, cmd, Key::N),
             )
         });
         if save_as {
@@ -1411,7 +1469,7 @@ impl App {
         if new {
             self.new_doc();
         }
-        if outline && !ctx.wants_keyboard_input() && self.editing.is_none() && self.ext.picker.eyedrop.is_none() {
+        if outline && !ctx.wants_keyboard_input() && self.editing.is_none() && self.ext.picker.eyedrop.is_none() && !self.dragging() {
             self.outline_stroke(ctx);
         }
 
@@ -1419,6 +1477,21 @@ impl App {
         if self.ext.picker.eyedrop.is_some() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.ext.picker.eyedrop = None;
+            }
+            return;
+        }
+
+        // In the middle of a drag only Esc means something: it calls the drag off. Deleting,
+        // cutting, undoing or re-selecting what is being dragged would pull it out from under
+        // the drag, so every other key waits until the button is released.
+        if self.dragging() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                if self.crop.is_some() {
+                    // (Crop mode keeps its own state to go back to.)
+                    self.finish_crop(false);
+                } else {
+                    self.cancel_drag();
+                }
             }
             return;
         }
@@ -1444,13 +1517,13 @@ impl App {
         // Ctrl+U would delete to the start of the line). Ctrl+Shift+X arrives as a cut event.
         if self.editing.is_some() || !ctx.wants_keyboard_input() {
             let (underline, strike) = ctx.input_mut(|i| {
-                let underline = i.consume_key(cmd, Key::U);
+                let underline = take_key(i, cmd, Key::U);
                 let cut_keys = i.modifiers.command && i.modifiers.shift && !i.modifiers.alt;
                 let before = i.events.len();
                 if cut_keys {
                     i.events.retain(|e| !matches!(e, egui::Event::Cut));
                 }
-                (underline, i.events.len() != before || i.consume_key(cmd | Modifiers::SHIFT, Key::X))
+                (underline, i.events.len() != before || take_key(i, cmd | Modifiers::SHIFT, Key::X))
             });
             if underline {
                 self.toggle_decoration(false);
@@ -1466,16 +1539,15 @@ impl App {
         }
         let (component, detach, clip_mask, redo, undo, dup, all, ungroup, group) = ctx.input_mut(|i| {
             (
-                i.consume_key(cmd | Modifiers::ALT, Key::K),
-                i.consume_key(cmd | Modifiers::ALT, Key::B),
-                // Sebelum Ctrl+G: pola tanpa Alt juga cocok dengan Ctrl+Alt+G.
-                i.consume_key(cmd | Modifiers::ALT, Key::G),
-                i.consume_key(cmd | Modifiers::SHIFT, Key::Z) || i.consume_key(cmd, Key::Y),
-                i.consume_key(cmd, Key::Z),
-                i.consume_key(cmd, Key::D),
-                i.consume_key(cmd, Key::A),
-                i.consume_key(cmd | Modifiers::SHIFT, Key::G),
-                i.consume_key(cmd, Key::G),
+                take_key(i, cmd | Modifiers::ALT, Key::K),
+                take_key(i, cmd | Modifiers::ALT, Key::B),
+                take_key(i, cmd | Modifiers::ALT, Key::G),
+                take_key(i, cmd | Modifiers::SHIFT, Key::Z) || take_key(i, cmd, Key::Y),
+                take_key(i, cmd, Key::Z),
+                take_key(i, cmd, Key::D),
+                take_key(i, cmd, Key::A),
+                take_key(i, cmd | Modifiers::SHIFT, Key::G),
+                take_key(i, cmd, Key::G),
             )
         });
         if component {
@@ -1490,10 +1562,7 @@ impl App {
         } else if group {
             self.group_selection();
         }
-        if (redo || undo) && self.crop.is_some() {
-            // Mode crop: undo membatalkan crop yang sedang dikerjakan.
-            self.finish_crop(false);
-        } else if redo {
+        if redo {
             self.redo_cmd();
         } else if undo {
             self.undo_cmd();
@@ -1555,14 +1624,11 @@ impl App {
             match key {
                 // Pen: Enter atau Esc menyelesaikan path yang sedang digambar
                 Key::Enter | Key::Escape if self.ext.pen.is_some() => self.finish_pen(false),
-                Key::Backspace | Key::Delete if self.ext.pen.is_some() => self.pen_backspace(),
                 // Mode edit titik path
                 Key::Enter | Key::Escape if self.ext.path_edit.is_some() => self.ext.path_edit = None,
-                Key::Backspace | Key::Delete if self.ext.path_edit.is_some() => self.path_edit_delete(),
                 // Mode crop: Enter menerapkan, Esc membatalkan
                 Key::Enter if self.crop.is_some() => self.finish_crop(true),
                 Key::Escape if self.crop.is_some() => self.finish_crop(false),
-                Key::Backspace | Key::Delete if self.crop.is_some() => {}
                 // Tool
                 Key::V if plain => self.tool = Tool::Select,
                 Key::K if plain => self.tool = Tool::Scale,
@@ -1644,7 +1710,7 @@ impl App {
                         self.start_crop(id);
                     }
                 }
-                Key::Delete | Key::Backspace => self.delete_selection(),
+                Key::Delete | Key::Backspace => self.delete_cmd(),
                 // Esc closes the Find and replace window first; the selection stays.
                 Key::Escape if self.find_escape() => {}
                 Key::Escape => {
@@ -1727,44 +1793,49 @@ impl App {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                let can_undo = self.pen_can_undo() || !self.undo.is_empty();
-                if ui.add_enabled(can_undo, egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
-                    ui.close_menu();
-                    self.undo_cmd();
-                }
-                let can_redo = self.pen_can_redo() || !self.redo.is_empty();
-                if ui.add_enabled(can_redo, egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
-                    ui.close_menu();
-                    self.redo_cmd();
-                }
-                ui.separator();
-                let has_sel = !self.sel.is_empty();
-                if ui.add_enabled(has_sel, egui::Button::new("Cut").shortcut_text("Ctrl+X")).clicked() {
-                    ui.close_menu();
-                    self.cut(ui.ctx());
-                }
-                if ui.add_enabled(has_sel, egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
-                    ui.close_menu();
-                    self.copy(ui.ctx());
-                }
-                if ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
-                    ui.close_menu();
-                    self.paste_clipboard(ui.ctx(), false);
-                }
-                if ui.add(egui::Button::new("Paste in Place").shortcut_text("Ctrl+Shift+V")).clicked() {
-                    ui.close_menu();
-                    self.paste_clipboard(ui.ctx(), true);
-                }
-                ui.separator();
-                if ui.add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {
-                    ui.close_menu();
-                    let nodes = self.selected_nodes();
-                    self.add_nodes(nodes, vec2(24.0, 24.0), None);
-                }
-                if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
-                    ui.close_menu();
-                    self.delete_selection();
-                }
+                // While a text is being typed the keys of these commands go to the text, and
+                // so the commands are not offered here either.
+                let typing = self.editing.is_some();
+                ui.add_enabled_ui(!typing, |ui| {
+                    let can_undo = self.crop.is_some() || self.pen_can_undo() || !self.undo.is_empty();
+                    if ui.add_enabled(can_undo, egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                        ui.close_menu();
+                        self.undo_cmd();
+                    }
+                    let can_redo = self.crop.is_some() || self.pen_can_redo() || !self.redo.is_empty();
+                    if ui.add_enabled(can_redo, egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
+                        ui.close_menu();
+                        self.redo_cmd();
+                    }
+                    ui.separator();
+                    let has_sel = !self.sel.is_empty();
+                    if ui.add_enabled(has_sel, egui::Button::new("Cut").shortcut_text("Ctrl+X")).clicked() {
+                        ui.close_menu();
+                        self.cut(ui.ctx());
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+                        ui.close_menu();
+                        self.copy(ui.ctx());
+                    }
+                    if ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                        ui.close_menu();
+                        self.paste_clipboard(ui.ctx(), false);
+                    }
+                    if ui.add(egui::Button::new("Paste in Place").shortcut_text("Ctrl+Shift+V")).clicked() {
+                        ui.close_menu();
+                        self.paste_clipboard(ui.ctx(), true);
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {
+                        ui.close_menu();
+                        let nodes = self.selected_nodes();
+                        self.add_nodes(nodes, vec2(24.0, 24.0), None);
+                    }
+                    if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
+                        ui.close_menu();
+                        self.delete_cmd();
+                    }
+                });
                 ui.separator();
                 if ui.add(egui::Button::new("Find…").shortcut_text("Ctrl+F")).clicked() {
                     ui.close_menu();
@@ -1774,78 +1845,81 @@ impl App {
                     ui.close_menu();
                     self.open_find(true);
                 }
-                ui.separator();
-                if ui.add(egui::Button::new("Group").shortcut_text("Ctrl+G")).clicked() {
-                    ui.close_menu();
-                    self.group_selection();
-                }
-                if ui.add(egui::Button::new("Ungroup").shortcut_text("Ctrl+Shift+G")).clicked() {
-                    ui.close_menu();
-                    self.ungroup_selection();
-                }
-                ui.separator();
-                if ui.add_enabled(has_sel, egui::Button::new("Flip horizontal").shortcut_text("Shift+H")).clicked() {
-                    ui.close_menu();
-                    self.flip(true);
-                }
-                if ui.add_enabled(has_sel, egui::Button::new("Flip vertical").shortcut_text("Shift+V")).clicked() {
-                    ui.close_menu();
-                    self.flip(false);
-                }
-                let several = self.sel.len() > 1;
-                if ui.add_enabled(several, egui::Button::new("Distribute horizontal spacing").shortcut_text("Alt+Shift+H")).clicked() {
-                    ui.close_menu();
-                    self.distribute(true);
-                }
-                if ui.add_enabled(several, egui::Button::new("Distribute vertical spacing").shortcut_text("Alt+Shift+V")).clicked() {
-                    ui.close_menu();
-                    self.distribute(false);
-                }
-                if ui.add_enabled(several, egui::Button::new("Tidy up").shortcut_text("Ctrl+Alt+T")).clicked() {
-                    ui.close_menu();
-                    self.tidy_up();
-                }
-                if ui.add_enabled(has_sel, egui::Button::new("Outline stroke / text").shortcut_text("Ctrl+Shift+O")).clicked() {
-                    ui.close_menu();
-                    let ctx = ui.ctx().clone();
-                    self.outline_stroke(&ctx);
-                }
-                let on_path = !self.sel_on_path().is_empty();
-                let label = if on_path { "Detach text from path" } else { "Text on path" };
-                if ui.add_enabled(has_sel, egui::Button::new(label).shortcut_text("Ctrl+Alt+P")).on_hover_text("Select one text and one shape: the text runs along the shape and follows it.").clicked() {
-                    ui.close_menu();
-                    let ctx = ui.ctx().clone();
-                    self.text_on_path(&ctx);
-                }
-                ui.separator();
-                if ui.add_enabled(has_sel, egui::Button::new("Add auto layout").shortcut_text("Shift+A")).clicked() {
-                    ui.close_menu();
-                    self.add_auto_layout();
-                }
-                let auto = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.is_auto()));
-                if ui.add_enabled(auto, egui::Button::new("Remove auto layout").shortcut_text("Alt+Shift+A")).clicked() {
-                    ui.close_menu();
-                    self.remove_auto_layout();
-                }
-                ui.separator();
-                if ui.add_enabled(has_sel, egui::Button::new("Create component").shortcut_text("Ctrl+Alt+K")).clicked() {
-                    ui.close_menu();
-                    self.create_component();
-                }
-                let instance = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.is_instance()));
-                if ui.add_enabled(instance, egui::Button::new("Detach instance").shortcut_text("Ctrl+Alt+B")).clicked() {
-                    ui.close_menu();
-                    self.detach_selection();
-                }
-                ui.separator();
-                if ui.add(egui::Button::new("Bring to front").shortcut_text("]")).clicked() {
-                    ui.close_menu();
-                    self.reorder(true);
-                }
-                if ui.add(egui::Button::new("Send to back").shortcut_text("[")).clicked() {
-                    ui.close_menu();
-                    self.reorder(false);
-                }
+                ui.add_enabled_ui(!typing, |ui| {
+                    let has_sel = !self.sel.is_empty();
+                    ui.separator();
+                    if ui.add(egui::Button::new("Group").shortcut_text("Ctrl+G")).clicked() {
+                        ui.close_menu();
+                        self.group_selection();
+                    }
+                    if ui.add(egui::Button::new("Ungroup").shortcut_text("Ctrl+Shift+G")).clicked() {
+                        ui.close_menu();
+                        self.ungroup_selection();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(has_sel, egui::Button::new("Flip horizontal").shortcut_text("Shift+H")).clicked() {
+                        ui.close_menu();
+                        self.flip(true);
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new("Flip vertical").shortcut_text("Shift+V")).clicked() {
+                        ui.close_menu();
+                        self.flip(false);
+                    }
+                    let several = self.sel.len() > 1;
+                    if ui.add_enabled(several, egui::Button::new("Distribute horizontal spacing").shortcut_text("Alt+Shift+H")).clicked() {
+                        ui.close_menu();
+                        self.distribute(true);
+                    }
+                    if ui.add_enabled(several, egui::Button::new("Distribute vertical spacing").shortcut_text("Alt+Shift+V")).clicked() {
+                        ui.close_menu();
+                        self.distribute(false);
+                    }
+                    if ui.add_enabled(several, egui::Button::new("Tidy up").shortcut_text("Ctrl+Alt+T")).clicked() {
+                        ui.close_menu();
+                        self.tidy_up();
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new("Outline stroke / text").shortcut_text("Ctrl+Shift+O")).clicked() {
+                        ui.close_menu();
+                        let ctx = ui.ctx().clone();
+                        self.outline_stroke(&ctx);
+                    }
+                    let on_path = !self.sel_on_path().is_empty();
+                    let label = if on_path { "Detach text from path" } else { "Text on path" };
+                    if ui.add_enabled(has_sel, egui::Button::new(label).shortcut_text("Ctrl+Alt+P")).on_hover_text("Select one text and one shape: the text runs along the shape and follows it.").clicked() {
+                        ui.close_menu();
+                        let ctx = ui.ctx().clone();
+                        self.text_on_path(&ctx);
+                    }
+                    ui.separator();
+                    if ui.add_enabled(has_sel, egui::Button::new("Add auto layout").shortcut_text("Shift+A")).clicked() {
+                        ui.close_menu();
+                        self.add_auto_layout();
+                    }
+                    let auto = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.is_auto()));
+                    if ui.add_enabled(auto, egui::Button::new("Remove auto layout").shortcut_text("Alt+Shift+A")).clicked() {
+                        ui.close_menu();
+                        self.remove_auto_layout();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(has_sel, egui::Button::new("Create component").shortcut_text("Ctrl+Alt+K")).clicked() {
+                        ui.close_menu();
+                        self.create_component();
+                    }
+                    let instance = self.sel.iter().any(|id| self.doc.find(*id).is_some_and(|n| n.is_instance()));
+                    if ui.add_enabled(instance, egui::Button::new("Detach instance").shortcut_text("Ctrl+Alt+B")).clicked() {
+                        ui.close_menu();
+                        self.detach_selection();
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Bring to front").shortcut_text("]")).clicked() {
+                        ui.close_menu();
+                        self.reorder(true);
+                    }
+                    if ui.add(egui::Button::new("Send to back").shortcut_text("[")).clicked() {
+                        ui.close_menu();
+                        self.reorder(false);
+                    }
+                });
             });
             ui.menu_button("View", |ui| {
                 if ui.add(egui::Button::new("Zoom 100%").shortcut_text("Shift+0")).clicked() {
@@ -2347,6 +2421,9 @@ impl App {
                     self.zoom_to(b, 4.0);
                 }
             }
+        }
+        if menu.is_some() {
+            self.leave_modes();
         }
         match menu {
             Some(0) => self.toggle_clip(),
@@ -2989,6 +3066,10 @@ impl App {
                         _ => {}
                     }
                 }
+                // `KANVAS_BENCH_DRAGKEYS=<esc|del|undo|cut>`: a key pressed in the middle of a drag (see `bench_dragkeys`).
+                if let Ok(mode) = std::env::var("KANVAS_BENCH_DRAGKEYS") {
+                    self.bench_dragkeys(&mode, b.frame, &mut b.inject, ctx);
+                }
                 if b.frame == 240 && std::env::var("KANVAS_BENCH_OVERLAY").is_ok() {
                     self.edit_selected(|n| n.fill = Some([0, 102, 227, 255]));
                 }
@@ -3528,6 +3609,15 @@ impl App {
         }
         self.bench = Some(b);
     }
+}
+
+/// A key pressed with exactly these modifiers: taken out of the input, so nothing else acts on
+/// it. (`InputState::consume_key` lets Shift and Alt pass when the pattern does not name them:
+/// Ctrl+Shift+D would duplicate, Ctrl+Alt+S save, Ctrl+Shift+A select all.) Result: it was.
+fn take_key(i: &mut egui::InputState, mods: Modifiers, key: Key) -> bool {
+    let before = i.events.len();
+    i.events.retain(|e| !matches!(e, egui::Event::Key { key: k, pressed: true, modifiers: m, .. } if *k == key && (m.command, m.shift, m.alt) == (mods.command, mods.shift, mods.alt)));
+    i.events.len() != before
 }
 
 /// Mode `--bench`: jadwalkan event pointer buatan.

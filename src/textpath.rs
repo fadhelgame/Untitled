@@ -344,12 +344,28 @@ pub fn line(ctx: &egui::Context, n: &Node, fonts: &mut FontManager) -> Line {
 /// A glyph where it is drawn, in world coordinates.
 #[derive(Clone, Debug)]
 pub struct Glyph {
+    /// Which character of the text it is (line breaks count as spaces, see `line_job`).
+    pub index: usize,
+    /// Its advance along the baseline, and how far its font reaches above and below that.
+    pub adv: f32,
+    pub asc: f32,
+    pub desc: f32,
     pub chr: char,
     pub family: FontFamily,
     pub size: f32,
     pub color: Color32,
     pub at: P,
     pub tan: P,
+}
+
+impl Glyph {
+    /// The four corners of the cell of the glyph: its advance wide, from the top of its font
+    /// to the bottom, turned with the path.
+    pub fn corners(&self) -> [P; 4] {
+        let (at, tan) = (self.at, self.tan);
+        let nrm = (-tan.1, tan.0);
+        [(0.0, -self.asc), (self.adv, -self.asc), (self.adv, self.desc), (0.0, self.desc)].map(|(dx, dy)| (at.0 + tan.0 * dx + nrm.0 * dy, at.1 + tan.1 * dx + nrm.1 * dy))
+    }
 }
 
 /// A text laid along its path.
@@ -372,14 +388,12 @@ pub fn lay(line: &Line, guide: &Guide, align: u8, offset: f32) -> Laid {
     let mut out = Laid { tan: (1.0, 0.0), ..Default::default() };
     let mut bbox: Option<(f32, f32, f32, f32)> = None;
     let mut grow = |p: P| bbox = Some(bbox.map_or((p.0, p.1, p.0, p.1), |b| (b.0.min(p.0), b.1.min(p.1), b.2.max(p.0), b.3.max(p.1))));
-    for (cell, spot) in line.cells.iter().zip(spots) {
+    for (index, (cell, spot)) in line.cells.iter().zip(spots).enumerate() {
         let Some(Spot { at, tan }) = spot else { continue };
-        // The normal of the baseline points down, into the descenders.
-        let nrm = (-tan.1, tan.0);
-        for (dx, dy) in [(0.0, -cell.asc), (cell.adv, -cell.asc), (cell.adv, cell.desc), (0.0, cell.desc)] {
-            grow((at.0 + tan.0 * dx + nrm.0 * dy, at.1 + tan.1 * dx + nrm.1 * dy));
-        }
-        out.glyphs.push(Glyph { chr: cell.chr, family: cell.family.clone(), size: cell.size, color: cell.color, at, tan });
+        // (The normal of the baseline points down, into the descenders.)
+        let glyph = Glyph { index, adv: cell.adv, asc: cell.asc, desc: cell.desc, chr: cell.chr, family: cell.family.clone(), size: cell.size, color: cell.color, at, tan };
+        glyph.corners().into_iter().for_each(&mut grow);
+        out.glyphs.push(glyph);
     }
     let (lo, hi) = if guide.closed { (0.0, guide.len().min(line.width)) } else { (-s0, guide.len() - s0) };
     for bar in &line.bars {
@@ -676,13 +690,22 @@ impl Doc {
         if !self.find(path).is_some_and(can_carry) {
             return Err("text can follow a vector path, a line, an ellipse or a rectangle");
         }
-        // In an auto layout the frame would place it; on a path the path does.
-        let item = self.auto_item(text);
         let Some(n) = self.find_mut(text).filter(|n| n.kind == Kind::Text) else { return Err("only a text layer can be put on a path") };
         (n.on_path, n.path_offset, n.path_side) = (Some(path), 0.0, false);
         (n.rotation, n.flip_h, n.flip_v) = (0.0, false, false);
-        n.absolute |= item;
         Ok(())
+    }
+
+    /// Is the point (x, y) on the text `n`, which is on a path? The box of such a text is the
+    /// one around all its glyphs (around a circle: the whole circle, hole included), so only
+    /// the part of it along its line counts: no further from the line than the text is high.
+    /// Without a line to follow the box is all there is.
+    pub fn hits_path_text(&self, n: &Node, x: f32, y: f32, tol: f32) -> bool {
+        if !n.contains(x, y, tol) {
+            return false;
+        }
+        let Some(guide) = n.on_path.and_then(|p| self.find(p)).filter(|p| can_carry(p)).and_then(guide_of) else { return true };
+        guide.nearest((x, y)).0 <= n.max_size() * 1.2 + tol
     }
 
     /// Texts whose path is gone (deleted, or no longer a shape text can follow) become plain
@@ -894,6 +917,29 @@ mod tests {
         // Half off: the underline stops where the line does.
         let half = lay(&line, &flat, 0, 90.0);
         assert!(half.glyphs.len() == 1 && half.bars[0].0.iter().all(|p| p.0 >= 190.0 && p.0 <= 200.0));
+    }
+
+    #[test]
+    fn a_text_around_a_circle_is_hit_on_its_ring_only() {
+        let mut doc = Doc::default();
+        let frame = shape(&mut doc, Kind::Frame, None, (0.0, 0.0, 400.0, 400.0));
+        let circle = shape(&mut doc, Kind::Ellipse, Some(frame), (100.0, 100.0, 200.0, 200.0));
+        let inside = shape(&mut doc, Kind::Rect, Some(frame), (180.0, 180.0, 40.0, 40.0));
+        // The text goes all the way round: its box is the circle and the height of the letters.
+        let text = shape(&mut doc, Kind::Text, Some(frame), (84.0, 84.0, 232.0, 232.0));
+        doc.find_mut(text).unwrap().font_size = 16.0;
+        assert_eq!(doc.attach_text(text, circle), Ok(()));
+        // On the letters at the top and at the left, and just inside the line.
+        for at in [(200.0, 92.0), (92.0, 200.0), (200.0, 110.0)] {
+            assert_eq!(doc.hit(at.0, at.1, 2.0), Some(text), "{at:?}");
+        }
+        // In the middle of the circle the click is for what lies there, and in a corner of
+        // the box for nothing but the frame.
+        assert_eq!((doc.hit(200.0, 200.0, 2.0), doc.hit_deep(200.0, 200.0, 2.0), doc.hit(90.0, 90.0, 2.0)), (Some(inside), Some(inside), Some(frame)));
+        assert_eq!(doc.hit_within(frame, 200.0, 160.0, 2.0), Some(circle));
+        // Off its path, it is its box again.
+        detach(doc.find_mut(text).unwrap());
+        assert_eq!(doc.hit(200.0, 160.0, 2.0), Some(text));
     }
 
     #[test]

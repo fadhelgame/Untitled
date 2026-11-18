@@ -220,9 +220,16 @@ impl Rebuild<'_> {
                 }
             },
         };
-        let at = Fit::place(&mut part, main, from, to, auto && !main.absolute);
+        let at = Fit::place(&mut part, main, from, to, auto && !main.floats());
         self.fit.mirror(&mut part);
         part.children = main.children.iter().map(|c| self.part(c, (main.x, main.y, main.w, main.h), at, main.is_auto())).collect();
+        // The part was mirrored before it had its children: that turned its layout, but the
+        // items of a nested auto layout have to run the other way as well.
+        for (flipped, horizontal) in [(self.fit.flip.0, true), (self.fit.flip.1, false)] {
+            if flipped {
+                layout::reverse_items(&mut part, horizontal);
+            }
+        }
         part
     }
 }
@@ -451,14 +458,22 @@ impl Doc {
     /// what was copied out of an instance (or whose main is not in this document) becomes plain.
     /// Result `true`: keep its ids. That is a main that is no longer in the document (cut and
     /// pasted): it comes back as the same main, so its instances stay linked.
+    ///
+    /// The main may have changed since the copy was made (it sat in the clipboard meanwhile):
+    /// an instance is laid out from the main as it is now, so it has the layers and the layout
+    /// the other instances have.
     pub fn settle_copy(&mut self, n: &mut Node) -> bool {
-        fn settle(doc: &Doc, n: &mut Node) {
+        fn settle(doc: &mut Doc, n: &mut Node) {
             if n.component && doc.main(n.id).is_some() {
-                return into_instance(n);
+                into_instance(n);
+                doc.fit_instance(n);
+                return;
             }
             if let Some(main) = n.instance_of {
                 if !doc.mirrors(n, main) {
                     strip(n);
+                } else if n.source.is_none() {
+                    doc.fit_instance(n);
                 }
                 return;
             }
@@ -1026,6 +1041,34 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_auto_layout_in_a_flipped_instance_stays_mirrored() {
+        let mut doc = button();
+        // In the main, 10 from its left edge: a row of two boxes, 40 and 20 wide and 10 apart.
+        let row = add(&mut doc, Kind::Frame, Some(1), (110.0, 110.0, 70.0, 20.0));
+        let a = add(&mut doc, Kind::Rect, Some(row), (110.0, 110.0, 40.0, 20.0));
+        let b = add(&mut doc, Kind::Rect, Some(row), (160.0, 110.0, 20.0, 20.0));
+        doc.find_mut(row).unwrap().layout = Some(layout::AutoLayout { gap: 10.0, ..Default::default() });
+        let i = place(&mut doc, 1, 400.0, 300.0, None);
+        edit(&mut doc, |d| assert!(d.flip(&[i], true)));
+        // Mirrored: the row is 10 from the right edge (600), and the wide box comes last.
+        let seen = |d: &Doc| {
+            let r = part(d, i, row);
+            (r.x, part(d, i, a).x, part(d, i, b).x, r.children.iter().map(|c| c.source.unwrap()).collect::<Vec<_>>())
+        };
+        let mirrored = (520.0, 550.0, 520.0, vec![b, a]);
+        assert_eq!(seen(&doc), mirrored);
+        // The main changes: the instance is rebuilt from it, and the row is still its mirror image.
+        assert!(edit(&mut doc, |d| d.find_mut(a).unwrap().fill = BLUE));
+        assert_eq!((seen(&doc), part(&doc, i, a).fill), (mirrored.clone(), BLUE));
+        assert!(!doc.settle_layout(None, &[]));
+        // A column in a row-wise flip keeps its order (and the other way round).
+        assert!(edit(&mut doc, |d| d.find_mut(row).unwrap().layout.as_mut().unwrap().dir = layout::Dir::Vertical));
+        assert_eq!(seen(&doc).3, vec![a, b]);
+        assert!(doc.flip(&[i], false) && edit(&mut doc, |d| d.find_mut(a).unwrap().fill = GREEN));
+        assert_eq!(seen(&doc).3, vec![b, a]);
+    }
+
+    #[test]
     fn a_change_passes_through_nested_components() {
         let mut doc = button();
         // Main `card` holds an instance of the button; `page` holds an instance of the card.
@@ -1154,6 +1197,22 @@ mod tests {
         doc.move_nodes(&[1], Some(holder), None, 0);
         let (held, _) = copy(&mut doc, holder);
         assert!(!held.is_linked() && held.children[0].is_instance() && held.children[0].instance_of == Some(1));
+        // A copy made before the main changed: pasted, it is an instance of the main as it is now.
+        let stale = doc.find_all(i).unwrap().clone();
+        let badge = add(&mut doc, Kind::Ellipse, Some(1), (270.0, 110.0, 20.0, 20.0));
+        assert!(edit(&mut doc, |d| d.find_mut(3).unwrap().x = 150.0));
+        let mut pasted = stale.clone();
+        pasted.translate(500.0, 0.0);
+        assert!(!doc.settle_copy(&mut pasted));
+        let sources: Vec<Option<u64>> = pasted.children.iter().map(|c| c.source).collect();
+        assert_eq!((sources, pasted.children[1].x - pasted.x, pasted.children[2].x - pasted.x), (vec![Some(2), Some(3), Some(badge)], 50.0, 170.0));
+        // So is a copy of the main itself, and an instance inside a copied frame.
+        let mut main = Node { children: stale.children.clone(), ..doc.find_all(1).unwrap().clone() };
+        main.children.iter_mut().for_each(|c| c.id = c.source.take().unwrap());
+        assert!(!doc.settle_copy(&mut main) && main.is_instance() && main.children.len() == 3 && main.children[2].source == Some(badge));
+        let mut around = Node::new(900, Kind::Frame, 0.0, 0.0);
+        around.children = vec![stale];
+        assert!(!doc.settle_copy(&mut around) && around.children[0].children.len() == 3);
         // Cut and pasted, the main comes back as itself, so its instances stay linked.
         let cut = doc.remove(1).unwrap();
         let mut back = cut.clone();

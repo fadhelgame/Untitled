@@ -5,7 +5,8 @@
 //! All positions are character indices (as in `Span`), never bytes.
 
 use crate::doc::{Doc, Kind, Node};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Options {
@@ -72,6 +73,26 @@ impl Needle {
 
     /// The occurrences in `text` as character ranges, in order and without overlap ("aa" is
     /// found twice in "aaaa"). An empty query is found nowhere.
+    /// The characters of `text` as they are compared with the query.
+    fn hay(&self, text: &str) -> Vec<char> {
+        if self.opt.match_case {
+            text.chars().collect()
+        } else {
+            text.chars().map(fold).collect()
+        }
+    }
+
+    /// Does the query occur in `hay` (see `hay`) at character `i`?
+    fn at(&self, hay: &[char], i: usize) -> bool {
+        let m = self.chars.len();
+        if m == 0 || i + m > hay.len() || hay[i..i + m] != self.chars[..] {
+            return false;
+        }
+        // A side of the query that is not itself part of a word (a query like "(a)") needs
+        // no boundary there.
+        !self.opt.whole_word || ((i == 0 || !word_char(hay[i - 1]) || !word_char(self.chars[0])) && (i + m == hay.len() || !word_char(hay[i + m]) || !word_char(self.chars[m - 1])))
+    }
+
     pub fn find_in(&self, text: &str) -> Vec<(usize, usize)> {
         let m = self.chars.len();
         // (Bytes are at least as many as characters: a text shorter than the query in bytes
@@ -79,16 +100,11 @@ impl Needle {
         if m == 0 || text.len() < m {
             return Vec::new();
         }
-        let hay: Vec<char> = if self.opt.match_case { text.chars().collect() } else { text.chars().map(fold).collect() };
+        let hay = self.hay(text);
         let mut out = Vec::new();
         let mut i = 0;
         while i + m <= hay.len() {
-            let found = hay[i] == self.chars[0] && hay[i..i + m] == self.chars[..];
-            // A side of the query that is not itself part of a word (a query like "(a)") needs
-            // no boundary there.
-            let whole = !self.opt.whole_word
-                || ((i == 0 || !word_char(hay[i - 1]) || !word_char(self.chars[0])) && (i + m == hay.len() || !word_char(hay[i + m]) || !word_char(self.chars[m - 1])));
-            if found && whole {
+            if self.at(&hay, i) {
                 out.push((i, i + m));
                 i += m;
             } else {
@@ -101,17 +117,22 @@ impl Needle {
 
 /// Replace these character ranges of the text of `n` (in order, not overlapping, as `Needle::find_in`
 /// gives them) with `with`. The styled ranges follow (see `Node::replace_range`), and so does a
-/// layer name that was taken from the text. Ranges that do not fit the text are left out.
-/// Result: how many were replaced.
-pub fn replace_in(n: &mut Node, ranges: &[(usize, usize)], with: &str) -> usize {
+/// layer name that was taken from the text. Ranges that do not fit the text are left out, and
+/// with `check` (the query the ranges were found with) so are those where the text no longer
+/// says what was searched for: the text changed since the search, and replacing by position
+/// would cut into whatever stands there now. Result: how many were replaced.
+pub fn replace_in(n: &mut Node, ranges: &[(usize, usize)], with: &str, check: Option<&Needle>) -> usize {
     let auto_name = |text: &str| -> String { text.lines().next().unwrap_or("Text").chars().take(40).collect() };
     let named_by_text = n.name == auto_name(&n.text);
     let len = n.text.chars().count();
+    // (Compared with the text as it is now: replacing from the end does not shift what is before.)
+    let hay = check.map(|c| (c, c.hay(&n.text)));
+    let found = |a: usize, b: usize| hay.as_ref().is_none_or(|(c, hay)| b - a == c.chars.len() && c.at(hay, a));
     let mut done = 0;
     let mut limit = len;
     // From the last to the first: the indices of those still to come are not shifted.
     for &(a, b) in ranges.iter().rev() {
-        if a < b && b <= limit {
+        if a < b && b <= limit && found(a, b) {
             n.replace_range(a, b, with);
             limit = a;
             done += 1;
@@ -163,10 +184,13 @@ pub fn find_all(doc: &Doc, query: &str, opt: Options, scope: &Scope) -> Vec<Matc
     out
 }
 
-/// Replace these matches (from `find_all` on this very document) with `with`. Top-level layers
-/// without a match stay shared with the undo snapshots. Result: how many matches were replaced,
-/// and the ids of the layers whose text changed.
-pub fn replace_matches(doc: &mut Doc, matches: &[Match], with: &str) -> (usize, Vec<u64>) {
+/// Replace these matches (from `find_all` on this document with `check`, the query) with `with`.
+/// Matches that the text no longer holds are skipped (see `replace_in`). A text that would be
+/// left with nothing to show is removed, as the text editor removes one that is left empty; a
+/// part of an instance can't be removed, so there such a replacement is not made at all.
+/// Top-level layers without a match stay shared with the undo snapshots. Result: how many
+/// matches were replaced, the ids of the layers whose text changed, and the ids of those removed.
+pub fn replace_matches(doc: &mut Doc, matches: &[Match], with: &str, check: Option<&Needle>) -> (usize, Vec<u64>, Vec<u64>) {
     let mut by_node: HashMap<u64, Vec<(usize, usize)>> = HashMap::new();
     for m in matches {
         by_node.entry(m.id).or_default().push((m.start, m.end));
@@ -174,25 +198,42 @@ pub fn replace_matches(doc: &mut Doc, matches: &[Match], with: &str) -> (usize, 
     for ranges in by_node.values_mut() {
         ranges.sort_unstable();
     }
-    let (mut count, mut changed) = (0, Vec::new());
+    let (mut count, mut changed, mut removed) = (0, Vec::new(), Vec::new());
     doc.update_nodes(
         |n| n.kind == Kind::Text && by_node.contains_key(&n.id),
         |n| {
-            let done = replace_in(n, &by_node[&n.id], with);
-            if done > 0 {
-                count += done;
-                changed.push(n.id);
+            let mut new = n.clone();
+            let done = replace_in(&mut new, &by_node[&n.id], with, check);
+            let emptied = new.text.trim().is_empty();
+            if done == 0 || (emptied && n.source.is_some()) {
+                return;
             }
+            count += done;
+            if emptied { &mut removed } else { &mut changed }.push(n.id);
+            *n = new;
         },
     );
-    (count, changed)
+    if !removed.is_empty() {
+        let gone: HashSet<u64> = removed.iter().copied().collect();
+        fn prune(n: &mut Node, gone: &HashSet<u64>) {
+            n.children.retain(|c| !gone.contains(&c.id));
+            n.children.iter_mut().for_each(|c| prune(c, gone));
+        }
+        let lists = std::iter::once(&mut doc.nodes).chain(doc.pages.iter_mut().map(|p| &mut p.nodes));
+        for list in lists {
+            list.retain(|n| !gone.contains(&n.id));
+            for top in list.iter_mut().filter(|top| top.any(&|n| gone.contains(&n.id))) {
+                prune(Arc::make_mut(top), &gone);
+            }
+        }
+    }
+    (count, changed, removed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::doc::{Page, Span, Style};
-    use std::sync::Arc;
 
     const PLAIN: Options = Options { match_case: false, whole_word: false };
     const CASE: Options = Options { match_case: true, whole_word: false };
@@ -272,17 +313,17 @@ mod tests {
     fn replacing_several_matches_in_one_text() {
         let mut n = text(1, "red, red and red");
         let found = find_in(&n.text, "red", PLAIN);
-        assert_eq!(replace_in(&mut n, &found, "green"), 3);
+        assert_eq!(replace_in(&mut n, &found, "green", None), 3);
         assert_eq!(n.text, "green, green and green");
         // The name was the text, so it follows.
         assert_eq!(n.name, "green, green and green");
         let mut named = text(2, "red");
         named.name = "Title".into();
-        replace_in(&mut named, &[(0, 3)], "blue");
+        replace_in(&mut named, &[(0, 3)], "blue", None);
         assert_eq!((named.text.as_str(), named.name.as_str()), ("blue", "Title"));
         // Ranges that do not fit the text (a stale search) change nothing.
         let mut short = text(3, "red");
-        assert_eq!(replace_in(&mut short, &[(2, 9)], "x"), 0);
+        assert_eq!(replace_in(&mut short, &[(2, 9)], "x", None), 0);
         assert_eq!(short.text, "red");
     }
 
@@ -294,7 +335,7 @@ mod tests {
         n.spans = vec![Span { start: 4, end: 12, style: style.clone() }, Span { start: 17, end: 21, style: style.clone() }];
         let found = find_in(&n.text, "two", PLAIN);
         assert_eq!(found, [(4, 7), (13, 16)]);
-        replace_in(&mut n, &found, "three");
+        replace_in(&mut n, &found, "three", None);
         assert_eq!(n.text, "Buy three, get three free");
         // The first match was bold and stays bold, the second was not; "free" moved by four.
         assert_eq!(spans(&n), [(4, 14, "three, get".into()), (21, 25, "free".into())]);
@@ -323,7 +364,7 @@ mod tests {
         let mut n = text(5, "Señor café olé");
         n.spans = vec![Span { start: 11, end: 14, style }];
         let found = find_in(&n.text, "CAFÉ", PLAIN);
-        replace_in(&mut n, &found, "té");
+        replace_in(&mut n, &found, "té", None);
         assert_eq!(n.text, "Señor té olé");
         assert_eq!(spans(&n), [(9, 12, "olé".into())]);
     }
@@ -333,13 +374,97 @@ mod tests {
         let mut n = text(1, "a--b--c");
         n.spans = vec![Span { start: 1, end: 3, style: bold(&n) }, Span { start: 3, end: 4, style: Style { italic: true, ..n.base_style() } }];
         let found = find_in(&n.text, "--", PLAIN);
-        assert_eq!(replace_in(&mut n, &found, ""), 2);
+        assert_eq!(replace_in(&mut n, &found, "", None), 2);
         assert_eq!(n.text, "abc");
         assert_eq!(spans(&n), [(1, 2, "b".into())]);
-        // A text emptied altogether keeps its name.
+        // A text emptied altogether keeps its name (`replace_matches` removes such a layer).
         let mut gone = text(2, "word");
-        replace_in(&mut gone, &[(0, 4)], "");
+        replace_in(&mut gone, &[(0, 4)], "", None);
         assert_eq!((gone.text.as_str(), gone.name.as_str()), ("", "word"));
+    }
+
+    #[test]
+    fn stale_matches_are_skipped_instead_of_cutting_into_the_text() {
+        let needle = Needle::new("now", PLAIN);
+        let mut n = text(1, "now and now");
+        let found = needle.find_in(&n.text);
+        // The text changed under the matches (an instance followed its main): the first is
+        // still there, where the second was the text says something else.
+        n.text = "now or tomorrow".into();
+        assert_eq!(replace_in(&mut n.clone(), &found, "then", None), 2);
+        assert_eq!(replace_in(&mut n, &found, "then", Some(&needle)), 1);
+        assert_eq!(n.text, "then or tomorrow");
+        // The right place, but not as a whole word any more; and a range of another length.
+        let word = Needle::new("cat", WORD);
+        let mut n = text(2, "cats");
+        assert_eq!((replace_in(&mut n, &[(0, 3)], "dog", Some(&word)), n.text.as_str()), (0, "cats"));
+        assert_eq!(replace_in(&mut n, &[(0, 4)], "dog", Some(&Needle::new("cat", PLAIN))), 0);
+        assert_eq!((replace_in(&mut n, &[(0, 3)], "dog", Some(&Needle::new("CAT", PLAIN))), n.text.as_str()), (1, "dogs"));
+    }
+
+    #[test]
+    fn replacing_one_by_one_in_a_main_and_its_instance() {
+        // The window replaces the current match, searches again and goes on, while the instance
+        // only follows its main at the end of the frame (`Doc::settle`): the matches found in
+        // the instance in between are those of its old text.
+        let mut doc = Doc::default();
+        doc.insert(Node::new(1, Kind::Frame, 0.0, 0.0), None);
+        doc.insert(text(2, "now and now"), Some(1));
+        doc.next_id = 10;
+        assert_eq!(doc.make_component(&[1]), Ok(1));
+        let inst = doc.instantiate(1).unwrap();
+        let label = inst.children[0].id;
+        doc.insert(inst, None);
+        let needle = Needle::new("now", PLAIN);
+        let stale = find_all(&doc, "now", PLAIN, &Scope::Page);
+        assert_eq!(stale.iter().map(|m| (m.id, m.start)).collect::<Vec<_>>(), [(2, 0), (2, 8), (label, 0), (label, 8)]);
+        let pre = doc.clone();
+        assert_eq!(replace_matches(&mut doc, &stale[..1], "tomorrow", Some(&needle)), (1, vec![2], vec![]));
+        doc.settle(Some(&pre), &[]);
+        assert_eq!(doc.find(label).unwrap().text, "tomorrow and now");
+        // The old second match of the instance, (8, 11), is "d n" now: not replaced.
+        assert_eq!(replace_matches(&mut doc, &stale[3..], "tomorrow", Some(&needle)), (0, vec![], vec![]));
+        assert_eq!(doc.find(label).unwrap().text, "tomorrow and now");
+        // Searched again, the rest goes one by one.
+        for _ in 0..4 {
+            let pre = doc.clone();
+            let found = find_all(&doc, "now", PLAIN, &Scope::Page);
+            replace_matches(&mut doc, &found[..found.len().min(1)], "tomorrow", Some(&needle));
+            doc.settle(Some(&pre), &[]);
+        }
+        assert_eq!((doc.find(2).unwrap().text.as_str(), doc.find(label).unwrap().text.as_str()), ("tomorrow and tomorrow", "tomorrow and tomorrow"));
+    }
+
+    #[test]
+    fn a_text_left_empty_is_removed_unless_it_is_part_of_an_instance() {
+        let mut doc = sample();
+        doc.find_mut(5).unwrap().text = " hello ".into();
+        doc.pages[1].nodes = vec![Arc::new(text(9, "hello"))];
+        let found = find_all(&doc, "hello", PLAIN, &Scope::All);
+        let (count, changed, mut removed) = replace_matches(&mut doc, &found, "", None);
+        removed.sort_unstable();
+        // "Hello world" keeps a word; "hello hello" keeps a space only, " hello " two.
+        assert_eq!((count, changed, removed), (5, vec![1], vec![3, 5, 9]));
+        assert_eq!(doc.find(1).unwrap().text, " world");
+        assert!(doc.find(3).is_none() && doc.find(5).is_none() && doc.find(4).is_some() && doc.pages[1].nodes.is_empty());
+        // The label of an instance stays as it is; the one of the main goes, and with it
+        // (once the document is settled) the part of the instance.
+        let mut doc = Doc::default();
+        doc.insert(Node::new(1, Kind::Frame, 0.0, 0.0), None);
+        doc.insert(text(2, "Buy"), Some(1));
+        doc.next_id = 10;
+        assert_eq!(doc.make_component(&[1]), Ok(1));
+        let inst = doc.instantiate(1).unwrap();
+        let (i, label) = (inst.id, inst.children[0].id);
+        doc.insert(inst, None);
+        let found = find_all(&doc, "buy", PLAIN, &Scope::Within(vec![i]));
+        assert_eq!(replace_matches(&mut doc, &found, "", None), (0, vec![], vec![]));
+        assert_eq!(doc.find(label).unwrap().text, "Buy");
+        let pre = doc.clone();
+        let found = find_all(&doc, "buy", PLAIN, &Scope::Within(vec![1]));
+        assert_eq!(replace_matches(&mut doc, &found, " ", None), (1, vec![], vec![2]));
+        doc.settle(Some(&pre), &[]);
+        assert!(doc.find(2).is_none() && doc.find(label).is_none() && doc.find(i).is_some());
     }
 
     /// Page 1 (current): text 1, frame 2 { text 3, frame 4 { text 5 } }, hidden text 6, locked
@@ -414,7 +539,7 @@ mod tests {
         let replace = |doc: &mut Doc, query: &str, with: &str, scope: Scope| {
             let pre = doc.clone();
             let found = find_all(doc, query, PLAIN, &scope);
-            let (count, _) = replace_matches(doc, &found, with);
+            let (count, ..) = replace_matches(doc, &found, with, None);
             // What the app does at the end of the frame.
             doc.settle(Some(&pre), &[]);
             count
@@ -439,7 +564,7 @@ mod tests {
         let mut doc = sample();
         let before = doc.clone();
         let found = find_all(&doc, "hello", PLAIN, &Scope::All);
-        let (count, mut changed) = replace_matches(&mut doc, &found, "bye");
+        let (count, mut changed, _) = replace_matches(&mut doc, &found, "bye", None);
         changed.sort_unstable();
         assert_eq!((count, changed), (5, vec![1, 3, 5, 9]));
         assert_eq!(doc.find(1).unwrap().text, "bye world");
@@ -462,7 +587,7 @@ mod tests {
         // One match only: the others in the same text stay.
         let mut doc = sample();
         let found = find_all(&doc, "hello", PLAIN, &Scope::Page);
-        assert_eq!(replace_matches(&mut doc, &found[2..3], "you"), (1, vec![3]));
+        assert_eq!(replace_matches(&mut doc, &found[2..3], "you", None), (1, vec![3], vec![]));
         assert_eq!(doc.find(3).unwrap().text, "hello you");
     }
 }

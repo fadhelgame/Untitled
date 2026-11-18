@@ -53,6 +53,8 @@ impl App {
             return;
         }
         self.pages.views.insert(old, self.view);
+        // (Where the canvas put the texts on a path of the old page says nothing about this one.)
+        self.ext.path_seen.clear();
         match self.pages.views.get(&new) {
             Some(v) => self.view = *v,
             None if self.doc.nodes.is_empty() => self.view = View { pan: vec2(80.0, 80.0), zoom: 1.0 },

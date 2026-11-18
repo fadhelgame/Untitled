@@ -78,6 +78,7 @@ impl App {
                     "Space+drag     pan canvas",
                     "Ctrl+scroll    zoom",
                     "Shift+0/1/2    100% / fit / selection",
+                    "+  -  Ctrl+0   zoom in / out / 100%",
                     "Alt+drag       duplicate",
                     "Shift+drag     lock axis",
                     "] and [        bring front / send back",
@@ -175,7 +176,8 @@ impl App {
                         field(ui, half, "Y", &mut n.y);
                     });
                 });
-                if in_auto {
+                // (A text on a path is left out of the layout anyway: the path places it.)
+                if in_auto && !(n.kind == Kind::Text && n.on_path.is_some()) {
                     ui.checkbox(&mut n.absolute, "Absolute position").on_hover_text("Left out of the auto layout of its frame: it stays where you put it, and follows its constraints when the frame is resized.");
                     if item {
                         ui.weak("Placed by the auto layout of its frame.");
@@ -310,7 +312,7 @@ impl App {
                 if btn.clicked() {
                     crop_image = true;
                 }
-                adjusting = adjust_section(ui, &mut n.adjust, "");
+                adjusting = adjust_section(ui, &mut n.adjust, "", n.fill.is_some());
                 section(ui, "Background");
                 if self.rembg_running(id) {
                     ui.horizontal(|ui| {
@@ -556,7 +558,12 @@ impl App {
         let mixed_type = !all(&|n| {
             (&n.font, n.weight, n.italic, n.font_size, n.line_height, n.letter_spacing, n.align)
                 == (&first.font, first.weight, first.italic, first.font_size, first.line_height, first.letter_spacing, first.align)
+                && (n.list, n.valign, n.fixed_h, n.wrap) == (first.list, first.valign, first.fixed_h, first.wrap)
+                && (n.decorated(0, 0, false), n.decorated(0, 0, true)) == (first.decorated(0, 0, false), first.decorated(0, 0, true))
         });
+        // The U and S buttons are lit when every text has the line through all of it, so a
+        // click turns it on unless all have it (as Ctrl+U does, see `App::toggle_decoration`).
+        let lined = [false, true].map(|strike| all_text && all(&|n| n.decorated(0, 0, strike)));
         let mixed_fill = !all(&|n| n.fill == first.fill && n.gradient == first.gradient);
         let mixed_stroke = !all(&|n| n.stroke == first.stroke && n.stroke_w == first.stroke_w);
         let mixed_look = !all(&|n| n.opacity == first.opacity && n.blend == first.blend && n.radius == first.radius);
@@ -564,6 +571,7 @@ impl App {
         let (inner_all, glass_all) = (all(&|n| has_inside(n)), all(&|n| glassy(n)));
         let images = all(&|n| n.kind == Kind::Image);
         let mixed_adjust = !all(&|n| n.adjustment() == first.adjustment());
+        let overlaid = all(&|n| n.fill.is_some());
         // Frames with auto layout of their own (not that of a main component).
         let auto_all = all(&|n| n.is_auto() && n.instance_of.is_none() && n.source.is_none());
         let mixed_layout = !all(&|n| n.layout == first.layout);
@@ -572,6 +580,9 @@ impl App {
         let spinnable = all(&|n| n.kind != Kind::Frame);
         let title = if same_kind { format!("{} × {}", first.kind.label(), nodes.len()) } else { "Design".to_owned() };
         let mut n = (*first).clone();
+        if all_text {
+            (n.underline, n.strike) = (lined[0], lined[1]);
+        }
         n.children.clear();
         drop(nodes);
         if any_text {
@@ -703,7 +714,7 @@ impl App {
                 }
             }
             if images {
-                adjusting = adjust_section(ui, &mut n.adjust, if mixed_adjust { MIXED } else { "" });
+                adjusting = adjust_section(ui, &mut n.adjust, if mixed_adjust { MIXED } else { "" }, overlaid);
             }
             // Anggota satu group dengan bayangan yang sama berbayangan bersama (lihat `shadow_run`).
             effects_section(
@@ -1307,7 +1318,8 @@ converted by a plain formula that knows nothing about the press.";
     fn print_svg(&mut self, only: Option<u64>, marks: bool, ctx: &egui::Context) -> Option<(String, f32, f32)> {
         let print = self.ext.print.clone();
         let (svg, w, h) = export::to_svg_bleed(&self.doc, only, print.bleed_px(), &mut self.fonts, ctx)?;
-        Some(if marks { crate::print::sheet_svg(svg, w, h, &print) } else { (svg, w, h) })
+        let scale = self.ext.export_scale.clamp(0.1, 16.0);
+        Some(if marks { crate::print::sheet_svg(svg, w, h, &print, scale) } else { (svg, w, h) })
     }
 
     fn export_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1655,8 +1667,10 @@ fn effects_section(ui: &mut egui::Ui, picker: &mut super::picker::Picker, id: u6
 }
 
 /// The "Adjust" section of an image: a slider per value, from -100 to 100. Double-click a
-/// slider to put it back to 0. Result: a slider is held down.
-fn adjust_section(ui: &mut egui::Ui, adjust: &mut Option<Adjust>, note: &str) -> bool {
+/// slider to put it back to 0. `overlaid`: the image has a colour overlay (a Fill), which shows
+/// its silhouette in one colour, so adjustments would change nothing: the sliders are off.
+/// Result: a slider is held down.
+fn adjust_section(ui: &mut egui::Ui, adjust: &mut Option<Adjust>, note: &str, overlaid: bool) -> bool {
     let was = adjust.unwrap_or_default();
     let mut values = was.values();
     let mut held = false;
@@ -1664,8 +1678,11 @@ fn adjust_section(ui: &mut egui::Ui, adjust: &mut Option<Adjust>, note: &str) ->
     if !note.is_empty() {
         ui.weak(note);
     }
+    if overlaid {
+        ui.weak("No effect while the image has a colour overlay: remove its Fill to adjust it.");
+    }
     let double = ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
-    ui.scope(|ui| {
+    ui.add_enabled_ui(!overlaid, |ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
         for (v, (_, label)) in values.iter_mut().zip(crate::adjust::FIELDS) {
             ui.horizontal(|ui| {
@@ -1737,6 +1754,10 @@ impl eframe::App for App {
             let frame = b.frame;
             b.inject.retain(|(at, event)| {
                 if *at <= frame {
+                    // (A key comes with the modifiers held, as from a real keyboard.)
+                    if let egui::Event::Key { pressed, modifiers, .. } = event {
+                        raw_input.modifiers = if *pressed { *modifiers } else { Default::default() };
+                    }
                     raw_input.events.push(event.clone());
                 }
                 *at > frame

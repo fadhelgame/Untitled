@@ -406,7 +406,9 @@ impl App {
         let z = self.view.zoom;
         let min = self.view.to_screen(self.canvas_rect.min, n.x, n.y);
         // Huruf bisa menjulang keluar kotak baris (line height rapat), jadi diberi kelonggaran.
-        Some(Rect::from_min_size(min, vec2(n.w.max(2.0), n.h.max(2.0)) * z).expand(8.0 + n.max_size() * z * 0.25))
+        // (And the lines of a text in a box of fixed height may run out of it altogether.)
+        let spill = self.ext.spill(n).unwrap_or(0.0) * z;
+        Some(Rect::from_min_size(min, vec2(n.w.max(2.0), n.h.max(2.0)) * z).expand(8.0 + n.max_size() * z * 0.25).expand2(vec2(0.0, spill)))
     }
 
     /// Editor teks di atas canvas.
@@ -572,6 +574,8 @@ impl App {
         }
         let fin = render::layout_text(ctx, &cur, &cur.text, &mut self.fonts, f, 1.0, true);
         let fin_origin = origin(&fin);
+        // (For `edit_box`: how far the lines run out of a box of fixed height.)
+        self.ext.note_spill(&cur, fin.height / f);
         let (w, h) = (if wrap { cur.w } else { (fin.width / f).max(2.0) }, (fin.height / f).max(1.0));
         if let Some(n) = self.doc.find_mut(id) {
             if n.text != cur.text {
@@ -779,6 +783,9 @@ impl App {
             Drag::Resize { id, handle, orig, start } => {
                 let d = wp - *start;
                 let (ox, oy, ow, oh) = *orig;
+                // How it was sized when the drag began: a side that is back at its old size
+                // hugs or fills as before.
+                let sized = self.pre_drag.as_ref().and_then(|d| d.find(*id)).map(|n| (n.size_h, n.size_v));
                 if let Some(n) = self.doc.find_mut(*id) {
                     // Alt: ukuran berubah dari tengah (sisi seberang ikut bergerak berlawanan), seperti Figma.
                     let centered = inp.mods.alt;
@@ -886,6 +893,9 @@ impl App {
                         // A side that was dragged has the size it was dragged to: it no longer
                         // hugs or fills. (The other one may only have been rounded.)
                         let (across, down) = (!matches!(*handle, 1 | 5) || inp.mods.shift, !matches!(*handle, 3 | 7) || inp.mods.shift);
+                        if let Some(sized) = sized {
+                            (n.size_h, n.size_v) = sized;
+                        }
                         if across && (n.w - ow).abs() > 1e-3 {
                             n.size_h = Sizing::Fixed;
                         }
@@ -1194,7 +1204,7 @@ impl App {
                 }
                 // A frame drawn inside a frame becomes its child, like any other object.
                 let parent = self.doc.frame_at(wp.x, wp.y, &[]);
-                self.doc.insert(n, parent);
+                self.doc.insert_placed(n, parent);
                 self.pre_drag = Some(pre);
                 self.sel = vec![id];
                 self.drag = Drag::Create { id, start };
@@ -1241,8 +1251,10 @@ impl App {
                     self.push_undo(pre);
                 }
             }
-            Drag::Resize { id, orig, .. } => {
-                let changed = self.doc.find(id).is_some_and(|n| (n.x, n.y, n.w, n.h) != orig);
+            Drag::Resize { id, .. } => {
+                // (Against the whole node as it was: its box may be back where it began while
+                // something else about it is not.)
+                let changed = pre.as_ref().is_some_and(|d| d.find(id) != self.doc.find(id));
                 if let (true, Some(pre)) = (changed, pre) {
                     self.push_undo(pre);
                 }
@@ -1309,7 +1321,7 @@ impl App {
                     (n.on_path, n.path_offset) = (Some(path), along);
                     self.status = "Text on a path: type, then click outside. Ctrl+Alt+P detaches it; drag it to slide it along.".into();
                 }
-                self.doc.insert(n, parent);
+                self.doc.insert_placed(n, parent);
                 self.start_text_edit(id, pre);
             }
             _ => {}
@@ -1605,6 +1617,67 @@ impl App {
         ids
     }
 
+    /// `KANVAS_BENCH_DRAGKEYS`: the rotated box of the demo is dragged, and in the middle of the
+    /// drag a key is pressed: `esc`, `del`, `undo` (Ctrl+Z) or `cut` (Ctrl+X). The drag goes on
+    /// for a few frames before the button is released. The outcome is printed to stderr.
+    /// `zoom`: no drag; Ctrl+= twice, Ctrl+-, Ctrl+0 (the canvas zooms, the interface does not),
+    /// then Ctrl+Shift+A, Ctrl+Shift+D and Ctrl+Alt+S (which are not Select all, Duplicate, Save).
+    pub(super) fn bench_dragkeys(&mut self, mode: &str, frame: u32, inject: &mut Vec<(u32, egui::Event)>, ctx: &egui::Context) {
+        if mode == "zoom" {
+            let key = |at: u32, key: Key, modifiers: Modifiers| {
+                let event = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+                [(at, event(true)), (at + 1, event(false))]
+            };
+            let cmd = Modifiers::COMMAND;
+            match frame {
+                200 => {
+                    self.sel.clear();
+                    inject.extend(key(204, Key::Equals, cmd).into_iter().chain(key(208, Key::Equals, cmd)).chain(key(212, Key::Minus, cmd)).chain(key(216, Key::Num0, cmd)));
+                    inject.extend(key(220, Key::A, cmd | Modifiers::SHIFT).into_iter().chain(key(224, Key::D, cmd | Modifiers::SHIFT)).chain(key(228, Key::S, cmd | Modifiers::ALT)));
+                }
+                203 | 207 | 211 | 215 | 219 | 223 | 227 | 232 => {
+                    eprintln!("DRAGKEYS zoom frame {frame}: canvas {:.3}, interface {:.3}, {} selected, {} layers, status: {}", self.view.zoom, ctx.zoom_factor(), self.sel.len(), self.doc.count(), self.status);
+                }
+                _ => {}
+            }
+            return;
+        }
+        let node = self.doc.nodes.iter().flat_map(|n| n.children.iter()).find(|c| c.name == "Rotated").map(|c| (c.id, c.center()));
+        match frame {
+            200 => {
+                let Some((_, c)) = node else { return };
+                let from = self.view.to_screen(self.canvas_rect.min, c.0, c.1);
+                let to = from + vec2(-120.0, -60.0);
+                let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                let mv = egui::Event::PointerMoved;
+                inject.extend([(202, mv(from)), (204, button(from, true))]);
+                inject.extend((1..=8u32).map(|s| (204 + s * 2, mv(from + (to - from) * (s as f32 / 8.0)))));
+                inject.push((224, button(to, false)));
+                let key = |at: u32, key: Key, modifiers: Modifiers| {
+                    let event = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+                    [(at, event(true)), (at + 1, event(false))]
+                };
+                match mode {
+                    "del" => inject.extend(key(213, Key::Delete, Modifiers::NONE)),
+                    "undo" => inject.extend(key(213, Key::Z, Modifiers::COMMAND)),
+                    "cut" => inject.push((213, egui::Event::Cut)),
+                    _ => inject.extend(key(213, Key::Escape, Modifiers::NONE)),
+                }
+                eprintln!("DRAGKEYS {mode}: box at {c:?} before the drag, {} undo steps", self.undo.len());
+            }
+            212 | 216 | 230 => {
+                eprintln!(
+                    "DRAGKEYS frame {frame}: box at {:?}, dragging {}, selection {:?}, {} undo steps",
+                    node.map(|n| n.1),
+                    !matches!(self.drag, Drag::None),
+                    self.sel,
+                    self.undo.len()
+                );
+            }
+            _ => {}
+        }
+    }
+
     // ------------------------------------------------------------ gambar
 
     /// Tambah gambar dari byte file (PNG, JPEG, WebP, GIF, BMP). `at` = posisi layar, default tengah canvas.
@@ -1624,7 +1697,7 @@ impl App {
         n.h = h as f32;
         n.image = Some(asset);
         let parent = self.doc.frame_at(c.x, c.y, &[]);
-        self.doc.insert(n, parent);
+        self.doc.insert_placed(n, parent);
         self.push_undo(pre);
         self.sel = vec![id];
         self.tool = Tool::Select;
@@ -1711,7 +1784,7 @@ impl App {
             }
             (plain, cmd, shift, up, pasted)
         });
-        let free = !ctx.wants_keyboard_input() && self.editing.is_none();
+        let free = !ctx.wants_keyboard_input() && self.editing.is_none() && !self.dragging();
         self.ext.v_plain |= plain_down;
         self.ext.paste_seen |= pasted;
         let at = self.canvas_pointer(ctx);

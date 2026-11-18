@@ -185,6 +185,34 @@ impl Doc {
         }
     }
 
+    /// Align (`mode`: 0 left, 1 right, 2 centre, 3 top, 4 bottom, 5 middle). Several units line
+    /// up on that side of the box around all of them; a single unit goes to that side of the
+    /// frame it is in. A group moves as one, so its members keep their places in it, and a
+    /// turned node is measured by the box around it. Result: whether there was anything to
+    /// align to (a single unit at the top level has nothing).
+    pub fn align(&mut self, ids: &[u64], mode: u8) -> bool {
+        let units = self.units(ids);
+        let target = match &units[..] {
+            [] => None,
+            [one] => self.parent_of(one.ids[0]).and_then(|p| self.find(p)).map(|f| f.aabb()),
+            many => many.iter().map(|u| u.b).reduce(union),
+        };
+        let Some(t) = target else { return false };
+        for u in &units {
+            let b = u.b;
+            let (dx, dy) = match mode {
+                0 => (t.0 - b.0, 0.0),
+                1 => (t.2 - b.2, 0.0),
+                2 => ((t.0 + t.2 - b.0 - b.2) * 0.5, 0.0),
+                3 => (0.0, t.1 - b.1),
+                4 => (0.0, t.3 - b.3),
+                _ => (0.0, (t.1 + t.3 - b.1 - b.3) * 0.5),
+            };
+            self.shift(u, dx.round(), dy.round());
+        }
+        true
+    }
+
     /// Distribute spacing: the two outermost units stay, the ones between are moved so that the
     /// gaps between neighbours are equal. Needs three units. Result: whether it applied.
     pub fn distribute(&mut self, ids: &[u64], horizontal: bool) -> bool {
@@ -316,6 +344,41 @@ mod tests {
         assert!(doc.distribute(&[a, b, c, d], false));
         // Top to bottom: a (0..20), d, c (40..80), b (90..110): 10 of room left for three gaps.
         assert!((at(&doc, d).1 - (20.0 + 10.0 / 3.0)).abs() < 1e-3 && (at(&doc, c).1 - (40.0 + 20.0 / 3.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn align_moves_a_group_as_one_and_measures_turned_boxes() {
+        let mut doc = Doc::default();
+        let frame = add(&mut doc, Kind::Frame, None, (100.0, 100.0, 600.0, 400.0));
+        let a = add(&mut doc, Kind::Rect, Some(frame), (150.0, 150.0, 40.0, 40.0));
+        let g1 = add(&mut doc, Kind::Rect, Some(frame), (260.0, 200.0, 20.0, 20.0));
+        let g2 = add(&mut doc, Kind::Rect, Some(frame), (290.0, 230.0, 30.0, 20.0));
+        let turned = add(&mut doc, Kind::Rect, Some(frame), (400.0, 300.0, 20.0, 60.0));
+        doc.group(&[g1, g2]);
+        doc.find_mut(turned).unwrap().rotation = 90.0;
+        let was = doc.clone();
+        // The group alone: to the left edge of its frame, the members as far apart as before
+        // (each on its own would land on that edge, one on top of the other).
+        assert!(doc.align(&[g1, g2], 0));
+        assert_eq!((at(&doc, g1), at(&doc, g2)), ((100.0, 200.0), (130.0, 230.0)));
+        // And to its bottom: the lower member touches it.
+        assert!(doc.align(&[g2, g1], 4));
+        assert_eq!((at(&doc, g1), at(&doc, g2)), ((100.0, 450.0), (130.0, 480.0)));
+        // A turned box alone: the box around it (60 wide, 20 high) goes to the right edge.
+        assert!(doc.align(&[turned], 1));
+        let b = doc.find(turned).unwrap().aabb();
+        assert_eq!((b.0, b.2), (640.0, 700.0));
+        // Several: to the box around all of them (150..440 by 150..340), the group as one unit.
+        doc = was;
+        assert!(doc.align(&[a, g1, g2, turned], 3));
+        assert_eq!((at(&doc, a).1, at(&doc, g1).1, at(&doc, g2).1, doc.find(turned).unwrap().aabb().1), (150.0, 150.0, 180.0, 150.0));
+        assert!(doc.align(&[a, g1, g2, turned], 2));
+        // Centres at 295: a is 40 wide, the group 60, the turned box 60.
+        assert_eq!((at(&doc, a).0, at(&doc, g1).0, at(&doc, g2).0, doc.find(turned).unwrap().aabb().0), (275.0, 265.0, 295.0, 265.0));
+        // Nothing to align to at the top level, and nothing moves.
+        let loose = add(&mut doc, Kind::Rect, None, (900.0, 900.0, 10.0, 10.0));
+        assert!(!doc.align(&[loose], 0) && !doc.align(&[], 0));
+        assert_eq!(at(&doc, loose), (900.0, 900.0));
     }
 
     #[test]

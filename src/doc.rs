@@ -713,17 +713,17 @@ fn gather<T>(v: &mut Vec<T>, is: impl Fn(&T) -> bool) {
 /// point gives way to what it holds, up to `depth` levels further down (0 = the frame itself);
 /// a hidden or locked frame hides or locks everything in it. An instance at the top level is
 /// picked as a whole by a plain click (`depth` 1), like a nested frame.
-fn hit_list<T: AsRef<Node>>(list: &[T], x: f32, y: f32, tol: f32, depth: usize) -> Option<&Node> {
+fn hit_list<'a, T: AsRef<Node>>(doc: &Doc, list: &'a [T], x: f32, y: f32, tol: f32, depth: usize) -> Option<&'a Node> {
     for n in list.iter().rev().map(|n| n.as_ref()) {
         if !n.visible || n.locked {
             continue;
         }
         if n.kind == Kind::Frame {
             if n.contains(x, y, 0.0) {
-                let inner = if depth > 0 && !(depth == 1 && n.instance_of.is_some()) { hit_list(&n.children, x, y, tol, depth - 1) } else { None };
+                let inner = if depth > 0 && !(depth == 1 && n.instance_of.is_some()) { hit_list(doc, &n.children, x, y, tol, depth - 1) } else { None };
                 return Some(inner.unwrap_or(n));
             }
-        } else if n.contains(x, y, tol) {
+        } else if if n.kind == Kind::Text && n.on_path.is_some() { doc.hits_path_text(n, x, y, tol) } else { n.contains(x, y, tol) } {
             return Some(n);
         }
     }
@@ -1289,6 +1289,16 @@ impl Node {
             2 => self.h - content,
             _ => 0.0,
         }
+    }
+
+    /// How far the lines of a text in a box of fixed height run out of that box, above or
+    /// below it (whichever is more), for lines `content` high in all. 0: they fit.
+    pub fn text_spill(&self, content: f32) -> f32 {
+        if !self.fixed_h {
+            return 0.0;
+        }
+        let dy = self.text_dy(content);
+        (-dy).max(dy + content - self.h).max(0.0)
     }
 
     pub fn style_at(&self, i: usize) -> Style {
@@ -2196,12 +2206,12 @@ impl Doc {
     /// Node paling depan di titik ini menurut aturan klik biasa: objek level atas, atau anak
     /// langsung frame level atas (frame di dalam frame terpilih utuh), kalau tidak frame-nya.
     pub fn hit(&self, x: f32, y: f32, tol: f32) -> Option<u64> {
-        hit_list(&self.nodes, x, y, tol, 1).map(|n| n.id)
+        hit_list(self, &self.nodes, x, y, tol, 1).map(|n| n.id)
     }
 
     /// The deepest node under this point, however many frames it sits in (Ctrl+click).
     pub fn hit_deep(&self, x: f32, y: f32, tol: f32) -> Option<u64> {
-        hit_list(&self.nodes, x, y, tol, usize::MAX).map(|n| n.id)
+        hit_list(self, &self.nodes, x, y, tol, usize::MAX).map(|n| n.id)
     }
 
     /// The front-most direct child of frame `scope` under this point (a nested frame counts as
@@ -2211,7 +2221,7 @@ impl Doc {
         let line = self.lineage(scope);
         let open = line.iter().all(|f| f.kind == Kind::Frame && f.visible && !f.locked && f.contains(x, y, 0.0));
         let frame = line.last().filter(|_| open)?;
-        hit_list(&frame.children, x, y, tol, 0).map(|n| n.id)
+        hit_list(self, &frame.children, x, y, tol, 0).map(|n| n.id)
     }
 
     pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
@@ -2241,6 +2251,15 @@ mod tests {
         n.text = s.into();
         n.fill = Some([0, 0, 0, 255]);
         n
+    }
+
+    #[test]
+    fn lines_higher_than_a_fixed_box_run_out_where_they_are_not_anchored() {
+        let mut n = text_node("a\nb\nc");
+        (n.h, n.fixed_h) = (20.0, true);
+        // 50 of lines in a box of 20: out at the bottom, half at each end, or out at the top.
+        assert_eq!([0, 1, 2].map(|v| Node { valign: v, ..n.clone() }.text_spill(50.0)), [30.0, 15.0, 30.0]);
+        assert_eq!((n.text_spill(20.0), n.text_spill(5.0), Node { fixed_h: false, ..n.clone() }.text_spill(50.0)), (0.0, 0.0, 0.0));
     }
 
     #[test]

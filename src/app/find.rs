@@ -43,6 +43,8 @@ struct Made {
     scope: Scope,
     /// `Ext::rev`: counts every committed change to the document (and undo, redo, page switch).
     rev: u64,
+    /// `Find::gen`: counts the changes that are not commits.
+    gen: u64,
     page: usize,
 }
 
@@ -69,6 +71,10 @@ pub(super) struct Find {
     rect: Option<Rect>,
     /// How long the last search took.
     pub scan_ms: f32,
+    /// Counts the times the document changed without a commit of its own: instances that
+    /// took the new text of their main when the document was settled (`App::settle_doc`).
+    /// The matches found before that are of the old texts.
+    pub gen: u64,
 }
 
 impl Find {
@@ -132,7 +138,7 @@ impl App {
     /// option, the scope or the document changed, not on every frame. (Typing in a text on the
     /// canvas is committed when the editor is left; until then its matches are the old ones.)
     fn find_refresh(&mut self) {
-        let made = Made { query: self.find.query.clone(), opt: self.find.opt, scope: self.find_scope(), rev: self.ext.rev, page: self.doc.page };
+        let made = Made { query: self.find.query.clone(), opt: self.find.opt, scope: self.find_scope(), rev: self.ext.rev, gen: self.find.gen, page: self.doc.page };
         if self.find.made.as_ref() == Some(&made) {
             return;
         }
@@ -255,21 +261,25 @@ impl App {
     /// `find_measure`). Text of a part of an instance can be overridden,
     /// so it is replaced like any other; a main component passes its new text on when the
     /// document is settled at the end of the frame, and the auto layouts around the texts are
-    /// laid out again then. Result: (matches replaced, layers changed).
-    pub(super) fn replace_matches(&mut self, matches: &[Match], with: &str) -> (usize, Vec<u64>) {
+    /// laid out again then. `query`, `opt`: what the matches were found with; one that the text
+    /// no longer holds is skipped. A text left with nothing to show is removed, as when it is
+    /// emptied in the text editor (not a part of an instance: that keeps its text).
+    /// Result: (matches replaced, layers changed, layers removed).
+    pub(super) fn replace_matches(&mut self, matches: &[Match], query: &str, opt: Options, with: &str) -> (usize, Vec<u64>, usize) {
         let pre = self.doc.clone();
-        let (count, changed) = find::replace_matches(&mut self.doc, matches, with);
+        let (count, changed, removed) = find::replace_matches(&mut self.doc, matches, with, Some(&find::Needle::new(query, opt)));
         if count == 0 {
-            return (0, changed);
+            return (0, changed, 0);
         }
+        self.sel.retain(|id| !removed.contains(id));
         self.push_undo(pre);
-        (count, changed)
+        (count, changed, removed.len())
     }
 
     /// Search and replace in one go, for the remote `replace_text`.
-    pub(super) fn replace_text(&mut self, query: &str, with: &str, opt: Options, all_pages: bool) -> (usize, Vec<u64>) {
+    pub(super) fn replace_text(&mut self, query: &str, with: &str, opt: Options, all_pages: bool) -> (usize, Vec<u64>, usize) {
         let matches = find::find_all(&self.doc, query, opt, if all_pages { &Scope::All } else { &Scope::Page });
-        self.replace_matches(&matches, with)
+        self.replace_matches(&matches, query, opt, with)
     }
 
     /// "Replace": the current match is replaced and the next one shown. Without a current
@@ -280,9 +290,13 @@ impl App {
         let Some((i, m)) = self.find.current.and_then(|i| Some((i, *self.find.matches.get(i)?))) else {
             return self.find_step(true);
         };
-        let with = self.find.with.clone();
-        let (count, changed) = self.replace_matches(&[m], &with);
+        let (query, opt, with) = (self.find.query.clone(), self.find.opt, self.find.with.clone());
+        let (count, changed, removed) = self.replace_matches(&[m], &query, opt, &with);
         if count == 0 {
+            // (The text of a part of an instance can't be emptied.)
+            if self.doc.pinned(m.id) {
+                self.status = "Not replaced: that would leave a text of an instance empty. Edit the main component, or detach the instance.".into();
+            }
             return;
         }
         self.find_measure(ctx, &changed);
@@ -303,6 +317,9 @@ impl App {
             self.status = format!("Replaced 1 match. {left} left.");
             self.find_show(if next < left { next } else { 0 });
         }
+        if removed > 0 {
+            self.status.push_str(" The text was left empty, so its layer was removed.");
+        }
     }
 
     /// "Replace all": every match in the scope, as one undo step.
@@ -310,14 +327,18 @@ impl App {
         self.finish_text_edit();
         self.find_refresh();
         let (matches, with) = (self.find.matches.clone(), self.find.with.clone());
-        let (count, layers) = self.replace_matches(&matches, &with);
+        let (query, opt) = (self.find.query.clone(), self.find.opt);
+        let (count, layers, removed) = self.replace_matches(&matches, &query, opt, &with);
         self.find_measure(ctx, &layers);
         self.find.current = None;
         let s = |n: usize| if n == 1 { "" } else { "s" };
         self.status = match count {
             0 => format!("Nothing to replace: \"{}\" was not found.", self.find.query),
-            _ => format!("Replaced {count} match{} in {} layer{}.", if count == 1 { "" } else { "es" }, layers.len(), s(layers.len())),
+            _ => format!("Replaced {count} match{} in {} layer{}.", if count == 1 { "" } else { "es" }, layers.len() + removed, s(layers.len() + removed)),
         };
+        if removed > 0 {
+            self.status.push_str(&format!(" {removed} layer{} left empty {} removed.", s(removed), if removed == 1 { "was" } else { "were" }));
+        }
     }
 
     /// The Find and replace window.
@@ -437,9 +458,11 @@ impl App {
         }
         let (o, z, view) = (self.canvas_rect.min, self.view.zoom, self.view);
         let (tl, br) = (view.to_world(o, self.canvas_rect.min), view.to_world(o, self.canvas_rect.max));
+        // (The lines of a text in a box of fixed height may run out of it, with a match in them.)
+        let ext = &self.ext;
         let in_view = |n: &Node| {
-            let b = n.aabb();
-            b.2 >= tl.x && b.0 <= br.x && b.3 >= tl.y && b.1 <= br.y
+            let (b, spill) = (n.aabb(), ext.spill(n).unwrap_or(0.0));
+            b.2 + spill >= tl.x && b.0 - spill <= br.x && b.3 + spill >= tl.y && b.1 - spill <= br.y
         };
         // The same glyph size the canvas uses on this frame, so the layouts come from its cache.
         let moving = ctx.input(|i| i.time) - self.last_zoom.1 < 0.15;
@@ -475,6 +498,19 @@ impl App {
             let found = &f.matches[from..to];
             let max = n.max_size();
             let px = max * z;
+            // On a path: the glyphs are where the canvas put them along it, each turned with
+            // the path, so every matched glyph is tinted where it stands. (Not laid out there:
+            // the path is gone or of no length, and the text is drawn straight, as below.)
+            if let Some(laid) = n.on_path.and_then(|_| ext.path_text(n.id)).filter(|l| l.bbox.is_some()) {
+                for m in found {
+                    let (fill, edge) = if current == Some(m) { (STRONG, Stroke::new(1.5_f32, STRONG_EDGE)) } else { (FAINT, Stroke::NONE) };
+                    for g in laid.glyphs.iter().filter(|g| g.index >= m.start && g.index < m.end) {
+                        let points = g.corners().map(|(x, y)| view.to_screen(o, x, y)).to_vec();
+                        painter.add(egui::Shape::convex_polygon(points, fill, edge));
+                    }
+                }
+                continue;
+            }
             if px < 3.0 {
                 // Drawn as a bar, too small to read: the whole layer is tinted.
                 tint(r.expand(1.0), current.is_some_and(|c| c.id == n.id));

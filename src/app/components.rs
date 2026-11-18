@@ -137,7 +137,7 @@ impl App {
         }
         let id = n.id;
         self.status = format!("Added an instance of \"{}\".", n.name);
-        self.doc.insert(n, parent);
+        self.doc.insert_placed(n, parent);
         self.sel = vec![id];
         self.tool = Tool::Select;
         self.push_undo(pre);

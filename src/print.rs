@@ -152,17 +152,21 @@ pub fn sheet(w: f32, h: f32, bleed: f32, marks: bool, mm: f32) -> Sheet {
 }
 
 /// For PNG, JPG and SVG: the exported `svg` (`w` × `h` px, bleed included) on a sheet with
-/// crop marks around it. Without marks it is returned as it is.
-pub fn sheet_svg(svg: String, w: f32, h: f32, print: &Print) -> (String, f32, f32) {
+/// crop marks around it. Without marks it is returned as it is. The sheet is white, as paper
+/// is: black marks on a see-through margin can't be seen where the picture is shown on a dark
+/// ground. `scale`: pixels of the picture per px of the SVG (1 for an SVG file).
+pub fn sheet_svg(svg: String, w: f32, h: f32, print: &Print, scale: f32) -> (String, f32, f32) {
     if !print.marks {
         return (svg, w, h);
     }
     let bleed = print.page_bleed(w, h);
     let s = sheet(w - bleed * 2.0, h - bleed * 2.0, bleed, true, print.px_per_mm());
     let (mw, mh) = s.media;
-    // (A quarter of a point is less than a pixel at screen resolutions: one px at least.)
-    let width = (MARK_WIDTH / print.pt_per_px()).max(1.0);
+    // (A quarter of a point is less than a pixel at screen resolutions: one pixel of the
+    // picture at least, however much smaller than the document that is made.)
+    let width = (MARK_WIDTH / print.pt_per_px()).max(1.0 / if scale.is_finite() && scale > 0.0 { scale.min(1.0) } else { 1.0 });
     let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{mw}" height="{mh}" viewBox="0 0 {mw} {mh}">"#);
+    out += &format!(r##"<rect width="{mw}" height="{mh}" fill="#ffffff"/>"##);
     out += &format!(r#"<g transform="translate({} {})">{svg}</g>"#, s.bleed[0], s.bleed[1]);
     out += r##"<path fill="none" stroke="#000000" stroke-width=""##;
     out += &format!(r#"{width}" d=""#);

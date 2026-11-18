@@ -463,7 +463,7 @@ impl App {
         let parent = self.doc.frame_at(pts[0].x, pts[0].y, &[]);
         n.stroke = Some(if parent.is_some() { [0, 0, 0, 255] } else { [235, 235, 235, 255] });
         n.stroke_w = 2.0;
-        self.doc.insert(n, parent);
+        self.doc.insert_placed(n, parent);
         self.push_undo(pre);
         self.sel = vec![id];
         self.tool = Tool::Select;
