@@ -3839,6 +3839,11 @@ fn sub(ui: &mut egui::Ui, title: &str) {
     ui.label(egui::RichText::new(title).size(11.5).weak());
 }
 
+/// The rotation of a layer, in degrees.
+fn rotation_field(ui: &mut egui::Ui, width: f32, v: &mut f32, tip: &str) {
+    ui.add_sized([width, 28.0], egui::DragValue::new(v).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°")).on_hover_text(tip);
+}
+
 /// Kolom angka dengan label di dalamnya (mis. "X  120").
 fn field(ui: &mut egui::Ui, width: f32, label: &str, v: &mut f32) {
     ui.add_sized(

@@ -189,18 +189,27 @@ impl App {
                     }
                 }
                 let spins = !matches!(n.kind, Kind::Frame | Kind::Line);
-                sub(ui, if spins { "Rotation" } else { "Flip" });
-                ui.horizontal(|ui| {
-                    if spins {
-                        ui.add_sized(
-                            [half, 28.0],
-                            egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
-                        )
-                        .on_hover_text("Or drag just outside a corner of the selection (Shift = 15° steps)");
-                        ui.add_space(6.0);
-                    }
-                    flip = flip_buttons(ui);
-                });
+                let title = if spins { "Rotation" } else { "Flip" };
+                const TIP: &str = "Or drag just outside a corner of the selection (Shift = 15° steps)";
+                // An item of an auto layout, or a layer of the page, has nothing to be pinned to.
+                if has_parent && !item {
+                    let shown = (Some(n.constrain_h), Some(n.constrain_v));
+                    constrain = super::constraints::constraints_beside(ui, shown, pinned, title, |ui| {
+                        if spins {
+                            rotation_field(ui, super::constraints::BESIDE, &mut n.rotation, TIP);
+                        }
+                        ui.horizontal(|ui| flip = flip_buttons(ui));
+                    });
+                } else {
+                    sub(ui, title);
+                    ui.horizontal(|ui| {
+                        if spins {
+                            rotation_field(ui, half, &mut n.rotation, TIP);
+                            ui.add_space(6.0);
+                        }
+                        flip = flip_buttons(ui);
+                    });
+                }
 
                 if n.kind != Kind::Text || n.wrap || n.fixed_h {
                     section(ui, "Layout");
@@ -222,10 +231,6 @@ impl App {
                 if n.layout.is_some() || locked.is_none() {
                     auto_act = layout_section(ui, &mut n.layout, locked, "");
                 }
-            }
-            // An item of an auto layout has nothing to be pinned to.
-            if has_parent && !item {
-                constrain = super::constraints::constraints_section(ui, (Some(n.constrain_h), Some(n.constrain_v)), pinned);
             }
 
             section(ui, "Appearance");
@@ -662,27 +667,31 @@ impl App {
             });
             let half = (ui.available_width() - 8.0) / 2.0;
             let spins = spinnable && !pinned;
-            sub(ui, if spins { "Rotation" } else { "Flip" });
-            ui.horizontal(|ui| {
-                if spins {
-                    ui.add_sized(
-                        [half, 28.0],
-                        egui::DragValue::new(&mut n.rotation).speed(1.0).range(-360.0..=360.0).max_decimals(1).suffix("°"),
-                    )
-                    .on_hover_text("Rotates the selection together around its center. Or drag just outside a corner of the selection box (Shift = 15° steps)");
-                    ui.add_space(6.0);
-                }
-                flip = flip_buttons(ui);
-            });
+            let title = if spins { "Rotation" } else { "Flip" };
+            const TIP: &str = "Rotates the selection together around its center. Or drag just outside a corner of the selection box (Shift = 15° steps)";
+            if let Some(shown) = constrained {
+                constrain = super::constraints::constraints_beside(ui, shown, pinned, title, |ui| {
+                    if spins {
+                        rotation_field(ui, super::constraints::BESIDE, &mut n.rotation, TIP);
+                    }
+                    ui.horizontal(|ui| flip = flip_buttons(ui));
+                });
+            } else {
+                sub(ui, title);
+                ui.horizontal(|ui| {
+                    if spins {
+                        rotation_field(ui, half, &mut n.rotation, TIP);
+                        ui.add_space(6.0);
+                    }
+                    flip = flip_buttons(ui);
+                });
+            }
             if !pinned {
                 sized = sizing_row(ui, half, sizes, (&choices[0], &choices[1]));
                 if in_auto {
                     ui.checkbox(&mut n.absolute, "Absolute position").on_hover_text("Left out of the auto layout of their frame: they stay where you put them.");
                 }
                 auto_act = if auto_all { layout_section(ui, &mut n.layout, None, if mixed_layout { MIXED } else { "" }) } else { layout_section(ui, &mut None, None, "") };
-            }
-            if let Some(shown) = constrained {
-                constrain = super::constraints::constraints_section(ui, shown, pinned);
             }
 
             section(ui, "Appearance");

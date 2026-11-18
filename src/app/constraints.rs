@@ -78,11 +78,39 @@ impl App {
     }
 }
 
-/// The Constraints section: the box with a bar per side, and a dropdown per axis. For a part
-/// of an instance (`pinned`) it only shows. Result: what was picked.
-pub(super) fn constraints_section(ui: &mut egui::Ui, shown: Pair, pinned: bool) -> Pair {
+/// Width of the column beside the constraints: the two flip buttons, and the rotation above them.
+pub(super) const BESIDE: f32 = 74.0;
+
+/// The constraints in the Position section: the box with a bar per side, and a dropdown per
+/// axis, to the right of a narrow column (`left`, under `left_title`) that holds the rotation
+/// and the flip buttons. For a part of an instance (`pinned`) it only shows. Result: what was
+/// picked.
+pub(super) fn constraints_beside(ui: &mut egui::Ui, shown: Pair, pinned: bool, left_title: &str, left: impl FnOnce(&mut egui::Ui)) -> Pair {
     let mut picked = (None, None);
-    section(ui, "Constraints");
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(BESIDE);
+            ui.spacing_mut().item_spacing.y = 8.0;
+            sub(ui, left_title);
+            left(ui);
+        });
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            sub(ui, "Constraints");
+            picked = constraints_row(ui, shown, pinned);
+        });
+    });
+    if pinned {
+        ui.weak(PINNED);
+    } else if shown.0.is_none() || shown.1.is_none() {
+        ui.weak("Mixed — a choice applies to all selected layers.");
+    }
+    picked
+}
+
+fn constraints_row(ui: &mut egui::Ui, shown: Pair, pinned: bool) -> Pair {
+    let mut picked = (None, None);
     ui.add_enabled_ui(!pinned, |ui| {
         ui.horizontal(|ui| {
             let side = 64.0;
@@ -112,11 +140,6 @@ pub(super) fn constraints_section(ui: &mut egui::Ui, shown: Pair, pinned: bool) 
             });
         });
     });
-    if pinned {
-        ui.weak(PINNED);
-    } else if shown.0.is_none() || shown.1.is_none() {
-        ui.weak("Mixed — a choice applies to all selected layers.");
-    }
     picked
 }
 
