@@ -910,7 +910,9 @@ impl App {
                 let (x0, y0, x1, y1) = orig.bounds();
                 let (fx, fy) = HANDLE_F[*handle as usize % 8];
                 let (hx, hy) = (x0 + (x1 - x0) * fx, y0 + (y1 - y0) * fy);
-                let (ax, ay) = (x0 + (x1 - x0) * (1.0 - fx), y0 + (y1 - y0) * (1.0 - fy));
+                // Alt: scale from the centre instead of the opposite handle.
+                let (afx, afy) = if inp.mods.alt { (0.5, 0.5) } else { (1.0 - fx, 1.0 - fy) };
+                let (ax, ay) = (x0 + (x1 - x0) * afx, y0 + (y1 - y0) * afy);
                 let sx = (fx != 0.5 && (hx - ax).abs() > 0.001).then(|| (wp.x - ax) / (hx - ax));
                 let sy = (fy != 0.5 && (hy - ay).abs() > 0.001).then(|| (wp.y - ay) / (hy - ay));
                 let mut s = match (sx, sy) {
