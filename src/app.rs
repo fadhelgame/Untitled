@@ -377,6 +377,11 @@ pub struct App {
     title: String,
     font_search: String,
     expanded: HashSet<u64>,
+    /// The selection the Layers panel showed last: when it changes from elsewhere (the canvas,
+    /// a shortcut), the panel opens what is around the newly selected layers and scrolls to them.
+    layers_sel: Vec<u64>,
+    /// How far the list of the Layers panel is scrolled.
+    layers_scroll: f32,
     /// Group yang namanya sedang diedit di panel layer: (id group, teks, fokus sudah diminta).
     group_rename: Option<(u64, String, bool)>,
     /// Layer yang sedang ditarik di panel layer (untuk dipindah urutan / induk / group-nya).
@@ -497,6 +502,8 @@ impl App {
             title: String::new(),
             font_search: String::new(),
             expanded: HashSet::new(),
+            layers_sel: Vec::new(),
+            layers_scroll: 0.0,
             group_rename: None,
             layer_drag: None,
             status: "Ready. Press F to create a frame.".to_owned(),
@@ -2072,9 +2079,29 @@ impl App {
                 }
             }
         }
+        // Selected from outside this panel (on the canvas, by a shortcut): the frames and groups
+        // around the newly selected layers open, and the list scrolls to the first of them.
+        let mut fresh: HashSet<u64> = HashSet::new();
+        if self.sel != self.layers_sel {
+            let old: HashSet<u64> = self.layers_sel.iter().copied().collect();
+            fresh = self.sel.iter().copied().filter(|id| !old.contains(id)).collect();
+            for id in &fresh {
+                let line = self.doc.lineage(*id);
+                for (i, n) in line.iter().enumerate() {
+                    if n.group != 0 {
+                        self.expanded.insert(n.group);
+                    }
+                    if i + 1 < line.len() {
+                        self.expanded.insert(n.id);
+                    }
+                }
+            }
+            self.layers_sel = self.sel.clone();
+        }
         let mut rows: Vec<Row> = Vec::with_capacity(self.doc.nodes.len());
         list(&mut rows, &self.doc.nodes, None, 0, &self.expanded);
         let row_h = 30.0;
+        let reveal = if fresh.is_empty() { None } else { rows.iter().position(|r| matches!(r, Row::Node(n, ..) if fresh.contains(&n.id))) };
         let mut click: Option<(u64, bool, bool)> = None; // (id, shift, double)
         let mut click_group: Option<(u64, bool)> = None; // (id group, shift)
         let mut toggle: Option<u64> = None;
@@ -2166,7 +2193,15 @@ impl App {
         let mut target: Option<Drop> = None;
         let mut mark: Option<(Rect, bool)> = None; // (garis sisip / baris tujuan, masuk ke dalam?)
         ui.spacing_mut().item_spacing.y = 0.0;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if let Some(i) = reveal {
+            // A row that shows in full already stays where it is; any other comes to the middle.
+            let (top, view) = (i as f32 * row_h, ui.available_height());
+            if top < self.layers_scroll || top + row_h > self.layers_scroll + view {
+                area = area.vertical_scroll_offset((top - (view - row_h) * 0.5).max(0.0));
+            }
+        }
+        let scrolled = area.show_rows(ui, row_h, rows.len(), |ui, range| {
             let at_end = range.end == rows.len();
             let mut last_bottom = ui.cursor().top();
             for i in range {
@@ -2385,6 +2420,7 @@ impl App {
                 }
             }
         });
+        self.layers_scroll = scrolled.state.offset.y;
         if let Some((ids, selected)) = drag_start {
             if !selected {
                 self.sel = ids.clone();
@@ -2479,6 +2515,10 @@ impl App {
                     self.zoom_to(b, 4.0);
                 }
             }
+        }
+        // Selected in the panel itself: the row is under the pointer, the list stays put.
+        if click.is_some() || click_group.is_some() || self.layer_drag.is_some() {
+            self.layers_sel = self.sel.clone();
         }
         if menu.is_some() {
             self.leave_modes();
@@ -3471,6 +3511,11 @@ impl App {
                         let sel: Vec<(String, Kind)> = self.sel.iter().filter_map(|id| self.doc.find(*id)).map(|n| (n.name.clone(), n.kind)).collect();
                         eprintln!("SVG selection {sel:?}; status: {}", self.status);
                     }
+                }
+                // `KANVAS_BENCH_REVEAL=1`: a layer clicked on the canvas is shown in the Layers panel
+                // (see `bench_reveal_frame`).
+                if std::env::var_os("KANVAS_BENCH_REVEAL").is_some() {
+                    self.bench_reveal_frame(b.frame, &mut b.inject);
                 }
                 let layers = std::env::var_os("KANVAS_BENCH_LAYERS").is_some() && b.ids.len() == 3;
                 if layers {

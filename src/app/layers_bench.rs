@@ -53,6 +53,27 @@ impl super::App {
         vec![stage, first, text]
     }
 
+    /// `--bench` with `KANVAS_BENCH_REVEAL=1`: a layer far down a closed artboard is clicked on
+    /// the canvas. The Layers panel is to open the artboard and scroll to the row of the layer.
+    pub(super) fn bench_reveal_frame(&mut self, frame: u32, inject: &mut Vec<(u32, egui::Event)>) {
+        match frame {
+            191 => {
+                let ids = self.bench_layers(300);
+                let Some(c) = self.doc.find(ids[1]).map(|n| n.center()) else { return };
+                let at = self.view.to_screen(self.canvas_rect.min, c.0, c.1);
+                let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                inject.extend([(200, egui::Event::PointerMoved(at)), (202, button(true)), (203, button(false))]);
+                eprintln!("REVEAL before the click: artboard open {}, list scrolled {:.0}", self.expanded.contains(&ids[0]), self.layers_scroll);
+            }
+            230 => {
+                let sel: Vec<&str> = self.sel.iter().filter_map(|id| self.doc.find(*id)).map(|n| n.name.as_str()).collect();
+                let open = self.sel.first().and_then(|id| self.doc.parent_of(*id)).is_some_and(|p| self.expanded.contains(&p));
+                eprintln!("REVEAL after the click: selected {sel:?}, artboard open {open}, list scrolled {:.0} (want [Layer 103], true, its row 198 in the middle: near 30 × 198 less half the list)", self.layers_scroll);
+            }
+            _ => {}
+        }
+    }
+
     /// On every frame: starts the next phase and reports the one that ended.
     pub(super) fn bench_layers_frame(&mut self, frame: u32, ids: &[u64], inject: &mut Vec<(u32, egui::Event)>) {
         let (stage, first, text) = (ids[0], ids[1], ids[2]);
